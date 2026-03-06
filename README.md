@@ -1,4 +1,4 @@
-# DLMI-SAM Auto Labeler
+# DLMI-SAM Labeler
 
 Interactive GUI tool for semi-automatic video/image segmentation and annotation, powered by [SAM 3 (Segment Anything Model 3)](https://github.com/facebookresearch/sam3) from Meta AI. Supports point/box prompts, polygon input, text-conditioned detection (PCS), and frame-by-frame mask propagation to produce LabelMe-compatible annotations.
 
