@@ -66,13 +66,14 @@ SAM 3를 사용하시는 경우 원본 논문을 인용해 주세요:
 
 ## 인용
 
-이 라벨링 도구를 연구에 사용하시는 경우 다음과 같이 인용해 주세요:
+이 라벨링 도구를 연구에 사용하는 경우 현재 검토 중인 원고를 인용해 주시기 바랍니다. 아래에 제공된 인용 정보는 임시 게시자이며 수락 시 공식 출판물 세부 정보로 업데이트됩니다.
 
 ```bibtex
-@software{dlmi_sam_autolabeler,
-  title={DLMI-SAM Auto Labeler},
-  author={TODO},
-  year={2025},
-  url={https://github.com/chickencoin2/DLMI_SAM}
+@article{sim2026dlmisam,
+  title={DLMI-SAM: Direct Latent Memory Injection for Robust Human-in-the-Loop Instance Segmentation Labeling},
+  author={Sim, Myongbo and Seo, Dasom and Baek, Na Rae},
+  journal={Under review at Computers and Electronics in Agriculture},
+  year={2026},
+  url={[https://github.com/chickencoin2/DLMI_SAM](https://github.com/chickencoin2/DLMI_SAM)}
 }
 ```
