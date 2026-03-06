@@ -66,13 +66,13 @@ If you use SAM 3, please cite the original work:
 
 ## Citation
 
-If you use this labeling tool in your research, please cite:
+If you use this labeling tool in your research, please cite our manuscript currently under review. The citation information provided below is a temporary placeholder and will be updated with the formal publication details upon acceptance.
 
 ```bibtex
-@software{dlmi_sam_autolabeler,
-  title={DLMI-SAM Auto Labeler},
-  author={TODO},
-  year={2025},
-  url={https://github.com/chickencoin2/DLMI_SAM}
+@article{sim2026dlmisam,
+  title={DLMI-SAM: Direct Latent Memory Injection for Robust Human-in-the-Loop Instance Segmentation Labeling},
+  author={Sim, Myongbo and Seo, Dasom and Baek, Na Rae},
+  journal={Under review at Computers and Electronics in Agriculture},
+  year={2026},
+  url={[https://github.com/chickencoin2/DLMI_SAM](https://github.com/chickencoin2/DLMI_SAM)}
 }
-```
