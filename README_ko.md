@@ -71,9 +71,9 @@ SAM 3를 사용하시는 경우 원본 논문을 인용해 주세요:
 ```bibtex
 @article{sim2026dlmisam,
   title={DLMI-SAM: Direct Latent Memory Injection for Robust Human-in-the-Loop Instance Segmentation Labeling},
-  author={Sim, Myongbo and Seo, Dasom and Baek, Na Rae},
+  author={Sim, Myongbo and Seo, Dasom and Noh Donghee and Hea-Min, Lee and Baek, Na Rae},
   journal={Under review at Computers and Electronics in Agriculture},
   year={2026},
-  url={[https://github.com/chickencoin2/DLMI_SAM](https://github.com/chickencoin2/DLMI_SAM)}
+  url={}
 }
 ```
