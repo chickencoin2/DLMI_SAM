@@ -48,7 +48,7 @@ python app.py
 
 ## 감사의 말
 
-이 프로젝트는 Meta AI의 **SAM 3 (Segment Anything Model 3)**를 기반으로 구축되었으며, [Hugging Face Transformers](https://github.com/huggingface/transformers) 라이브러리를 통해 사용합니다.
+이 프로젝트는 Meta AI의 SAM 3 (Segment Anything Model 3)를 기반으로 구축되었으며, [Hugging Face Transformers](https://github.com/huggingface/transformers) 라이브러리를 통해 사용합니다.
 
 SAM 3를 사용하시는 경우 원본 논문을 인용해 주세요:
 
@@ -66,7 +66,7 @@ SAM 3를 사용하시는 경우 원본 논문을 인용해 주세요:
 
 ## 인용
 
-이 라벨링 도구를 연구에 사용하는 경우 현재 검토 중인 원고를 인용해 주시기 바랍니다. 아래에 제공된 인용 정보는 임시 게시자이며 수락 시 공식 출판물 세부 정보로 업데이트됩니다.
+이 라벨링 도구를 연구에 사용하는 경우 현재 검토 중인 원고를 인용해 주시기 바랍니다. 아래에 제공된 인용 정보는 임시 정보이며 추후 업데이트될 예정입니다.
 
 ```bibtex
 @article{sim2026dlmisam,
