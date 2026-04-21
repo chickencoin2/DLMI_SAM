@@ -125,6 +125,32 @@ def on_left_mouse_press(app, event):
         if app.add_polygon_point(img_x, img_y):
             return
 
+    pose_add_on = bool(getattr(app, 'pose_add_mode_var', None) and app.pose_add_mode_var.get())
+    if pose_add_on and not app.is_ctrl_pressed and not app.is_alt_pressed:
+        img_x, img_y = app._canvas_to_image_coords(event.x, event.y)
+        app.add_pose_point_at(img_x, img_y)
+        app.bbox_start_canvas_coords = None
+        if app.view:
+            app.view.delete_temp_bbox()
+        return
+
+    if app.is_shift_pressed and not app.is_ctrl_pressed and not app.is_alt_pressed:
+        img_x, img_y = app._canvas_to_image_coords(event.x, event.y)
+        hit = None
+        if getattr(app, '_pose_ui', None) is not None:
+            try:
+                hit = app._pose_ui.hit_test_pose_point(app, img_x, img_y)
+            except Exception as _hit_err:
+                logger.debug(f"pose hit_test failed: {_hit_err}")
+        if hit is not None:
+            app.toggle_pose_point_selection(hit[0], hit[1])
+        else:
+            app.clear_pose_selection()
+        app.bbox_start_canvas_coords = None
+        if app.view:
+            app.view.delete_temp_bbox()
+        return
+
     if app.is_ctrl_pressed and app.is_shift_pressed:
         on_ctrl_shift_left_click(app, event)
         return
@@ -333,6 +359,15 @@ def on_right_mouse_press(app, event):
     if app.current_cv_frame is None:
         return
     if is_any_special_mode_active(app):
+        return
+
+    if app.is_shift_pressed and not app.is_ctrl_pressed and not app.is_alt_pressed:
+        img_x, img_y = app._canvas_to_image_coords(event.x, event.y)
+        if hasattr(app, 'select_pose_chain_at'):
+            app.select_pose_chain_at(img_x, img_y)
+        app.right_bbox_start_canvas_coords = None
+        if app.view:
+            app.view.delete_temp_bbox()
         return
 
     if app.is_alt_pressed:

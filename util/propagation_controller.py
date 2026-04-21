@@ -5,7 +5,8 @@ import logging
 import tkinter.messagebox as messagebox
 from PIL import Image
 
-from .customutil import process_sam_mask, get_bbox_from_mask, compute_dlmi_logits
+from .customutil import process_sam_mask, get_bbox_from_mask
+from . import dlmi_hooks
 
 logger = logging.getLogger("DLMI_SAM_LABELER.PropagationController")
 
@@ -83,89 +84,30 @@ def _setup_dlmi_injection_hook(app, frame_bgr, frame_idx):
     logger.info(f"DLMI mid-propagation: {len(obj_ids)} objects registered in single call "
                 f"({len(new_obj_ids)} new, {len(existing_injection_ids)} existing) at frame {frame_idx}")
 
-    # Pre-compute DLMI logits for each object
+    # Pre-compute DLMI logits and install the injection hook via shared helper.
     dlmi_mode = app.dlmi_boundary_mode_var.get()
     dlmi_intensity = app.dlmi_alpha_var.get()
     dlmi_falloff = app.dlmi_gradient_falloff_var.get()
 
-    injection_queue = []
-    for oid in obj_ids:
-        mask = masks_to_inject[oid]['mask']
-        logits_np = compute_dlmi_logits(mask, mode=dlmi_mode,
-                                        intensity=dlmi_intensity, falloff=dlmi_falloff)
-        injection_queue.append(torch.from_numpy(logits_np).to(app.device))
+    injection_queue = dlmi_hooks.build_injection_queue(
+        obj_ids=obj_ids,
+        masks_by_oid={oid: masks_to_inject[oid]['mask'] for oid in obj_ids},
+        intensity=dlmi_intensity,
+        mode=dlmi_mode,
+        falloff=dlmi_falloff,
+        device=app.device,
+    )
 
     logger.info(f"DLMI mid-propagation: logit maps computed (mode={dlmi_mode}, "
                 f"intensity={dlmi_intensity}, falloff={dlmi_falloff})")
 
-    # Install _encode_new_memory hook
+    # Manual install (not context-manager) because restore happens per-frame via
+    # _cleanup_dlmi_hook in the propagation loop, not inside this function's scope.
     original_encode = app.tracker_model._encode_new_memory
     app._dlmi_original_encode = original_encode
-    injection_state = {"idx": 0}
-
-    def injection_hook(**kwargs):
-        if 'pred_masks_high_res' not in kwargs:
-            return original_encode(**kwargs)
-
-        input_tensor = kwargs['pred_masks_high_res']
-
-        if input_tensor.ndim == 4:
-            curr_num_obj = input_tensor.shape[0]
-            curr_h, curr_w = input_tensor.shape[-2:]
-        elif input_tensor.ndim == 5:
-            curr_num_obj = input_tensor.shape[1]
-            curr_h, curr_w = input_tensor.shape[-2:]
-        else:
-            return original_encode(**kwargs)
-
-        target_tensors = []
-        start_idx = injection_state["idx"]
-
-        for i in range(curr_num_obj):
-            q_idx = start_idx + i
-            if q_idx < len(injection_queue):
-                logit_t = injection_queue[q_idx]
-
-                if logit_t.dim() == 2:
-                    logit_t = logit_t.view(1, 1, logit_t.shape[0], logit_t.shape[1])
-                elif logit_t.dim() == 3:
-                    logit_t = logit_t.unsqueeze(0)
-
-                if (logit_t.shape[-2], logit_t.shape[-1]) != (curr_h, curr_w):
-                    logit_t = torch.nn.functional.interpolate(
-                        logit_t.float(), size=(curr_h, curr_w), mode='bilinear',
-                        align_corners=False
-                    )
-
-                target_tensors.append(logit_t.to(input_tensor.dtype))
-            else:
-                logger.warning(f"  DLMI mid-prop: injection queue exhausted (idx={q_idx})")
-
-        if target_tensors and len(target_tensors) == curr_num_obj:
-            injected_batch = torch.cat(target_tensors, dim=0)
-
-            if input_tensor.ndim == 4:
-                if injected_batch.shape == input_tensor.shape:
-                    kwargs['pred_masks_high_res'] = injected_batch
-                else:
-                    logger.error(f"  DLMI mid-prop: shape mismatch {injected_batch.shape} vs {input_tensor.shape}")
-            elif input_tensor.ndim == 5:
-                injected_batch = injected_batch.unsqueeze(0)
-                if injected_batch.shape == input_tensor.shape:
-                    kwargs['pred_masks_high_res'] = injected_batch
-                else:
-                    try:
-                        kwargs['pred_masks_high_res'] = injected_batch.view_as(input_tensor)
-                    except Exception as e:
-                        logger.error(f"  DLMI mid-prop: view_as failed: {e}")
-
-            injection_state["idx"] += curr_num_obj
-
-        # Force sigmoid path instead of binarization in _encode_new_memory
-        kwargs['is_mask_from_pts'] = False
-        return original_encode(**kwargs)
-
-    app.tracker_model._encode_new_memory = injection_hook
+    app.tracker_model._encode_new_memory = dlmi_hooks.create_injection_hook(
+        injection_queue, original_encode, log_prefix="mid-prop"
+    )
     app.dlmi_hook_active = True
     logger.info(f"DLMI mid-propagation: _encode_new_memory hook installed for frame {frame_idx}")
 

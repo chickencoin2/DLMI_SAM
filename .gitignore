@@ -18,3 +18,33 @@ results/
 .claude/
 
 images/test_video.mp4
+
+# Local model checkpoints and caches
+util/pose_models/
+*.pt
+*.pth
+*.ckpt
+
+# Runtime config (user-specific)
+pose_config.json
+
+# Local artifacts
+autolabel_sam/
+completed_videos/
+sam3_models/
+
+# Local sample media / reference docs
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+!images/*.png
+!images/*.jpg
+
+# Korean reference docs (local only)
+git내용-*.txt
+sam3의허깅페이스내용과_기타깃허브.txt
+메모리인젝션쌍둥이실험기술명세서.txt
+util/공식예제.txt

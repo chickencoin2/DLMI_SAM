@@ -8,11 +8,79 @@ import torch
 import numpy as np
 import logging
 import tkinter as tk
-from tkinter import filedialog, messagebox
 
 from .customutil import get_bbox_from_mask, process_sam_mask, is_bbox_on_edge, merge_contours_into_single_polygon
 
 logger = logging.getLogger("DLMI_SAM_LABELER.AutoLabelWorkflow")
+
+
+def _resolve_save_paths(app, frame_idx, label_subdir, label_ext, image_ext="jpg",
+                        include_image=True):
+    """Compute (save_dir, base_filename, label_filepath, image_filepath) for a
+    frame save operation. Centralises the video_name + custom_path + batch
+    subfolder + filename-template + overwrite/rename-counter logic that used
+    to live inline in save_yolo_format and save_yolo_pose_format.
+
+    - label_subdir: 'labels' / 'pose_labels' / '' (=> save_dir root for labelme).
+    - label_ext:    'txt' / 'json'.
+    - include_image: when True, also computes image_filepath inside
+                     `<save_dir>/images/` and ensures that directory exists
+                     (used by YOLO seg/pose save). When False, the returned
+                     image_filepath is None.
+    The function honours app.overwrite_policy == 'overwrite' (returns first
+    candidate path) or 'rename' (increments `_vN` suffix until no collision).
+    """
+    video_name = "video"
+    if isinstance(app.video_source_path, str):
+        video_name = os.path.splitext(os.path.basename(app.video_source_path))[0]
+
+    save_dir = app.AUTOLABEL_FOLDER_val
+    final_base_filename = f"{video_name}_frame"
+
+    if app.use_custom_save_path_var.get():
+        base_dir = app.custom_save_dir_var.get()
+        folder_template = app.custom_folder_name_var.get()
+        file_template = app.custom_file_name_var.get()
+
+        if app.batch_processing_mode_var.get() and app.batch_save_option_var.get() == "subfolder":
+            folder_name = folder_template.format(video_name=video_name)
+            save_dir = os.path.join(base_dir, folder_name)
+        else:
+            save_dir = base_dir
+
+        if app.batch_processing_mode_var.get() and app.batch_filename_option_var.get() == "video_name":
+            final_base_filename = f"{video_name}_frame"
+        else:
+            final_base_filename = file_template.format(video_name=video_name)
+
+    labels_dir = os.path.join(save_dir, label_subdir) if label_subdir else save_dir
+    os.makedirs(labels_dir, exist_ok=True)
+
+    images_dir = None
+    if include_image:
+        images_dir = os.path.join(save_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+
+    overwrite_policy = getattr(app, 'overwrite_policy', 'rename')
+    counter = 0
+    while True:
+        suffix = f"_v{counter}" if counter > 0 else ""
+        stem = f"{final_base_filename}_{frame_idx:05d}{suffix}"
+        label_filepath = os.path.join(labels_dir, f"{stem}.{label_ext}")
+        image_filepath = os.path.join(images_dir, f"{stem}.{image_ext}") if images_dir else None
+
+        if overwrite_policy == "overwrite":
+            break
+        collision = os.path.exists(label_filepath) or (image_filepath and os.path.exists(image_filepath))
+        if not collision:
+            break
+        if overwrite_policy == "rename":
+            counter += 1
+        else:
+            logger.warning(f"Unexpected overwrite_policy={overwrite_policy!r}; using {label_filepath}")
+            break
+
+    return save_dir, final_base_filename, label_filepath, image_filepath
 
 
 def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, base_filename_prefix):
@@ -50,54 +118,9 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
 
     masks_data_for_frame = processed_masks
 
-    actual_frame_idx = frame_idx
-
-    video_name = "video"
-    if isinstance(app.video_source_path, str):
-        video_name = os.path.splitext(os.path.basename(app.video_source_path))[0]
-
-    save_dir = app.AUTOLABEL_FOLDER_val
-    final_base_filename = f"{video_name}_frame"
-
-    if app.use_custom_save_path_var.get():
-        base_dir = app.custom_save_dir_var.get()
-        folder_template = app.custom_folder_name_var.get()
-        file_template = app.custom_file_name_var.get()
-
-        if app.batch_processing_mode_var.get() and app.batch_save_option_var.get() == "subfolder":
-            folder_name = folder_template.format(video_name=video_name)
-            save_dir = os.path.join(base_dir, folder_name)
-        else:
-            save_dir = base_dir
-
-        if app.batch_processing_mode_var.get() and app.batch_filename_option_var.get() == "video_name":
-            final_base_filename = f"{video_name}_frame"
-        else:
-            final_base_filename = file_template.format(video_name=video_name)
-
-    images_dir = os.path.join(save_dir, "images")
-    labels_dir = os.path.join(save_dir, "labels")
-    os.makedirs(images_dir, exist_ok=True)
-    os.makedirs(labels_dir, exist_ok=True)
-
-    current_overwrite_policy = app.overwrite_policy
-    counter = 0
-    while True:
-        suffix = f"_v{counter}" if counter > 0 else ""
-        image_filename = f"{final_base_filename}_{actual_frame_idx:05d}{suffix}.jpg"
-        label_filename = f"{final_base_filename}_{actual_frame_idx:05d}{suffix}.txt"
-        image_filepath = os.path.join(images_dir, image_filename)
-        label_filepath = os.path.join(labels_dir, label_filename)
-
-        if current_overwrite_policy == "overwrite":
-            break
-        if not os.path.exists(image_filepath) and not os.path.exists(label_filepath):
-            break
-        if current_overwrite_policy == "rename":
-            counter += 1
-        else:
-            logger.warning(f"Unexpected situation during filename duplication handling: {image_filename}")
-            break
+    save_dir, final_base_filename, label_filepath, image_filepath = _resolve_save_paths(
+        app, frame_idx, label_subdir="labels", label_ext="txt", include_image=True
+    )
 
     try:
         frame_pil_image_rgb.save(image_filepath, "JPEG", quality=95)
@@ -367,8 +390,7 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
             "group_id": None,
             "description": "",
             "shape_type": None,
-            "flags": {},
-            "mask": None
+            "flags": {}
         }
 
         if labeling_mode == "Bounding Box":
@@ -798,225 +820,147 @@ def parse_yolo_txt(txt_path, frame_width, frame_height):
     return objects
 
 
-def load_label_file(app):
-    if app.current_cv_frame is None:
-        messagebox.showwarning("Notice", "Load video or image source first.", parent=app.root)
+def save_yolo_pose_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, base_filename_prefix,
+                          separate_subdir=None):
+    """Save YOLO-pose format labels. Each line:
+        class_id cx cy w h x1 y1 v1 x2 y2 v2 ... xN yN vN
+    where all coords are normalized [0,1] and v in {0,1}.
+
+    Only objects with non-empty 'pose_points' are emitted. If the object also
+    has 'last_mask', the bbox is derived from that mask; else the bbox is the
+    bounding rectangle of the keypoints themselves.
+
+    When `separate_subdir` is provided (e.g., 'pose_labels'), writes into a
+    sibling folder under the YOLO dataset root. Otherwise writes alongside
+    the normal labels/.
+    """
+    if not masks_data_for_frame:
+        return
+    has_any_pose = any(
+        isinstance(d, dict) and d.get('pose_points') for d in masks_data_for_frame.values()
+    )
+    if not has_any_pose:
         return
 
-    label_file_path = filedialog.askopenfilename(
-        title="Select Label File (JSON or YOLO txt)",
-        filetypes=(
-            ("LabelMe JSON", "*.json"),
-            ("YOLO txt", "*.txt"),
-            ("All Files", "*.*")
-        ),
-        parent=app.root
+    h, w = frame_pil_image_rgb.height, frame_pil_image_rgb.width
+
+    labels_subdir = separate_subdir or "labels"
+    # Pose labels share their YOLO dataset root with seg labels but land in a
+    # different subdir. We don't re-emit the image file; the seg save already
+    # wrote it. include_image=False skips the image collision check and dir.
+    _save_dir, _base, label_filepath, _img = _resolve_save_paths(
+        app, frame_idx, label_subdir=labels_subdir, label_ext="txt", include_image=False
     )
 
-    if not label_file_path:
-        return
+    class_name_to_idx = {name: idx for idx, name in enumerate(app.yolo_class_names_for_save)} if app.yolo_class_names_for_save else {}
+    default_label = app.default_object_label_var.get()
 
-    file_ext = os.path.splitext(label_file_path)[1].lower()
-
-    try:
-        frame_height, frame_width = app.current_cv_frame.shape[:2]
-        if file_ext == '.json':
-            loaded_objects = parse_labelme_json(label_file_path, frame_width, frame_height)
-        elif file_ext == '.txt':
-            loaded_objects = parse_yolo_txt(label_file_path, frame_width, frame_height)
-        else:
-            messagebox.showerror("Error", "Unsupported file format.\nOnly JSON or txt files are supported.", parent=app.root)
-            return
-
-        if not loaded_objects:
-            messagebox.showinfo("Info", "No objects to load.", parent=app.root)
-            return
-
-        if app.low_level_api_enabled_var.get():
-            _apply_loaded_labels_as_polygon_masks(app, loaded_objects)
-            return
-
-        current_mode = app.prompt_mode_var.get()
-
-        if current_mode == "PVS" or current_mode == "PVS_CHUNK":
-            _apply_loaded_labels_as_prompts(app, loaded_objects)
-        elif current_mode in ("PCS", "PCS_IMAGE"):
-            _apply_loaded_labels_for_pcs(app, loaded_objects)
-
-        app.update_status(f"{len(loaded_objects)} objects loaded.")
-        logger.info(f"Label file loaded: {label_file_path}, objects: {len(loaded_objects)}")
-
-    except Exception as e:
-        logger.exception(f"Label file load error: {e}")
-        messagebox.showerror("Error", f"Error loading label file:\n{e}", parent=app.root)
-
-
-def _apply_loaded_labels_as_polygon_masks(app, loaded_objects):
-    if not loaded_objects:
-        return
-
-    if app.current_cv_frame is None:
-        messagebox.showerror("Error", "No current frame available.", parent=app.root)
-        return
-
-    try:
-        frame_height, frame_width = app.current_cv_frame.shape[:2]
-
-        app.tracked_objects.clear()
-        app.next_obj_id_to_propose = 1
-        app.polygon_objects.clear()
-
-        for obj in loaded_objects:
-            label = obj.get('label', app.default_object_label_var.get())
-
-            polygon = obj.get('polygon')
-            if polygon and len(polygon) >= 3:
-                mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-                pts = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
-                cv2.fillPoly(mask, [pts], 255)
-                mask_bool = mask > 0
-            elif obj.get('bbox'):
-                x1, y1, x2, y2 = obj['bbox']
-                mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-                mask[int(y1):int(y2), int(x1):int(x2)] = 255
-                mask_bool = mask > 0
-            else:
-                continue
-
-            if not mask_bool.any():
-                continue
-
-            new_obj_id = app.next_obj_id_to_propose
-            app.next_obj_id_to_propose += 1
-
-            app.tracked_objects[new_obj_id] = {
-                'custom_label': label,
-                'last_mask': mask_bool,
-                'is_polygon_object': False,
-            }
-
-            logger.info(f"Label load (Low API): object '{label}' (ID: {new_obj_id}) mask created")
-
-        if not app.tracked_objects:
-            messagebox.showwarning("Info", "No objects to convert.", parent=app.root)
-            return
-
-        app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
-        app._update_obj_id_info_label()
-
-        app.update_status(f"{len(app.tracked_objects)} object masks created. Injecting Low data...")
-        app.root.update_idletasks()
-
-        app.inject_low_level_mask_prompt()
-
-        app.update_status(f"Low-level API: {len(app.tracked_objects)} objects injected to SAM3.")
-        logger.info(f"Label load + Low data injection complete: {len(app.tracked_objects)} objects")
-
-    except Exception as e:
-        logger.exception(f"Low-level API label load failed: {e}")
-        messagebox.showerror("Error", f"Error loading labels via Low-level API:\n{e}", parent=app.root)
-
-
-def _apply_loaded_labels_as_prompts(app, loaded_objects):
-    if not loaded_objects:
-        return
-
-    if app.inference_session is None:
-        if not app._init_inference_session():
-            messagebox.showerror("Error", "SAM3 session initialization failed.", parent=app.root)
-            return
-
-    if app.tracked_objects:
-        response = messagebox.askyesno(
-            "Existing Object Handling",
-            f"Currently {len(app.tracked_objects)} objects exist.\n"
-            "Keep existing objects and add new ones?\n\n"
-            "Yes: Keep existing and add\n"
-            "No: Clear existing and add new",
-            parent=app.root
-        )
-        if not response:
-            app.tracked_objects.clear()
-            app.next_obj_id_to_propose = 1
-            app._reset_inference_session()
-
-    for obj in loaded_objects:
-        bbox = obj.get('bbox')
-        label = obj.get('label', app.default_object_label_var.get())
-
-        if bbox is None:
+    lines = []
+    seen_groups = set()
+    for sam_id, obj_data in masks_data_for_frame.items():
+        if not isinstance(obj_data, dict):
             continue
 
-        x1, y1, x2, y2 = bbox
-        coords = np.array([x1, y1, x2, y2])
+        group_id = app.sam_id_to_group.get(sam_id) if hasattr(app, 'sam_id_to_group') else None
+        if group_id is not None:
+            if group_id in seen_groups:
+                continue
+            seen_groups.add(group_id)
+            members = app.object_groups.get(group_id, {sam_id}) if hasattr(app, 'object_groups') else {sam_id}
+            pose_pts = []
+            merged_mask = None
+            rep_label = None
+            for m_id in members:
+                m_data = masks_data_for_frame.get(m_id)
+                if not isinstance(m_data, dict):
+                    continue
+                if rep_label is None:
+                    rep_label = m_data.get('custom_label')
+                if not pose_pts and m_data.get('pose_points'):
+                    pose_pts = m_data.get('pose_points')
+                mm = m_data.get('last_mask')
+                if mm is not None and mm.any():
+                    if merged_mask is None:
+                        merged_mask = mm.astype(bool).copy()
+                    else:
+                        merged_mask = merged_mask | mm.astype(bool)
+            if not pose_pts:
+                continue
+            obj_label = rep_label or default_label
+            obj_mask = merged_mask
+        else:
+            pose_pts = obj_data.get('pose_points')
+            if not pose_pts:
+                continue
+            obj_label = obj_data.get('custom_label', default_label)
+            obj_mask = obj_data.get('last_mask')
 
-        new_obj_id = app.next_obj_id_to_propose
+        if obj_mask is not None and obj_mask.any():
+            bb = get_bbox_from_mask(obj_mask, min_bbox_area_val=1)
+            if bb is None:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in bb]
+        else:
+            xs = [p['x'] for p in pose_pts if p.get('visibility', 1) > 0]
+            ys = [p['y'] for p in pose_pts if p.get('visibility', 1) > 0]
+            if not xs or not ys:
+                continue
+            x1, x2 = min(xs), max(xs)
+            y1, y2 = min(ys), max(ys)
+            pad = 4
+            x1 = max(0, x1 - pad); y1 = max(0, y1 - pad)
+            x2 = min(w - 1, x2 + pad); y2 = min(h - 1, y2 + pad)
 
-        app._handle_sam_prompt_wrapper(
-            prompt_type='bbox',
-            coords=coords,
-            label=1,  # positive
-            proposed_obj_id_for_new=new_obj_id,
-            target_existing_obj_id=None,
-            custom_label=label
+        cx = ((x1 + x2) / 2) / w
+        cy = ((y1 + y2) / 2) / h
+        bw = (x2 - x1) / w
+        bh = (y2 - y1) / h
+        cx = max(0.0, min(1.0, cx)); cy = max(0.0, min(1.0, cy))
+        bw = max(0.0, min(1.0, bw)); bh = max(0.0, min(1.0, bh))
+
+        class_idx = class_name_to_idx.get(obj_label, 0)
+
+        parts = [str(class_idx), f"{cx:.6f}", f"{cy:.6f}", f"{bw:.6f}", f"{bh:.6f}"]
+        for p in pose_pts:
+            nx = max(0.0, min(1.0, p['x'] / w))
+            ny = max(0.0, min(1.0, p['y'] / h))
+            v = int(p.get('visibility', 2))
+            if v < 0:
+                v = 0
+            elif v > 2:
+                v = 2
+            parts.extend([f"{nx:.6f}", f"{ny:.6f}", str(v)])
+        lines.append(" ".join(parts))
+
+    if not lines:
+        return
+    try:
+        with open(label_filepath, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines) + "\n")
+        logger.debug(f"YOLO pose saved: {label_filepath}")
+    except Exception as e:
+        logger.error(f"YOLO pose save failed {label_filepath}: {e}")
+
+
+def save_frame_dispatch(app, frame_pil, frame_idx, masks, video_name, pose_subdir=None):
+    """Dispatch save for one frame across all requested output formats.
+
+    Consolidates the three-way dispatch block (YOLO seg + YOLO pose + labelme)
+    that used to be repeated at 3 call sites in app.py (cut_and_repropagate,
+    _cut_save_frames_0_to_n, _save_labels_thread). The dispatch honours
+    `app.save_format_var.get()` which is 'yolo' | 'labelme' | 'both'. Pose
+    labels are always written to a separate subdir (default 'pose_labels')
+    so they never collide with YOLO-seg label files.
+    """
+    fmt = app.save_format_var.get()
+    if fmt in ("yolo", "both"):
+        save_yolo_format(app, frame_pil, frame_idx, masks, video_name)
+        save_yolo_pose_format(
+            app, frame_pil, frame_idx, masks, video_name,
+            separate_subdir=(pose_subdir or 'pose_labels')
         )
-
-        logger.info(f"Label load: object '{label}' (ID: {new_obj_id}) bbox prompt applied")
-
-    if app.current_cv_frame is not None:
-        app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
-
-    app._update_obj_id_info_label()
-
-
-def _apply_loaded_labels_for_pcs(app, loaded_objects):
-    if not loaded_objects:
-        return
-
-    label_set = set()
-    for obj in loaded_objects:
-        label = obj.get('label', '')
-        if label:
-            label_set.add(label)
-
-    if not label_set:
-        messagebox.showinfo("Info", "No object labels found in loaded labels.", parent=app.root)
-        return
-
-    prompt_text = ", ".join(sorted(label_set))
-
-    app.pcs_text_prompt_var.set(prompt_text)
-
-    response = messagebox.askyesno(
-        "PCS Mode Label Apply",
-        f"Proceed with PCS detection using these object names?\n\n"
-        f"Object names: {prompt_text}\n\n"
-        f"Yes: Execute 'Cut here' and start PCS detection\n"
-        f"No: Only set text prompt",
-        parent=app.root
-    )
-
-    if response:
-        app.propagated_results = {}
-        app.tracked_objects.clear()
-        app.next_obj_id_to_propose = 1
-        app.is_tracking_ever_started = False
-
-        if app.inference_session is not None:
-            try:
-                app.inference_session.reset_inference_session()
-            except:
-                pass
-            app.inference_session = None
-
-        app._update_obj_id_info_label()
-
-        app.execute_pcs_detection()
-    else:
-        messagebox.showinfo(
-            "Info",
-            f"Text prompt has been set.\n"
-            f"'{prompt_text}'\n\n"
-            f"Press 'Detect' button to start PCS detection.",
-            parent=app.root
+    if fmt in ("labelme", "both"):
+        save_labelme_json(
+            app, frame_pil, frame_idx, masks, video_name,
+            is_both_mode=(fmt == "both")
         )
