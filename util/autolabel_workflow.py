@@ -9,13 +9,16 @@ import numpy as np
 import logging
 import tkinter as tk
 
-from .customutil import get_bbox_from_mask, process_sam_mask, is_bbox_on_edge, merge_contours_into_single_polygon
+from .customutil import (
+    get_bbox_from_mask, process_sam_mask, is_bbox_on_edge,
+    merge_contours_into_single_polygon, simplify_contours_for_save,
+)
 
 logger = logging.getLogger("DLMI_SAM_LABELER.AutoLabelWorkflow")
 
 
 def _resolve_save_paths(app, frame_idx, label_subdir, label_ext, image_ext="jpg",
-                        include_image=True):
+                        include_image=True, save_dir_override=None):
     """Compute (save_dir, base_filename, label_filepath, image_filepath) for a
     frame save operation. Centralises the video_name + custom_path + batch
     subfolder + filename-template + overwrite/rename-counter logic that used
@@ -27,6 +30,11 @@ def _resolve_save_paths(app, frame_idx, label_subdir, label_ext, image_ext="jpg"
                      `<save_dir>/images/` and ensures that directory exists
                      (used by YOLO seg/pose save). When False, the returned
                      image_filepath is None.
+    - save_dir_override: when provided, replaces the default seg-label root
+                     resolution. The batch subfolder rule (per-video folder
+                     when batch + subfolder mode) and filename template are
+                     still applied on top of this override. Used to send
+                     YOLO-pose labels to a fully separate root.
     The function honours app.overwrite_policy == 'overwrite' (returns first
     candidate path) or 'rename' (increments `_vN` suffix until no collision).
     """
@@ -37,7 +45,24 @@ def _resolve_save_paths(app, frame_idx, label_subdir, label_ext, image_ext="jpg"
     save_dir = app.AUTOLABEL_FOLDER_val
     final_base_filename = f"{video_name}_frame"
 
-    if app.use_custom_save_path_var.get():
+    if save_dir_override is not None:
+        # Pose-only override path: respect batch subfolder + filename template
+        # rules so per-video isolation still works inside the pose root.
+        base_dir = save_dir_override
+        folder_template = app.custom_folder_name_var.get() if app.use_custom_save_path_var.get() else "{video_name}_dataset"
+        file_template = app.custom_file_name_var.get() if app.use_custom_save_path_var.get() else "{video_name}_frame"
+
+        if app.batch_processing_mode_var.get() and app.batch_save_option_var.get() == "subfolder":
+            folder_name = folder_template.format(video_name=video_name)
+            save_dir = os.path.join(base_dir, folder_name)
+        else:
+            save_dir = base_dir
+
+        if app.batch_processing_mode_var.get() and app.batch_filename_option_var.get() == "video_name":
+            final_base_filename = f"{video_name}_frame"
+        else:
+            final_base_filename = file_template.format(video_name=video_name)
+    elif app.use_custom_save_path_var.get():
         base_dir = app.custom_save_dir_var.get()
         folder_template = app.custom_folder_name_var.get()
         file_template = app.custom_file_name_var.get()
@@ -84,8 +109,12 @@ def _resolve_save_paths(app, frame_idx, label_subdir, label_ext, image_ext="jpg"
 
 
 def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, base_filename_prefix):
+    """Save YOLO labels + image for one frame. Returns the absolute path of
+    the encoded JPEG on success, or None on failure / no-op. The path is used
+    by save_frame_dispatch to avoid re-encoding the same image when LabelMe
+    JSON is also written ("both" mode)."""
     logger.debug(f"YOLO format save attempt. frame_idx: {frame_idx}")
-    if not masks_data_for_frame: return
+    if not masks_data_for_frame: return None
 
     h, w = frame_pil_image_rgb.height, frame_pil_image_rgb.width
 
@@ -126,11 +155,17 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
         frame_pil_image_rgb.save(image_filepath, "JPEG", quality=95)
     except Exception as e:
         logger.error(f"Image save failed {image_filepath}: {e}")
-        return
+        return None
 
     labeling_mode = app.labeling_mode_var.get()
     ignore_edge = app.ignore_edge_labels_var.get()
     edge_margin = app.edge_margin_var.get()
+    erosion_k = app.erosion_kernel_size.get()
+    erosion_i = app.erosion_iterations.get()
+    filter_small_obj_var = getattr(app, 'filter_small_objects_var', None)
+    filter_small_obj_on = bool(filter_small_obj_var and filter_small_obj_var.get())
+    small_obj_threshold_ratio = app.small_object_threshold_var.get() if filter_small_obj_on else 0.0
+    min_bbox_width_for_filter = w * small_obj_threshold_ratio if filter_small_obj_on else 0.0
 
     class_name_to_idx = {name: idx for idx, name in enumerate(app.yolo_class_names_for_save)} if app.yolo_class_names_for_save else {}
     default_label = app.default_object_label_var.get()
@@ -151,21 +186,27 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
         mask = obj_data.get("last_mask")
         if mask is None or not mask.any(): continue
 
+        # Compute the no-erosion bbox at most once per object and reuse for
+        # both edge filter and small-object filter checks (was previously
+        # computed up to twice via separate get_bbox_from_mask calls).
+        bbox_no_erosion = None
+        bbox_no_erosion_computed = False
+
         if ignore_edge:
-            bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
-            if is_bbox_on_edge(bbox, (h, w), edge_margin):
+            bbox_no_erosion = get_bbox_from_mask(mask, min_bbox_area_val=1)
+            bbox_no_erosion_computed = True
+            if is_bbox_on_edge(bbox_no_erosion, (h, w), edge_margin):
                 logger.debug(f"YOLO save skipped: SAM ID {sam_id} is an edge object.")
                 continue
 
-        filter_small_obj = getattr(app, 'filter_small_objects_var', None)
-        if filter_small_obj and filter_small_obj.get():
-            threshold_ratio = app.small_object_threshold_var.get()
-            min_bbox_width = w * threshold_ratio
-            bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
-            if bbox is not None:
-                bbox_width = bbox[2] - bbox[0]
-                if bbox_width < min_bbox_width:
-                    logger.debug(f"YOLO save skipped: SAM ID {sam_id} (width {bbox_width:.1f} < threshold {min_bbox_width:.1f})")
+        if filter_small_obj_on:
+            if not bbox_no_erosion_computed:
+                bbox_no_erosion = get_bbox_from_mask(mask, min_bbox_area_val=1)
+                bbox_no_erosion_computed = True
+            if bbox_no_erosion is not None:
+                bbox_width = bbox_no_erosion[2] - bbox_no_erosion[0]
+                if bbox_width < min_bbox_width_for_filter:
+                    logger.debug(f"YOLO save skipped: SAM ID {sam_id} (width {bbox_width:.1f} < threshold {min_bbox_width_for_filter:.1f})")
                     continue
 
         obj_label = obj_data.get("custom_label", default_label)
@@ -175,8 +216,9 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
             logger.warning(f"Object {sam_id} label '{obj_label}' not in class list, saving as first class.")
 
         if labeling_mode == "Bounding Box":
-            bbox = get_bbox_from_mask(mask, app.erosion_kernel_size.get(),
-                                     app.erosion_iterations.get(), min_bbox_area_val=1)
+            # Erosion-aware bbox is what the BBox emission needs (matches
+            # previous behaviour byte-for-byte).
+            bbox = get_bbox_from_mask(mask, erosion_k, erosion_i, min_bbox_area_val=1)
             if bbox is not None:
                 x1, y1, x2, y2 = bbox
                 center_x = ((x1 + x2) / 2) / w
@@ -212,6 +254,13 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
                     logger.debug(f"Small contour filtering: {len(contours)} -> {len(filtered_contours)} (ObjID {sam_id})")
                 contours = filtered_contours
 
+            # Reduce vertex density to ~1/5 of the dense CHAIN_APPROX_SIMPLE
+            # output via Douglas-Peucker simplification on each connected
+            # component BEFORE bridging. The bridge step then operates on
+            # already-thinned contours, so the final polygon and the saved
+            # YOLO line stay compact.
+            contours = simplify_contours_for_save(contours, epsilon_ratio=0.002)
+
             merged_polygon_contour = merge_contours_into_single_polygon(contours, min_area=10)
 
             if merged_polygon_contour is not None and len(merged_polygon_contour) >= 3:
@@ -226,8 +275,7 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
 
         elif labeling_mode == "Semantic":
             logger.warning(f"YOLO format does not support Semantic Segmentation. Object {sam_id} will be saved as BBox.")
-            bbox = get_bbox_from_mask(mask, app.erosion_kernel_size.get(),
-                                     app.erosion_iterations.get(), min_bbox_area_val=1)
+            bbox = get_bbox_from_mask(mask, erosion_k, erosion_i, min_bbox_area_val=1)
             if bbox is not None:
                 x1, y1, x2, y2 = bbox
                 center_x = ((x1 + x2) / 2) / w
@@ -250,8 +298,15 @@ def save_yolo_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, 
         except Exception as e:
             logger.error(f"YOLO label file save failed {label_filepath}: {e}")
 
+    return image_filepath
 
-def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, base_filename_prefix, is_both_mode=False):
+
+def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, base_filename_prefix,
+                      is_both_mode=False, source_image_path=None):
+    """Save a LabelMe JSON for one frame. If `source_image_path` is provided
+    (the JPEG already encoded by save_yolo_format on the same frame), copy it
+    into the labelme target folder instead of re-encoding the same PIL image.
+    The bytes are byte-identical to the YOLO save (same quality=95 JPEG)."""
     logger.debug(f"LabelMe JSON save attempt. frame_idx: {frame_idx}, both_mode: {is_both_mode}")
     if not masks_data_for_frame: return
     h, w = frame_pil_image_rgb.height, frame_pil_image_rgb.width
@@ -337,8 +392,16 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
             logger.warning(f"Unexpected situation during filename duplication: {image_filename}, current policy: {current_overwrite_policy}")
             break
 
-    try: frame_pil_image_rgb.save(image_filepath, "JPEG", quality=95)
-    except Exception as e: logger.error(f"Image save failed {image_filepath}: {e}"); return
+    try:
+        if source_image_path and os.path.exists(source_image_path):
+            # Reuse the JPEG already encoded by the YOLO save on this same
+            # frame. shutil.copyfile preserves the bytes exactly.
+            import shutil as _shutil
+            _shutil.copyfile(source_image_path, image_filepath)
+        else:
+            frame_pil_image_rgb.save(image_filepath, "JPEG", quality=95)
+    except Exception as e:
+        logger.error(f"Image save failed {image_filepath}: {e}"); return
 
     labelme_data = {
         "version": app.LABELME_VERSION_val, "flags": {}, "shapes": [],
@@ -347,6 +410,13 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
     labeling_mode = app.labeling_mode_var.get()
     ignore_edge = app.ignore_edge_labels_var.get()
     edge_margin = app.edge_margin_var.get()
+    erosion_k = app.erosion_kernel_size.get()
+    erosion_i = app.erosion_iterations.get()
+    filter_small_obj_var = getattr(app, 'filter_small_objects_var', None)
+    filter_small_obj_on = bool(filter_small_obj_var and filter_small_obj_var.get())
+    small_obj_threshold_ratio = app.small_object_threshold_var.get() if filter_small_obj_on else 0.0
+    min_bbox_width_for_filter = w * small_obj_threshold_ratio if filter_small_obj_on else 0.0
+    default_label_value = app.default_object_label_var.get()
 
     for sam_id, obj_data_original in masks_data_for_frame.items():
         if sam_id in app.suppressed_sam_ids:
@@ -362,24 +432,30 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
         mask = obj_data.get("last_mask")
         if mask is None or not mask.any(): continue
 
+        # Compute the no-erosion bbox at most once per object (was previously
+        # computed up to twice, once for edge filter and once for small-object
+        # filter).
+        bbox_no_erosion = None
+        bbox_no_erosion_computed = False
+
         if ignore_edge:
-            bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
-            if is_bbox_on_edge(bbox, (h, w), edge_margin):
+            bbox_no_erosion = get_bbox_from_mask(mask, min_bbox_area_val=1)
+            bbox_no_erosion_computed = True
+            if is_bbox_on_edge(bbox_no_erosion, (h, w), edge_margin):
                 logger.debug(f"LabelMe save skipped: SAM ID {sam_id} is an edge object.")
                 continue
 
-        filter_small_obj = getattr(app, 'filter_small_objects_var', None)
-        if filter_small_obj and filter_small_obj.get():
-            threshold_ratio = app.small_object_threshold_var.get()
-            min_bbox_width = w * threshold_ratio
-            bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
-            if bbox is not None:
-                bbox_width = bbox[2] - bbox[0]
-                if bbox_width < min_bbox_width:
-                    logger.debug(f"LabelMe save skipped: SAM ID {sam_id} (width {bbox_width:.1f} < threshold {min_bbox_width:.1f})")
+        if filter_small_obj_on:
+            if not bbox_no_erosion_computed:
+                bbox_no_erosion = get_bbox_from_mask(mask, min_bbox_area_val=1)
+                bbox_no_erosion_computed = True
+            if bbox_no_erosion is not None:
+                bbox_width = bbox_no_erosion[2] - bbox_no_erosion[0]
+                if bbox_width < min_bbox_width_for_filter:
+                    logger.debug(f"LabelMe save skipped: SAM ID {sam_id} (width {bbox_width:.1f} < threshold {min_bbox_width_for_filter:.1f})")
                     continue
 
-        obj_label_raw = obj_data.get("custom_label", app.default_object_label_var.get())
+        obj_label_raw = obj_data.get("custom_label", default_label_value)
         if not obj_label_raw or obj_label_raw.strip() == "" or obj_label_raw.lower() == "object":
             obj_label = f"Object_{sam_id}"
         else: obj_label = obj_label_raw
@@ -394,7 +470,7 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
         }
 
         if labeling_mode == "Bounding Box":
-            bbox = get_bbox_from_mask(mask, app.erosion_kernel_size.get(), app.erosion_iterations.get(), min_bbox_area_val=1)
+            bbox = get_bbox_from_mask(mask, erosion_k, erosion_i, min_bbox_area_val=1)
             if bbox is not None:
                 xmin, ymin, xmax, ymax = bbox.tolist()
                 shape = shape_base.copy(); shape["points"] = [[xmin, ymin], [xmax, ymax]]; shape["shape_type"] = "rectangle"
@@ -420,6 +496,11 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
                     logger.debug(f"LabelMe small contour filtering: {len(contours)} -> {len(filtered_contours)} (ObjID {sam_id})")
                 contours = filtered_contours
 
+            # See save_yolo_format: thin out vertices ~5× before bridging so
+            # the LabelMe polygon emits the same compact density as the
+            # historical save pipeline did.
+            contours = simplify_contours_for_save(contours, epsilon_ratio=0.002)
+
             merged_polygon_contour = merge_contours_into_single_polygon(contours, min_area=10)
 
             if merged_polygon_contour is not None and len(merged_polygon_contour) >= 3:
@@ -429,7 +510,10 @@ def save_labelme_json(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame,
                 shape_poly["shape_type"] = "polygon"
                 labelme_data["shapes"].append(shape_poly)
         elif labeling_mode == "Semantic":
-            bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
+            if bbox_no_erosion_computed:
+                bbox = bbox_no_erosion
+            else:
+                bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
             if bbox is not None:
                 xmin, ymin, xmax, ymax = map(int, bbox)
 
@@ -821,7 +905,7 @@ def parse_yolo_txt(txt_path, frame_width, frame_height):
 
 
 def save_yolo_pose_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_frame, base_filename_prefix,
-                          separate_subdir=None):
+                          separate_subdir=None, source_image_path=None):
     """Save YOLO-pose format labels. Each line:
         class_id cx cy w h x1 y1 v1 x2 y2 v2 ... xN yN vN
     where all coords are normalized [0,1] and v in {0,1}.
@@ -844,13 +928,39 @@ def save_yolo_pose_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_fr
 
     h, w = frame_pil_image_rgb.height, frame_pil_image_rgb.width
 
-    labels_subdir = separate_subdir or "labels"
-    # Pose labels share their YOLO dataset root with seg labels but land in a
-    # different subdir. We don't re-emit the image file; the seg save already
-    # wrote it. include_image=False skips the image collision check and dir.
-    _save_dir, _base, label_filepath, _img = _resolve_save_paths(
-        app, frame_idx, label_subdir=labels_subdir, label_ext="txt", include_image=False
-    )
+    # When the user has configured a separate pose-save root, route YOLO-pose
+    # files there (the seg-label root never receives a pose .txt). The pose
+    # root still respects batch subfolder rules so per-video isolation is
+    # preserved. When the override is on, the pose root is dedicated to pose,
+    # so we drop the "pose_labels" sub-suffix and write directly under
+    # `<pose_root>[/<video_subfolder>]/labels/`.
+    use_pose_root = bool(getattr(app, 'use_custom_pose_save_path_var', None) and
+                         app.use_custom_pose_save_path_var.get())
+    pose_image_target = None  # absolute path of the image YOLO-pose expects next to the .txt
+    if use_pose_root:
+        pose_root = app.custom_pose_save_dir_var.get()
+        labels_subdir = "labels"
+        # include_image=True makes _resolve_save_paths return the YOLO-style
+        # `<pose_root>[/<video_subfolder>]/images/<stem>.jpg` path AND ensure
+        # the dir exists. We populate the file ourselves below using the
+        # already-encoded JPEG when available, or by encoding the PIL once.
+        _save_dir, _base, label_filepath, pose_image_target = _resolve_save_paths(
+            app, frame_idx, label_subdir=labels_subdir, label_ext="txt",
+            include_image=True, save_dir_override=pose_root,
+        )
+    else:
+        labels_subdir = separate_subdir or "labels"
+        # Pose labels share their YOLO dataset root with seg labels but land
+        # in a different subdir. The seg-YOLO save already wrote the image
+        # to `<save_dir>/images/<stem>.jpg` when fmt is yolo/both. In
+        # labelme-only fmt the image is at `<save_dir>/<stem>.jpg` (root,
+        # not images/), so YOLO-pose would have no matching frame; we
+        # ensure one exists by always computing the YOLO-style image path
+        # and writing it ourselves below if it isn't already there.
+        _save_dir, _base, label_filepath, pose_image_target = _resolve_save_paths(
+            app, frame_idx, label_subdir=labels_subdir, label_ext="txt",
+            include_image=True,
+        )
 
     class_name_to_idx = {name: idx for idx, name in enumerate(app.yolo_class_names_for_save)} if app.yolo_class_names_for_save else {}
     default_label = app.default_object_label_var.get()
@@ -941,26 +1051,55 @@ def save_yolo_pose_format(app, frame_pil_image_rgb, frame_idx, masks_data_for_fr
     except Exception as e:
         logger.error(f"YOLO pose save failed {label_filepath}: {e}")
 
+    # Make sure the YOLO-pose dataset is self-consistent: the .txt at
+    # `<root>[/<sub>]/labels/<stem>.txt` needs a matching JPEG at
+    # `<root>[/<sub>]/images/<stem>.jpg`. Skip if the file already exists
+    # (the seg-YOLO save almost always populated it for the seg root case).
+    if pose_image_target:
+        try:
+            if not os.path.exists(pose_image_target):
+                if source_image_path and os.path.exists(source_image_path):
+                    import shutil as _shutil
+                    _shutil.copyfile(source_image_path, pose_image_target)
+                else:
+                    frame_pil_image_rgb.save(pose_image_target, "JPEG", quality=95)
+        except Exception as e:
+            logger.error(f"YOLO pose image save failed {pose_image_target}: {e}")
+
 
 def save_frame_dispatch(app, frame_pil, frame_idx, masks, video_name, pose_subdir=None):
     """Dispatch save for one frame across all requested output formats.
 
-    Consolidates the three-way dispatch block (YOLO seg + YOLO pose + labelme)
-    that used to be repeated at 3 call sites in app.py (cut_and_repropagate,
-    _cut_save_frames_0_to_n, _save_labels_thread). The dispatch honours
-    `app.save_format_var.get()` which is 'yolo' | 'labelme' | 'both'. Pose
-    labels are always written to a separate subdir (default 'pose_labels')
-    so they never collide with YOLO-seg label files.
+    The seg-label save honours `app.save_format_var` which is
+    'yolo' | 'labelme' | 'both' — these select the segmentation/box output
+    format only. Pose, however, is an independent annotation track:
+    YOLO-pose training does NOT require a YOLO-seg dataset, and the user
+    may want pose labels even when seg is being saved as LabelMe JSON. So
+    pose is dispatched whenever pose data exists in the frame, regardless
+    of `save_format_var`. Routing of the pose file (default
+    `<save_dir>/pose_labels/`, or the user-configured separate pose root
+    when enabled) is owned by `save_yolo_pose_format` itself.
     """
     fmt = app.save_format_var.get()
+    yolo_image_path = None
     if fmt in ("yolo", "both"):
-        save_yolo_format(app, frame_pil, frame_idx, masks, video_name)
-        save_yolo_pose_format(
-            app, frame_pil, frame_idx, masks, video_name,
-            separate_subdir=(pose_subdir or 'pose_labels')
-        )
+        yolo_image_path = save_yolo_format(app, frame_pil, frame_idx, masks, video_name)
     if fmt in ("labelme", "both"):
+        # In "both" mode, reuse the JPEG already encoded by save_yolo_format
+        # (byte-identical, quality=95) instead of re-encoding the same PIL.
         save_labelme_json(
             app, frame_pil, frame_idx, masks, video_name,
-            is_both_mode=(fmt == "both")
+            is_both_mode=(fmt == "both"),
+            source_image_path=yolo_image_path if fmt == "both" else None,
         )
+
+    # Pose is fully decoupled from the seg format selector. The function
+    # itself early-returns when the frame contains no pose points, so the
+    # call is cheap when no pose data exists. We hand it the JPEG path
+    # produced by the YOLO seg save (when present) so it can byte-copy
+    # rather than re-encode if it needs to populate its own images/.
+    save_yolo_pose_format(
+        app, frame_pil, frame_idx, masks, video_name,
+        separate_subdir=(pose_subdir or 'pose_labels'),
+        source_image_path=yolo_image_path,
+    )

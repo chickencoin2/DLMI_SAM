@@ -34,14 +34,42 @@ def pose_labels_subdir(app):
     return POSE_LABELS_SUBDIR
 
 
-def save_frames_0_to_n(app, slider_idx, save_labels, current_offset):
-    """Save propagated frames 0..slider_idx. Return number of saved frames."""
+def save_frames_0_to_n(app, slider_idx, save_labels, current_offset, inclusive=True):
+    """Save propagated frames 0..slider_idx (default inclusive). When
+    `inclusive=False`, saves 0..slider_idx-1 instead — used by Cut+DLMI and
+    Cut+Load, which intentionally do NOT save frame N because frame N is the
+    starting frame of the new sub-video and its labels will be re-emitted
+    from there. Returns number of saved frames.
+
+    Drives the propagate progress bar in the same style as the threaded
+    Confirm-Labels save (throttled to ~50 updates across the run). Cut runs
+    on the main Tk thread, so each progress update is paired with
+    `update_idletasks()` to flush the redraw and let the user see progress
+    while saving.
+    """
     if not save_labels:
         return 0
     saved_count = 0
-    frames_to_save = [f for f in app.propagated_results.keys() if f <= slider_idx]
+    upper = slider_idx if inclusive else slider_idx - 1
+    frames_to_save = sorted(f for f in app.propagated_results.keys() if f <= upper)
+    total_frames = len(frames_to_save)
     pose_subdir = pose_labels_subdir(app)
-    for frame_idx in sorted(frames_to_save):
+    video_name = (
+        os.path.splitext(os.path.basename(app.video_source_path))[0]
+        if isinstance(app.video_source_path, str) else "video"
+    )
+
+    progress_step = max(1, total_frames // 50) if total_frames > 0 else 1
+    last_reported = -1
+
+    if total_frames > 0:
+        try:
+            app.view.update_propagate_progress(0, f"Cut save: 0/{total_frames}")
+            app.root.update_idletasks()
+        except Exception:
+            pass
+
+    for i, frame_idx in enumerate(frames_to_save):
         result = app.propagated_results.get(frame_idx)
         if not result:
             continue
@@ -50,13 +78,30 @@ def save_frames_0_to_n(app, slider_idx, save_labels, current_offset):
         if frame_bgr is None or not masks:
             continue
         frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-        video_name = (
-            os.path.splitext(os.path.basename(app.video_source_path))[0]
-            if isinstance(app.video_source_path, str) else "video"
-        )
         actual_save_frame = current_offset + frame_idx
         save_frame_dispatch(app, frame_pil, actual_save_frame, masks, video_name, pose_subdir=pose_subdir)
         saved_count += 1
+
+        done = i + 1
+        if done == total_frames or done - last_reported >= progress_step:
+            last_reported = done
+            try:
+                pct = int(done / total_frames * 100) if total_frames > 0 else 100
+                app.view.update_propagate_progress(
+                    pct, f"Cut save: {done}/{total_frames} (frame {actual_save_frame})"
+                )
+                app.root.update_idletasks()
+            except Exception:
+                pass
+
+    if total_frames > 0:
+        try:
+            app.view.update_propagate_progress(
+                100, f"Cut save complete: {saved_count}/{total_frames}"
+            )
+            app.root.update_idletasks()
+        except Exception:
+            pass
     return saved_count
 
 
@@ -66,6 +111,7 @@ def reset_state_and_seek(app, next_start_frame):
     app.tracked_objects.clear()
     app.next_obj_id_to_propose = 1
     app._update_obj_id_info_label()
+    app.label_anchor_frame_idx = None
     app.is_tracking_ever_started = False
     app.inference_session = None
     app.pcs_inference_session = None
@@ -262,11 +308,39 @@ def seed_session_with_masks(app, oid_to_mask):
 
 def _yolo_dataset_prechecks(app):
     """Shared guard used by cut_and_{repropagate,dlmi_propagate,load_labels} when
-    save_format is YOLO/both: verify/initialise the YOLO dataset structure.
+    save_format is YOLO/both, OR when seg fmt is labelme but pose data exists
+    (then pose still gets saved as YOLO-pose, which needs a proper YOLO
+    dataset root with class names + data.yaml).
     Returns (ok: bool). False means user cancelled or init failed."""
-    if app.save_format_var.get() not in ["yolo", "both"]:
+    fmt = app.save_format_var.get()
+
+    has_any_pose_overall = False
+    try:
+        for _frame_idx, _result in app.propagated_results.items():
+            if _frame_idx in app.discarded_frames:
+                continue
+            _masks = _result.get('masks') if _result else None
+            if not _masks:
+                continue
+            for _oid, _odata in _masks.items():
+                if isinstance(_odata, dict) and _odata.get('pose_points'):
+                    has_any_pose_overall = True
+                    break
+            if has_any_pose_overall:
+                break
+    except Exception:
+        has_any_pose_overall = False
+
+    if fmt not in ["yolo", "both"] and not has_any_pose_overall:
         return True
-    save_dir = app._get_save_directory()
+
+    use_pose_root = bool(getattr(app, 'use_custom_pose_save_path_var', None) and
+                         app.use_custom_pose_save_path_var.get())
+    if use_pose_root and fmt == "labelme":
+        save_dir = app.custom_pose_save_dir_var.get()
+    else:
+        save_dir = app._get_save_directory()
+
     check_result = app._check_existing_yolo_dataset(save_dir)
     if check_result is None:
         return False
@@ -358,9 +432,13 @@ def cut_and_repropagate(app):
 
 
 def cut_and_dlmi_propagate(app):
-    """Cut at current frame, then DLMI-propagate the saved frame n's masks into
-    frame n+1 via a 2-frame mini inference session. After reset, frame n+1 appears
-    with auto-propagated masks (as if load labels was used)."""
+    """Cut at frame N (slider position): save 0..N-1, then start the new
+    sub-video AT original frame N (one frame before a plain Cut Here would).
+    The propagated masks already computed at frame N are reused as-is and
+    DLMI-injected into a fresh inference session anchored at frame N — no
+    mini-video propagation is needed because the masks the user already
+    confirmed at N are exactly what should seed N going forward.
+    """
     slider_idx = app.review_current_frame
     if slider_idx < 0:
         messagebox.showwarning("Info", "Please select a valid frame.", parent=app.root)
@@ -371,10 +449,18 @@ def cut_and_dlmi_propagate(app):
 
     current_offset = getattr(app, 'cut_start_frame', 0)
     absolute_cut_frame = current_offset + slider_idx
-    next_start_frame = absolute_cut_frame + 1
+    next_start_frame = absolute_cut_frame  # start the new sub-video at frame N itself
 
     if next_start_frame >= app.video_total_frames:
         messagebox.showwarning("Info", "This is the last frame. Cannot cut+DLMI.", parent=app.root)
+        return
+    if slider_idx == 0:
+        messagebox.showwarning(
+            "Info",
+            "Cut+DLMI requires at least one previously-labelled frame before the cut "
+            "point (frame N-1). Cannot cut at the first frame.",
+            parent=app.root
+        )
         return
 
     frame_n_result = app.propagated_results[slider_idx]
@@ -392,22 +478,11 @@ def cut_and_dlmi_propagate(app):
         messagebox.showwarning("Info", "No valid masks at current frame.", parent=app.root)
         return
 
-    if not app.cap:
-        messagebox.showerror("Error", "Video capture is not available.", parent=app.root)
-        return
-    saved_pos = app.cap.get(cv2.CAP_PROP_POS_FRAMES)
-    app.cap.set(cv2.CAP_PROP_POS_FRAMES, next_start_frame)
-    ret, frame_n_plus_1_bgr = app.cap.read()
-    app.cap.set(cv2.CAP_PROP_POS_FRAMES, saved_pos)
-    if not ret or frame_n_plus_1_bgr is None:
-        messagebox.showerror("Error", "Failed to read frame n+1 from video.", parent=app.root)
-        return
-
-    frames_to_save = [f for f in app.propagated_results.keys() if f <= slider_idx]
+    frames_to_save = [f for f in app.propagated_results.keys() if f <= slider_idx - 1]
     response = messagebox.askyesnocancel(
         "Cut + DLMI",
-        f"Save labels for frames 0~{slider_idx} ({len(frames_to_save)} frames),\n"
-        f"then DLMI-propagate {slider_idx}→{slider_idx+1} using mini-video?\n\n"
+        f"Save labels for frames 0~{slider_idx - 1} ({len(frames_to_save)} frames),\n"
+        f"then restart the new sub-video at frame {slider_idx} reusing its masks via DLMI?\n\n"
         f"Yes: Save then cut+DLMI\n"
         f"No: Cut+DLMI without saving labels\n"
         f"Cancel: Abort",
@@ -420,45 +495,80 @@ def cut_and_dlmi_propagate(app):
     if save_labels and not _yolo_dataset_prechecks(app):
         return
 
-    saved_count = save_frames_0_to_n(app, slider_idx, save_labels, current_offset)
-
-    app.update_status("Cut+DLMI: running mini-video propagation...")
-    app.root.update_idletasks()
-    propagated_n1 = dlmi_mini_propagate_n_to_n1(app, frame_n_bgr, frame_n_plus_1_bgr, frame_n_masks)
+    # Save 0..N-1 only — frame N is intentionally NOT saved here because it
+    # becomes the starting frame of the new sub-video.
+    saved_count = save_frames_0_to_n(app, slider_idx, save_labels, current_offset, inclusive=False)
 
     if not reset_state_and_seek(app, next_start_frame):
         return
 
+    if frame_n_bgr is not None:
+        app.current_cv_frame = frame_n_bgr
+
+    # The new sub-video's frame 0 IS the original frame N. Use its already
+    # computed propagated masks directly — no mini-video propagation, no
+    # accuracy loss vs. the frame the user just reviewed.
+    propagated_n1 = {oid: data['mask'] for oid, data in frame_n_masks.items()}
+
     if propagated_n1:
+        synthetic_masks = {}
         for oid, mask in propagated_n1.items():
             if mask is None or not mask.any():
                 continue
             label = frame_n_masks.get(oid, {}).get('label', f'Object_{oid}')
+            mask_bool = mask.astype(bool)
             app.tracked_objects[oid] = {
                 'custom_label': label,
-                'last_mask': mask.astype(bool),
+                'last_mask': mask_bool,
                 'is_polygon_object': False,
+            }
+            synthetic_masks[oid] = {
+                'last_mask': mask_bool,
+                'custom_label': label,
             }
             app.next_obj_id_to_propose = max(app.next_obj_id_to_propose, int(oid) + 1)
         app._update_obj_id_info_label()
+
+        # Stamp a synthetic propagated_results[0] so any redraw triggered
+        # by slider events (review_frame_slider.set(0) inside
+        # reset_state_and_seek fires _on_review_slider_change →
+        # on_review_frame_change(0)) finds this frame in propagated_results
+        # and shows the masks instead of silently clearing them via the
+        # empty-results fallback path.
+        if synthetic_masks and app.current_cv_frame is not None:
+            app.propagated_results[0] = {
+                'frame': app.current_cv_frame.copy(),
+                'masks': synthetic_masks,
+            }
+
         if app.current_cv_frame is not None:
             app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
+        # Seed the fresh inference session at frame 0 (= original frame N)
+        # with these masks, optionally with DLMI injection on the memory
+        # encode path (controlled inside seed_session_with_masks via the
+        # standard injection flag).
         seed_session_with_masks(app, propagated_n1)
+        if app.current_cv_frame is not None:
+            app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
 
     app.update_status(
-        f"Cut+DLMI complete. {saved_count} frames saved. "
-        f"{len(propagated_n1)} objects propagated to frame {next_start_frame}."
+        f"Cut+DLMI complete. {saved_count} frames saved (0~{absolute_cut_frame - 1}). "
+        f"{len(propagated_n1)} objects reused at frame {next_start_frame}."
     )
     app.view.update_propagate_progress(
         0, f"Cut+DLMI complete (new video from original frame {next_start_frame})"
     )
     messagebox.showinfo(
         "Cut + DLMI Complete",
-        f"{saved_count} frames saved.\n"
-        f"{len(propagated_n1)} objects DLMI-propagated to frame {next_start_frame}.\n\n"
+        f"{saved_count} frames saved (0~{absolute_cut_frame - 1}).\n"
+        f"{len(propagated_n1)} objects reused at frame {next_start_frame} via DLMI.\n\n"
         f"Review the masks and click 'Start Propagation' to continue.",
         parent=app.root
     )
+
+    # Final defensive redraw after the modal dialog closes.
+    if app.current_cv_frame is not None:
+        app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
 
 
 def cut_and_load_labels(app):
@@ -467,20 +577,72 @@ def cut_and_load_labels(app):
     if slider_idx < 0:
         messagebox.showwarning("Info", "Please select a valid frame.", parent=app.root)
         return
+    if slider_idx not in app.propagated_results:
+        messagebox.showwarning("Info", f"Frame {slider_idx} has no propagated result.", parent=app.root)
+        return
 
     current_offset = getattr(app, 'cut_start_frame', 0)
     absolute_cut_frame = current_offset + slider_idx
-    next_start_frame = absolute_cut_frame + 1
+    next_start_frame = absolute_cut_frame  # start the new sub-video at frame N itself
 
     if next_start_frame >= app.video_total_frames:
         messagebox.showwarning("Info", "This is the last frame. Cannot cut+load.", parent=app.root)
         return
+    if slider_idx == 0:
+        messagebox.showwarning(
+            "Info",
+            "Cut+Load requires at least one previously-labelled frame before the cut "
+            "point (frame N-1). Cannot cut at the first frame.",
+            parent=app.root
+        )
+        return
 
-    frames_to_save = [f for f in app.propagated_results.keys() if f <= slider_idx]
+    # Capture frame N's existing propagated masks BEFORE reset wipes them.
+    frame_n_result = app.propagated_results[slider_idx]
+    frame_n_objects = []  # list of {'label', 'bbox', 'polygon'} like load_label_file's parsers emit
+    for oid, odata in frame_n_result.get('masks', {}).items():
+        m = odata.get('last_mask')
+        if m is None or not m.any():
+            continue
+        label = odata.get('custom_label', f'Object_{int(oid)}')
+        # Derive bbox + polygon contour from the existing mask so
+        # _apply_loaded_labels_as_prompts (PVS) and
+        # _apply_loaded_labels_as_polygon_masks (low-level API) both have what
+        # they need. This mirrors the structure produced by
+        # parse_labelme_json / parse_yolo_txt.
+        ys, xs = np.where(m)
+        if len(xs) == 0 or len(ys) == 0:
+            continue
+        x1, y1 = int(xs.min()), int(ys.min())
+        x2, y2 = int(xs.max()), int(ys.max())
+        polygon = None
+        try:
+            mask_uint8 = m.astype(np.uint8)
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                if len(largest) >= 3:
+                    polygon = [[int(p[0][0]), int(p[0][1])] for p in largest]
+        except Exception:
+            polygon = None
+        obj_entry = {
+            'label': label,
+            'bbox': [x1, y1, x2, y2],
+        }
+        if polygon is not None:
+            obj_entry['polygon'] = polygon
+        frame_n_objects.append(obj_entry)
+
+    if not frame_n_objects:
+        messagebox.showwarning("Info", "No valid masks at current frame.", parent=app.root)
+        return
+
+    frames_to_save = [f for f in app.propagated_results.keys() if f <= slider_idx - 1]
     response = messagebox.askyesnocancel(
         "Cut + Load Labels",
-        f"Save labels for frames 0~{slider_idx} ({len(frames_to_save)} frames),\n"
-        f"then load an external label file for frame {next_start_frame}?\n\n"
+        f"Save labels for frames 0~{slider_idx - 1} ({len(frames_to_save)} frames),\n"
+        f"then restart the new sub-video at frame {slider_idx} reusing its masks via the\n"
+        f"same path as the 'Load Labels' button?\n\n"
         f"Yes: Save then cut+load\n"
         f"No: Cut+load without saving labels\n"
         f"Cancel: Abort",
@@ -493,22 +655,42 @@ def cut_and_load_labels(app):
     if save_labels and not _yolo_dataset_prechecks(app):
         return
 
-    saved_count = save_frames_0_to_n(app, slider_idx, save_labels, current_offset)
+    # Save 0..N-1 only — frame N is intentionally NOT saved here because it
+    # becomes the starting frame of the new sub-video and will be re-emitted
+    # from there.
+    saved_count = save_frames_0_to_n(app, slider_idx, save_labels, current_offset, inclusive=False)
 
     if not reset_state_and_seek(app, next_start_frame):
         return
 
-    messagebox.showinfo(
-        "Select Label File",
-        f"Cut complete. {saved_count} frames saved.\n"
-        f"Now select a label file (LabelMe JSON or YOLO txt) to load for frame {next_start_frame}.",
-        parent=app.root
-    )
-    app.load_label_file()
+    # Feed the frame-N masks straight through the same path the Load Labels
+    # button uses (PVS bbox prompts, PCS exemplars, or low-level polygon-mask
+    # injection — picked by current prompt_mode_var and low_level_api_var).
+    app._apply_loaded_objects(frame_n_objects, source_desc=f"cut+load@frame{slider_idx}")
+
+    # Mirror tracked_objects into propagated_results[0] so any redraw
+    # triggered by slider/notebook events finds the masks instead of falling
+    # through to the empty-results fallback path that wipes the canvas.
+    if app.tracked_objects and app.current_cv_frame is not None:
+        synthetic_masks = {}
+        for oid, data in app.tracked_objects.items():
+            mask = data.get('last_mask') if data else None
+            if mask is None or not mask.any():
+                continue
+            synthetic_masks[oid] = {
+                'last_mask': mask,
+                'custom_label': data.get('custom_label', f'Object_{oid}'),
+            }
+        if synthetic_masks:
+            app.propagated_results[0] = {
+                'frame': app.current_cv_frame.copy(),
+                'masks': synthetic_masks,
+            }
+        app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
 
     app.update_status(
-        f"Cut+Load complete. {saved_count} frames saved. "
-        f"Labels loaded for frame {next_start_frame}."
+        f"Cut+Load complete. {saved_count} frames saved (0~{absolute_cut_frame - 1}). "
+        f"{len(frame_n_objects)} objects reused at frame {next_start_frame}."
     )
     app.view.update_propagate_progress(
         0, f"Cut+Load complete (new video from original frame {next_start_frame})"

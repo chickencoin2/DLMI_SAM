@@ -34,8 +34,44 @@ def confirm_and_save_labels(app):
     if not response:
         return
 
-    if app.save_format_var.get() in ["yolo", "both"]:
-        save_dir = app._get_save_directory()
+    fmt = app.save_format_var.get()
+
+    # Pose YOLO save runs whenever any frame has pose data, even when seg fmt
+    # is "labelme" (segment as LabelMe JSON, pose as YOLO-pose). In that case
+    # we still need a valid YOLO class list and data.yaml so the pose .txt
+    # files have meaningful class indices and the resulting folder is a
+    # trainable YOLO-pose dataset.
+    has_any_pose_overall = False
+    try:
+        for _frame_idx, _result in app.propagated_results.items():
+            if _frame_idx in app.discarded_frames:
+                continue
+            _masks = _result.get('masks') if _result else None
+            if not _masks:
+                continue
+            for _oid, _odata in _masks.items():
+                if isinstance(_odata, dict) and _odata.get('pose_points'):
+                    has_any_pose_overall = True
+                    break
+            if has_any_pose_overall:
+                break
+    except Exception:
+        has_any_pose_overall = False
+
+    needs_yolo_dataset = fmt in ["yolo", "both"] or has_any_pose_overall
+
+    if needs_yolo_dataset:
+        # Pick the dataset root: when the user has configured a dedicated
+        # pose root AND seg fmt is labelme-only, the YOLO dataset (= pose
+        # dataset) belongs under that pose root. Otherwise it lives under
+        # the regular save dir.
+        use_pose_root = bool(getattr(app, 'use_custom_pose_save_path_var', None) and
+                             app.use_custom_pose_save_path_var.get())
+        if use_pose_root and fmt == "labelme":
+            save_dir = app.custom_pose_save_dir_var.get()
+        else:
+            save_dir = app._get_save_directory()
+
         check_result = app._check_existing_yolo_dataset(save_dir)
         if check_result is None:
             return
@@ -99,6 +135,11 @@ def _save_labels_thread(app):
             logger.info(f"Label saving: {skipped_count} frames excluded by discard marking")
 
         saved_count = 0
+        # Throttle progress callbacks: at most ~50 idle-callbacks across the
+        # whole save run (every ~2% of progress) so the Tk main loop isn't
+        # flooded by per-frame `after(0, ...)` posts when saving many frames.
+        progress_step = max(1, total_frames // 50) if total_frames > 0 else 1
+        last_reported_progress = -1
         for i, (frame_idx, result) in enumerate(sorted(frames_to_save.items())):
             frame_bgr = result['frame']
             masks_data = result['masks']
@@ -110,9 +151,12 @@ def _save_labels_thread(app):
             save_frame_dispatch(app, frame_pil, actual_frame_num, masks_data, frame_base_name, pose_subdir=pose_subdir)
             saved_count += 1
 
-            progress = int((i + 1) / total_frames * 100) if total_frames > 0 else 100
-            app.root.after(0, app.view.update_propagate_progress, progress,
-                           f"Saving: {i + 1}/{total_frames} (frame {actual_frame_num})")
+            done = i + 1
+            if done == total_frames or done - last_reported_progress >= progress_step:
+                last_reported_progress = done
+                progress = int(done / total_frames * 100) if total_frames > 0 else 100
+                app.root.after(0, app.view.update_propagate_progress, progress,
+                               f"Saving: {done}/{total_frames} (frame {actual_frame_num})")
 
         app.discarded_frames.clear()
         app.root.after(0, app.view.update_discarded_frames_display, set())

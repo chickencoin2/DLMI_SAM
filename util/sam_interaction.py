@@ -42,7 +42,7 @@ def prepare_and_conditionally_reset_sam3(app, target_existing_obj_id, proposed_o
             return False
 
         if app.inference_session is None:
-            if not app._init_inference_session():
+            if not app._init_inference_session(preserve_annotations=True):
                 logger.error("SAM3 inference session initialization failed")
                 return False
 
@@ -134,7 +134,7 @@ def prepare_and_conditionally_reset_sam3(app, target_existing_obj_id, proposed_o
             tk.messagebox.showerror("Error", "No current frame information during first frame loading.", parent=app.root)
             return False
 
-        if not app._init_inference_session():
+        if not app._init_inference_session(preserve_annotations=True):
             logger.error("SAM3 inference session initialization failed")
             return False
 

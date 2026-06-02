@@ -43,6 +43,11 @@ class AppView:
             self.top_frame, text="Hide Tabs",
             command=self._toggle_tabs_visibility, bg="#fff9c4"
         )
+        self.btn_save_settings = tk.Button(
+            self.top_frame, text="Save Settings",
+            command=self.app.save_user_settings if hasattr(self.app, 'save_user_settings') else None,
+            bg="#c8e6c9"
+        )
 
         self.notebook = ttk.Notebook(self.controls_and_config_frame)
 
@@ -108,6 +113,16 @@ class AppView:
         self.guide_toggle_frame = tk.Frame(self.selected_obj_action_frame)
         self.guide_visible = False
         self.btn_guide_toggle = tk.Button(self.guide_toggle_frame, text="▶ Guide", font=("TkDefaultFont", 8), command=self._toggle_guide_visibility)
+        self.btn_negative_area = tk.Button(
+            self.guide_toggle_frame, text="✂ Negative Area", font=("TkDefaultFont", 8),
+            command=self.app.toggle_negative_area_mode if hasattr(self.app, 'toggle_negative_area_mode') else None,
+            bg="#ffe0b2"
+        )
+        self.btn_multi_choose = tk.Button(
+            self.guide_toggle_frame, text="▦ Multi Choose", font=("TkDefaultFont", 8),
+            command=self.app.toggle_multi_choose_mode if hasattr(self.app, 'toggle_multi_choose_mode') else None,
+            bg="#c5e1a5"
+        )
         self.guide_label = tk.Label(self.selected_obj_action_frame, text=selection_guide_text, justify=tk.LEFT, fg="gray50", font=("TkDefaultFont", 8))
         self.button_frame = tk.Frame(self.selected_obj_action_frame)
         self.btn_set_custom_label = tk.Button(self.button_frame, text="Set Name", command=self.app._set_custom_label_for_selected, state=tk.DISABLED)
@@ -245,6 +260,19 @@ class AppView:
             command=self._on_ui_display_change, font=("TkDefaultFont", 8)
         )
 
+        self.polygon_vertex_size_frame = tk.Frame(self.ui_display_frame)
+        self.polygon_vertex_size_label = tk.Label(self.polygon_vertex_size_frame, text="Polygon Point(%):", font=("TkDefaultFont", 8))
+        self.polygon_vertex_size_entry = tk.Entry(self.polygon_vertex_size_frame, width=5, justify=tk.CENTER)
+        _pv_default = 0.40
+        if hasattr(self.app, 'polygon_vertex_size_percent_var'):
+            try:
+                _pv_default = float(self.app.polygon_vertex_size_percent_var.get())
+            except Exception:
+                _pv_default = 0.40
+        self.polygon_vertex_size_entry.insert(0, f"{_pv_default:.2f}")
+        self.polygon_vertex_size_entry.bind("<Return>", self._on_polygon_vertex_size_change)
+        self.polygon_vertex_size_entry.bind("<FocusOut>", self._on_polygon_vertex_size_change)
+
         self.small_obj_filter_frame = tk.Frame(self.batch_control_frame)
         self.check_filter_small_obj = tk.Checkbutton(
             self.small_obj_filter_frame, text="Filter Small Objects",
@@ -322,17 +350,39 @@ class AppView:
         self.entry_custom_file_name = tk.Entry(self.custom_save_widgets_frame, textvariable=self.app.custom_file_name_var)
         self.custom_format_label = tk.Label(self.custom_save_widgets_frame, text="* Format: {video_name} available", fg="gray50")
 
+        # Separate pose-label save path. When enabled, YOLO-pose .txt files go
+        # exclusively to this root (with per-video subfolder rules mirroring
+        # the seg save), so videos that have no pose data emit nothing into
+        # this folder while seg labels for the same video continue to land
+        # under the regular Save Location.
+        self.check_custom_pose_save = tk.Checkbutton(
+            self.save_options_frame,
+            text="Use Separate Pose Save Path",
+            variable=self.app.use_custom_pose_save_path_var,
+            command=self.app._on_custom_pose_save_toggle,
+        )
+        self.custom_pose_save_widgets_frame = tk.Frame(self.save_options_frame)
+        self.custom_pose_save_dir_label = tk.Label(self.custom_pose_save_widgets_frame, text="Pose Save Location:")
+        self.entry_custom_pose_save_dir = tk.Entry(
+            self.custom_pose_save_widgets_frame,
+            textvariable=self.app.custom_pose_save_dir_var, width=18
+        )
+        self.btn_select_pose_save_dir = tk.Button(
+            self.custom_pose_save_widgets_frame, text="...",
+            command=self.app.select_custom_pose_save_dir, width=3
+        )
+
         self.check_batch_mode = tk.Checkbutton(self.batch_options_frame, text="Enable Batch Processing Mode", variable=self.app.batch_processing_mode_var, command=self.app._on_batch_mode_toggle)
         self.batch_widgets_frame = tk.Frame(self.batch_options_frame)
         self.batch_dir_label = tk.Label(self.batch_widgets_frame, text="Video Folder:")
         self.entry_batch_dir = tk.Entry(self.batch_widgets_frame, textvariable=self.app.batch_source_dir_var, width=18)
         self.btn_select_batch_dir = tk.Button(self.batch_widgets_frame, text="...", command=self.app.select_batch_source_dir, width=3)
         self.btn_start_batch = tk.Button(self.batch_widgets_frame, text="Start Batch", command=self.app.start_batch_processing)
-        self.batch_save_label = tk.Label(self.batch_widgets_frame, text="Save Method:")
+        self.batch_save_label = tk.Label(self.batch_widgets_frame, text="Save:")
         self.batch_save_rb_frame = tk.Frame(self.batch_widgets_frame)
         self.rb_subfolder = tk.Radiobutton(self.batch_save_rb_frame, text="Create Subfolder", variable=self.app.batch_save_option_var, value="subfolder")
         self.rb_singlefolder = tk.Radiobutton(self.batch_save_rb_frame, text="Single Folder", variable=self.app.batch_save_option_var, value="singlefolder")
-        self.batch_filename_label = tk.Label(self.batch_widgets_frame, text="Filename Method:")
+        self.batch_filename_label = tk.Label(self.batch_widgets_frame, text="Filename:")
         self.batch_filename_rb_frame = tk.Frame(self.batch_widgets_frame)
         self.rb_fname_video = tk.Radiobutton(self.batch_filename_rb_frame, text="Use Video Name", variable=self.app.batch_filename_option_var, value="video_name")
         self.rb_fname_custom = tk.Radiobutton(self.batch_filename_rb_frame, text="Use Custom Name", variable=self.app.batch_filename_option_var, value="custom")
@@ -629,6 +679,7 @@ class AppView:
         self.btn_clear_tracked.pack(side=tk.LEFT, padx=2)
         self.btn_load_label.pack(side=tk.RIGHT, padx=2)
         self.btn_toggle_tabs.pack(side=tk.RIGHT, padx=2)
+        self.btn_save_settings.pack(side=tk.RIGHT, padx=2)
 
         self.notebook.pack(fill=tk.BOTH, expand=True)
         self.obj_control_tab.columnconfigure(0, weight=1)
@@ -663,6 +714,8 @@ class AppView:
         self.selected_obj_action_frame.grid(row=1, column=0, padx=5, pady=5, sticky='ew')
         self.guide_toggle_frame.pack(side=tk.TOP, anchor='w', padx=5, pady=2)
         self.btn_guide_toggle.pack(side=tk.LEFT)
+        self.btn_negative_area.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_multi_choose.pack(side=tk.LEFT, padx=(4, 0))
         self.button_frame.pack(side=tk.TOP, fill=tk.X)
         self.btn_low_data_inject = tk.Button(self.button_frame, text="Inject Data", command=self.app.inject_low_level_mask_prompt if hasattr(self.app, 'inject_low_level_mask_prompt') else None, state=tk.DISABLED, bg="#e1bee7")
         self.btn_low_data_inject.pack(side=tk.LEFT, padx=3)
@@ -709,6 +762,9 @@ class AppView:
         self.show_border_check.pack(side=tk.LEFT, padx=2)
         self.show_prompt_viz_check.pack(side=tk.LEFT, padx=2)
         self.show_prompt_per_object_check.pack(side=tk.LEFT, padx=2)
+        self.polygon_vertex_size_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.polygon_vertex_size_label.pack(side=tk.LEFT)
+        self.polygon_vertex_size_entry.pack(side=tk.LEFT, padx=(2, 8))
 
         self.batch_control_frame.grid(row=5, column=0, padx=5, pady=5, sticky='ew')
         self.small_obj_filter_frame.pack(pady=2, padx=5, fill=tk.X)
@@ -747,6 +803,13 @@ class AppView:
         self.custom_file_name_label.grid(row=2, column=0, sticky='e', pady=2, padx=2)
         self.entry_custom_file_name.grid(row=2, column=1, columnspan=2, sticky='ew')
         self.custom_format_label.grid(row=3, column=1, sticky='w')
+
+        self.check_custom_pose_save.pack(anchor='w', padx=5, pady=(6, 0))
+        self.custom_pose_save_widgets_frame.pack(anchor='w', padx=5, fill='x')
+        self.custom_pose_save_widgets_frame.columnconfigure(1, weight=1)
+        self.custom_pose_save_dir_label.grid(row=0, column=0, sticky='e', pady=2, padx=2)
+        self.entry_custom_pose_save_dir.grid(row=0, column=1, sticky='ew')
+        self.btn_select_pose_save_dir.grid(row=0, column=2, padx=(2, 0))
         
         self.check_batch_mode.pack(anchor='w', padx=5)
         self.batch_widgets_frame.pack(anchor='w', padx=5, fill='x')
@@ -869,6 +932,7 @@ class AppView:
         logger.debug("Widget layout complete.")
 
         self.update_custom_save_options_state()
+        self.update_custom_pose_save_options_state()
         self.update_batch_options_state()
         self._update_pcs_mode_ui()
 
@@ -1099,6 +1163,18 @@ class AppView:
             except tk.TclError:
                 pass
 
+    def update_custom_pose_save_options_state(self):
+        state = tk.NORMAL if self.app.use_custom_pose_save_path_var.get() else tk.DISABLED
+        for widget in self.custom_pose_save_widgets_frame.winfo_children():
+            try:
+                if isinstance(widget, tk.Entry) and state == tk.DISABLED:
+                    widget.config(state=tk.NORMAL)
+                    widget.config(state='readonly')
+                else:
+                    widget.config(state=state)
+            except tk.TclError:
+                pass
+
     def update_batch_options_state(self):
         state = tk.NORMAL if self.app.batch_processing_mode_var.get() else tk.DISABLED
         for widget in self.batch_widgets_frame.winfo_children():
@@ -1183,6 +1259,7 @@ class AppView:
             w.bind("<Leave>", _leave)
 
         self.notebook.add(wrapper, text=tab_text)
+        inner._tab_wrapper = wrapper
         return inner
 
     def _on_tab_changed(self, event=None):
@@ -1398,6 +1475,29 @@ class AppView:
             self.btn_guide_toggle.config(text="▼ Guide")
             self.guide_visible = True
 
+    def update_negative_area_mode_ui(self, active):
+        """Reflect the negative-area-mode state on the toggle button."""
+        if not hasattr(self, 'btn_negative_area') or self.btn_negative_area is None:
+            return
+        try:
+            if active:
+                self.btn_negative_area.config(text="✂ Negative ON", bg="#ef9a9a", relief=tk.SUNKEN)
+            else:
+                self.btn_negative_area.config(text="✂ Negative Area", bg="#ffe0b2", relief=tk.RAISED)
+        except tk.TclError:
+            pass
+
+    def update_multi_choose_mode_ui(self, active):
+        if not hasattr(self, 'btn_multi_choose') or self.btn_multi_choose is None:
+            return
+        try:
+            if active:
+                self.btn_multi_choose.config(text="▦ Multi ON", bg="#9ccc65", relief=tk.SUNKEN)
+            else:
+                self.btn_multi_choose.config(text="▦ Multi Choose", bg="#c5e1a5", relief=tk.RAISED)
+        except tk.TclError:
+            pass
+
     def _on_small_obj_filter_change(self):
         if hasattr(self.app, 'current_cv_frame') and self.app.current_cv_frame is not None:
             if hasattr(self.app, '_get_current_masks_for_display'):
@@ -1456,6 +1556,21 @@ class AppView:
             logger.warning("Point size must be a number.")
             self.polygon_point_size_entry.delete(0, tk.END)
             self.polygon_point_size_entry.insert(0, "0.40")
+
+    def _on_polygon_vertex_size_change(self, event=None):
+        try:
+            value = float(self.polygon_vertex_size_entry.get())
+            value = max(0.1, min(5.0, value))
+            self.polygon_vertex_size_entry.delete(0, tk.END)
+            self.polygon_vertex_size_entry.insert(0, f"{value:.2f}")
+            if hasattr(self.app, 'polygon_vertex_size_percent_var'):
+                self.app.polygon_vertex_size_percent_var.set(value)
+            self._on_ui_display_change()
+            logger.info(f"Polygon vertex point size changed: {value}%")
+        except ValueError:
+            logger.warning("Polygon point size must be a number.")
+            self.polygon_vertex_size_entry.delete(0, tk.END)
+            self.polygon_vertex_size_entry.insert(0, "0.40")
 
     def _on_font_size_change(self, event=None):
         try:

@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
+import math
 import os
 import threading
 import numpy as np
@@ -71,7 +72,7 @@ class SAM3AutolabelApp:
 
     def __init__(self, root_window):
         self.root = root_window
-        self.root.title("DLMI-SAM labeler v1.1_test")
+        self.root.title("DLMI-SAM labeler v1.2_test")
 
         self.video_source_path = None
         self.cap = None
@@ -172,6 +173,25 @@ class SAM3AutolabelApp:
         self.polygon_points = []
         self.polygon_objects = []
 
+        # Slider-relative index of the frame the user started pre-propagate
+        # labelling on. Stays None until the first label is created. While
+        # set, that frame is the only one where new labels are allowed; if
+        # the user navigates elsewhere and comes back, the existing masks
+        # are re-displayed; if they try to label on a different frame, a
+        # confirm dialog asks whether to discard the anchor labels and
+        # re-anchor here. After Start Propagate fires, propagated_results
+        # becomes the source of truth and this anchor is cleared.
+        self.label_anchor_frame_idx = None
+
+        self.negative_area_mode_active = False
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+
+        self.multi_choose_mode_active = False
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+
         self.ignore_edge_labels_var = tk.BooleanVar(value=False)
         self.edge_margin_var = tk.IntVar(value=DEFAULT_EDGE_MARGIN)
 
@@ -184,6 +204,16 @@ class SAM3AutolabelApp:
         self.custom_save_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), AUTOLABEL_FOLDER, "custom_output"))
         self.custom_folder_name_var = tk.StringVar(value="{video_name}_dataset")
         self.custom_file_name_var = tk.StringVar(value="{video_name}_frame")
+
+        # Optional: route YOLO-pose labels to a separate root that's fully
+        # decoupled from the seg-label save dir. When a video in batch has no
+        # pose points, no pose file is emitted for it (existing data-driven
+        # behaviour) — combined with this routing, pose-less and pose-having
+        # videos in the same batch end up in cleanly separated folders.
+        self.use_custom_pose_save_path_var = tk.BooleanVar(value=False)
+        self.custom_pose_save_dir_var = tk.StringVar(
+            value=os.path.join(os.getcwd(), AUTOLABEL_FOLDER, "custom_pose_output")
+        )
 
         self.batch_processing_mode_var = tk.BooleanVar(value=False)
         self.batch_source_dir_var = tk.StringVar()
@@ -244,6 +274,7 @@ class SAM3AutolabelApp:
 
         self.label_font_size_percent_var = tk.DoubleVar(value=0.7)
         self.polygon_point_size_percent_var = tk.DoubleVar(value=0.4)
+        self.polygon_vertex_size_percent_var = tk.DoubleVar(value=0.4)
         self.show_object_border_var = tk.BooleanVar(value=False)
         self.tabs_visible_var = tk.BooleanVar(value=True)
         self.show_prompt_visualization_var = tk.BooleanVar(value=False)
@@ -274,16 +305,38 @@ class SAM3AutolabelApp:
         try: self.label_font = ImageFont.truetype("arial.ttf", 15)
         except IOError: self.label_font = ImageFont.load_default()
 
+        # Cache for dynamic-sized labels in _display_cv_frame_on_view.
+        # Keys: int font_size; values: ImageFont object. Avoids opening the
+        # TrueType file from disk for every label on every redraw.
+        self._dynamic_font_cache = {}
+        self._dynamic_font_paths = (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        )
+
         if torch.cuda.is_available(): self.device = torch.device("cuda")
         elif torch.backends.mps.is_available(): self.device = torch.device("mps"); logger.info("Using MPS.")
         else: self.device = torch.device("cpu")
         logger.info(f"Device: {self.device}")
 
         self.autocast_context = torch.autocast("cuda", dtype=torch.float32) if self.device.type == "cuda" else contextlib.nullcontext()
-        
+
         self.sam_interaction_module = sam_interaction
         self.autolabel_workflow_module = autolabel_workflow
-        
+
+        # Auto-load persisted user settings before AppView is constructed so
+        # widgets that bind directly to tk.Variables pick up the loaded
+        # values on first paint instead of resetting to module defaults.
+        self._user_settings_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "user_settings.json"
+        )
+        try:
+            self._load_user_settings()
+        except Exception as _settings_err:
+            logger.warning(f"User settings auto-load skipped: {_settings_err}")
+
         self.view = AppView(self.root, self)
 
         self._suppress_pose_class_trace = False
@@ -341,11 +394,101 @@ class SAM3AutolabelApp:
         )
         return result
 
+    def _is_pre_propagate_phase(self):
+        """True when no propagation has run yet for the current source/cut.
+        In this phase the user is composing prompts at a single anchor
+        frame; navigating to other frames must not destroy that work."""
+        if self.app_state in ("PROPAGATING", "PAUSED", "REVIEWING", "LABELING"):
+            return False
+        if self.propagated_results:
+            return False
+        return True
+
+    def _ensure_label_anchor_or_confirm_switch(self):
+        """Guard for any pre-propagate labeling action. Returns True when
+        the caller may proceed at the current slider frame.
+
+        - If we're not in pre-propagate, returns True (existing flow rules).
+        - If no anchor is set yet, captures the current frame as anchor.
+        - If the current frame is the anchor, returns True.
+        - Otherwise, prompts: discard anchor labels and re-anchor here
+          (Yes), or cancel and snap the slider back to the anchor frame
+          so the in-progress labels are preserved (No).
+        """
+        if not self._is_pre_propagate_phase():
+            return True
+
+        cur = getattr(self, 'review_current_frame', 0)
+
+        if self.label_anchor_frame_idx is None:
+            if self.tracked_objects or self.polygon_objects:
+                self.label_anchor_frame_idx = cur
+            else:
+                self.label_anchor_frame_idx = cur
+            return True
+
+        if cur == self.label_anchor_frame_idx:
+            return True
+
+        if not self.tracked_objects and not self.polygon_objects:
+            # Nothing to lose — silently move the anchor to the new frame.
+            self.label_anchor_frame_idx = cur
+            return True
+
+        cut_offset = getattr(self, 'cut_start_frame', 0)
+        anchor_abs = self.label_anchor_frame_idx + cut_offset
+        cur_abs = cur + cut_offset
+        proceed = messagebox.askyesno(
+            "Switch labeling frame?",
+            f"You started labeling at frame {anchor_abs}.\n\n"
+            f"Discard those labels and start over at frame {cur_abs}?\n\n"
+            f"Yes: Clear current labels and restart here\n"
+            f"No: Cancel — go back to frame {anchor_abs} to continue",
+            parent=self.root,
+        )
+        if not proceed:
+            try:
+                if hasattr(self, 'view') and hasattr(self.view, 'review_frame_slider'):
+                    self.view.review_frame_slider.set(self.label_anchor_frame_idx)
+            except Exception:
+                pass
+            return False
+
+        # User chose to discard and re-anchor here.
+        self.tracked_objects.clear()
+        self.next_obj_id_to_propose = 1
+        self.polygon_mode_active = False
+        self.polygon_points = []
+        self.polygon_objects.clear()
+        try:
+            if hasattr(self, 'object_prompt_history'):
+                self.object_prompt_history.clear()
+        except Exception:
+            pass
+        self.selected_object_sam_id = None
+        self.selected_objects_sam_ids.clear()
+        try:
+            self._reset_inference_session()
+        except Exception as _e:
+            logger.debug(f"_reset_inference_session in anchor switch: {_e}")
+        self.label_anchor_frame_idx = cur
+        self._update_obj_id_info_label()
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, {})
+        return True
+
     def _handle_sam_prompt_wrapper(self, prompt_type, coords, label=None,
                                   proposed_obj_id_for_new=None, target_existing_obj_id=None,
                                   custom_label=None):
         if self.app_state == "PAUSED":
             self.update_status("Paused: BBox/Point prompts blocked (session protection). Use polygon mode + DLMI injection instead.")
+            return
+
+        # Pre-propagate cross-frame guard: a SAM3 session built at one
+        # anchor frame is meaningless on other frames, so any prompt input
+        # has to be on the anchor. If the user is on a different frame,
+        # ask whether to discard the anchor labels and restart here.
+        if not self._ensure_label_anchor_or_confirm_switch():
             return
 
         is_new_object = (proposed_obj_id_for_new is not None) and (target_existing_obj_id is None)
@@ -464,6 +607,9 @@ class SAM3AutolabelApp:
             new_id = max(snapshot.keys()) + 1
         self.next_obj_id_to_propose = max(self.next_obj_id_to_propose, new_id + 1)
 
+        preserved_groups = {gid: set(members) for gid, members in self.object_groups.items()}
+        preserved_next_group_id = self.next_group_id
+
         self.tracked_objects.clear()
         self.object_groups.clear()
         self.sam_id_to_group.clear()
@@ -504,6 +650,19 @@ class SAM3AutolabelApp:
 
         if new_id in self.tracked_objects:
             self.tracked_objects[new_id]['mid_session_added'] = True
+
+        self.object_groups.clear()
+        self.sam_id_to_group.clear()
+        for gid, members in preserved_groups.items():
+            surviving = {m for m in members if m in self.tracked_objects and m != new_id}
+            if len(surviving) >= 2:
+                self.object_groups[gid] = surviving
+                for m in surviving:
+                    self.sam_id_to_group[m] = gid
+        self.next_group_id = max(
+            preserved_next_group_id,
+            (max(self.object_groups) + 1) if self.object_groups else 1,
+        )
 
         if new_obj_mask is None or not new_obj_mask.any():
             logger.warning(
@@ -593,8 +752,9 @@ class SAM3AutolabelApp:
             self.tracker_processor = None
             self.view.set_ui_element_state("btn_set_custom_label", tk.DISABLED)
 
-    def _init_inference_session(self, for_pcs_mode=False):
-        self._reset_group_and_polygon_state()
+    def _init_inference_session(self, for_pcs_mode=False, preserve_annotations=False):
+        if not preserve_annotations:
+            self._reset_group_and_polygon_state()
 
         model_dtype = torch.float32
 
@@ -1143,9 +1303,38 @@ class SAM3AutolabelApp:
             logger.info("DLMI Boost: _gather_memory_frame_outputs restored to original")
             del self._dlmi_original_gather
 
+    def _deactivate_negative_area_mode(self):
+        if not getattr(self, 'negative_area_mode_active', False):
+            return
+        self.negative_area_mode_active = False
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+        if self.view and hasattr(self.view, 'update_negative_area_mode_ui'):
+            self.view.update_negative_area_mode_ui(False)
+
+    def _deactivate_multi_choose_mode(self):
+        if not getattr(self, 'multi_choose_mode_active', False):
+            return
+        self.multi_choose_mode_active = False
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+        if self.view and hasattr(self.view, 'update_multi_choose_mode_ui'):
+            self.view.update_multi_choose_mode_ui(False)
+
+    def _deactivate_polygon_mode(self):
+        if not getattr(self, 'polygon_mode_active', False):
+            return
+        self.polygon_mode_active = False
+        self.polygon_points = []
+        if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
+            self.view.update_polygon_mode_ui(False)
+
     def toggle_polygon_mode(self):
         self.polygon_mode_active = not self.polygon_mode_active
         if self.polygon_mode_active:
+            self._deactivate_negative_area_mode()
+            self._deactivate_multi_choose_mode()
             self.polygon_points = []
             self.update_status("Polygon mode: Left click to add points. Click 'Complete Object' when done.")
             logger.info("Polygon add mode activated")
@@ -1162,6 +1351,12 @@ class SAM3AutolabelApp:
 
     def add_polygon_point(self, x, y):
         if not self.polygon_mode_active:
+            return False
+
+        # Only check anchor on the FIRST point of a fresh polygon — once a
+        # polygon is in progress, subsequent points are obviously meant for
+        # the same anchor frame.
+        if not self.polygon_points and not self._ensure_label_anchor_or_confirm_switch():
             return False
 
         self.polygon_points.append((int(x), int(y)))
@@ -1207,6 +1402,23 @@ class SAM3AutolabelApp:
 
             if not mask_bool.any():
                 messagebox.showwarning("Notice", "Generated mask is empty.", parent=self.root)
+                return
+
+            if self.negative_area_mode_active:
+                modified = self._erase_region_from_all_masks(mask_bool)
+                self.polygon_points = []
+                if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
+                    self.polygon_mode_active = False
+                    self.view.update_polygon_mode_ui(False)
+                if modified:
+                    self.update_status(
+                        f"Negative Area (polygon): erased region from {len(modified)} object(s)."
+                    )
+                else:
+                    self.update_status("Negative Area (polygon): no overlap with any object.")
+                if self.current_cv_frame is not None:
+                    self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+                self._update_obj_id_info_label()
                 return
 
             new_obj_id = self.next_obj_id_to_propose
@@ -1317,8 +1529,304 @@ class SAM3AutolabelApp:
         if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
             self.view.update_polygon_mode_ui(False)
 
+    def toggle_negative_area_mode(self):
+        """Toggle the 'negative area' editing mode. While active:
+          - Left-click drag erases the swept region from EVERY object's mask on
+            the current frame (treats it as background).
+          - Add Polygon -> Complete subtracts the polygon area from EVERY
+            object's mask on the current frame instead of creating a new object.
+        This is a frame-local mask edit. It is unrelated to SAM3 negative
+        prompts and does not modify the inference session inputs.
+        """
+        self.negative_area_mode_active = not self.negative_area_mode_active
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+
+        if self.negative_area_mode_active:
+            self._deactivate_multi_choose_mode()
+            self._deactivate_polygon_mode()
+
+        if self.negative_area_mode_active:
+            self.update_status(
+                "Negative Area ON: drag to erase from all masks; or use Add Polygon → Complete to subtract a region."
+            )
+            logger.info("Negative area mode activated")
+        else:
+            self.update_status("Negative Area OFF")
+            logger.info("Negative area mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_negative_area_mode_ui'):
+            self.view.update_negative_area_mode_ui(self.negative_area_mode_active)
+
+        if self.view:
+            self.view.delete_temp_bbox()
+
         if self.current_cv_frame is not None:
             self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def _erase_region_from_all_masks(self, erase_mask_bool):
+        """Subtract erase_mask_bool (HxW) from every tracked object's last_mask.
+        Removes objects whose mask becomes empty. Returns the list of obj_ids
+        that were modified.
+        """
+        if self.current_cv_frame is None or erase_mask_bool is None:
+            return []
+        if not isinstance(erase_mask_bool, np.ndarray) or erase_mask_bool.dtype != bool:
+            erase_mask_bool = np.asarray(erase_mask_bool, dtype=bool)
+        if not erase_mask_bool.any():
+            return []
+
+        h, w = self.current_cv_frame.shape[:2]
+        if erase_mask_bool.shape != (h, w):
+            return []
+
+        modified = []
+        emptied = []
+        for obj_id, data in list(self.tracked_objects.items()):
+            if not data:
+                continue
+            mask = data.get('last_mask')
+            if mask is None:
+                continue
+            if mask.shape != (h, w):
+                continue
+            new_mask = mask & ~erase_mask_bool
+            if np.array_equal(new_mask, mask):
+                continue
+            data['last_mask'] = new_mask
+            if 'is_polygon_object' in data and data.get('is_polygon_object'):
+                data.pop('polygon_points', None)
+                data['is_polygon_object'] = False
+            modified.append(obj_id)
+            if not new_mask.any():
+                emptied.append(obj_id)
+
+        for obj_id in emptied:
+            self.tracked_objects.pop(obj_id, None)
+            self.selected_objects_sam_ids.discard(obj_id)
+            if self.selected_object_sam_id == obj_id:
+                self.selected_object_sam_id = None
+
+        if modified:
+            logger.info(
+                f"Negative area: erased region from {len(modified)} object(s); "
+                f"emptied={emptied}"
+            )
+
+        return modified
+
+    def negative_drag_begin(self, canvas_x, canvas_y):
+        if not self.negative_area_mode_active:
+            return False
+        if self.current_cv_frame is None:
+            return False
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        self.negative_drag_start_canvas = (canvas_x, canvas_y)
+        self.negative_drag_last_canvas = (canvas_x, canvas_y)
+        self.negative_drag_path_image = [(int(img_x), int(img_y))]
+        return True
+
+    def negative_drag_update(self, canvas_x, canvas_y):
+        if not self.negative_area_mode_active:
+            return False
+        if self.negative_drag_start_canvas is None:
+            return False
+        self.negative_drag_last_canvas = (canvas_x, canvas_y)
+        if self.view:
+            sx, sy = self.negative_drag_start_canvas
+            self.view.draw_temp_bbox(sx, sy, canvas_x, canvas_y)
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        self.negative_drag_path_image.append((int(img_x), int(img_y)))
+        return True
+
+    def negative_drag_finish(self, canvas_x, canvas_y):
+        if not self.negative_area_mode_active:
+            return False
+        if self.negative_drag_start_canvas is None:
+            return False
+        if self.current_cv_frame is None:
+            self.negative_drag_start_canvas = None
+            self.negative_drag_last_canvas = None
+            self.negative_drag_path_image = []
+            return False
+
+        sx_c, sy_c = self.negative_drag_start_canvas
+        ex_c, ey_c = canvas_x, canvas_y
+        if self.view:
+            self.view.delete_temp_bbox()
+
+        h, w = self.current_cv_frame.shape[:2]
+        erase_mask = np.zeros((h, w), dtype=np.uint8)
+
+        img_s = self._canvas_to_image_coords(min(sx_c, ex_c), min(sy_c, ey_c))
+        img_e = self._canvas_to_image_coords(max(sx_c, ex_c), max(sy_c, ey_c))
+        x0 = max(0, int(min(img_s[0], img_e[0])))
+        y0 = max(0, int(min(img_s[1], img_e[1])))
+        x1 = min(w, int(max(img_s[0], img_e[0])))
+        y1 = min(h, int(max(img_s[1], img_e[1])))
+
+        rect_significant = (x1 - x0) >= 2 and (y1 - y0) >= 2
+        if rect_significant:
+            erase_mask[y0:y1, x0:x1] = 255
+
+        # Always also stamp the path itself so a thin/zero-area drag still erases
+        path = self.negative_drag_path_image
+        if path:
+            try:
+                px_size_pct = 0.4
+                if hasattr(self, 'view') and self.view is not None:
+                    try:
+                        v = float(self.view.polygon_point_size_entry.get())
+                        if v > 0:
+                            px_size_pct = v
+                    except Exception:
+                        pass
+                radius = max(2, int(round(min(h, w) * px_size_pct / 100.0)))
+                pts = np.array(path, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(erase_mask, [pts], isClosed=False, color=255, thickness=radius * 2)
+                for (px, py) in path:
+                    if 0 <= px < w and 0 <= py < h:
+                        cv2.circle(erase_mask, (int(px), int(py)), radius, 255, thickness=-1)
+            except Exception as _e:
+                logger.debug(f"negative path stamp failed: {_e}")
+
+        erase_bool = erase_mask > 0
+        modified = self._erase_region_from_all_masks(erase_bool)
+
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+
+        if modified:
+            self.update_status(f"Negative Area: erased region from {len(modified)} object(s).")
+        else:
+            self.update_status("Negative Area: no overlap with any object.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        self._update_obj_id_info_label()
+        return True
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def toggle_multi_choose_mode(self):
+        self.multi_choose_mode_active = not self.multi_choose_mode_active
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+
+        if self.multi_choose_mode_active:
+            self._deactivate_negative_area_mode()
+            self._deactivate_polygon_mode()
+
+        if self.multi_choose_mode_active:
+            self.update_status(
+                "Multi Choose ON: drag a rectangle to select every object inside (like Ctrl-clicking each)."
+            )
+            logger.info("Multi-choose mode activated")
+        else:
+            self.update_status("Multi Choose OFF")
+            logger.info("Multi-choose mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_multi_choose_mode_ui'):
+            self.view.update_multi_choose_mode_ui(self.multi_choose_mode_active)
+
+        if self.view:
+            self.view.delete_temp_bbox()
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def multi_choose_drag_begin(self, canvas_x, canvas_y):
+        if not self.multi_choose_mode_active:
+            return False
+        if self.current_cv_frame is None:
+            return False
+        self.multi_choose_drag_start_canvas = (canvas_x, canvas_y)
+        self.multi_choose_drag_last_canvas = (canvas_x, canvas_y)
+        return True
+
+    def multi_choose_drag_update(self, canvas_x, canvas_y):
+        if not self.multi_choose_mode_active:
+            return False
+        if self.multi_choose_drag_start_canvas is None:
+            return False
+        self.multi_choose_drag_last_canvas = (canvas_x, canvas_y)
+        if self.view:
+            sx, sy = self.multi_choose_drag_start_canvas
+            self.view.draw_temp_bbox(sx, sy, canvas_x, canvas_y)
+        return True
+
+    def multi_choose_drag_finish(self, canvas_x, canvas_y):
+        if not self.multi_choose_mode_active:
+            return False
+        if self.multi_choose_drag_start_canvas is None:
+            return False
+        if self.current_cv_frame is None:
+            self.multi_choose_drag_start_canvas = None
+            self.multi_choose_drag_last_canvas = None
+            return False
+
+        sx_c, sy_c = self.multi_choose_drag_start_canvas
+        ex_c, ey_c = canvas_x, canvas_y
+        if self.view:
+            self.view.delete_temp_bbox()
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+
+        h, w = self.current_cv_frame.shape[:2]
+        img_s = self._canvas_to_image_coords(min(sx_c, ex_c), min(sy_c, ey_c))
+        img_e = self._canvas_to_image_coords(max(sx_c, ex_c), max(sy_c, ey_c))
+        x0 = max(0, int(min(img_s[0], img_e[0])))
+        y0 = max(0, int(min(img_s[1], img_e[1])))
+        x1 = min(w, int(max(img_s[0], img_e[0])))
+        y1 = min(h, int(max(img_s[1], img_e[1])))
+
+        if (x1 - x0) < 2 or (y1 - y0) < 2:
+            self.update_status("Multi Choose: drag area too small.")
+            return False
+
+        newly_selected = []
+        for obj_id, data in list(self.tracked_objects.items()):
+            if not data:
+                continue
+            mask = data.get('last_mask')
+            if mask is None:
+                continue
+            if mask.shape[:2] != (h, w):
+                continue
+            if mask[y0:y1, x0:x1].any():
+                if obj_id not in self.selected_objects_sam_ids:
+                    newly_selected.append(obj_id)
+                self.selected_objects_sam_ids.add(obj_id)
+                self.selected_object_sam_id = obj_id
+
+        if self.view and hasattr(self.view, 'btn_merge_objects'):
+            if len(self.selected_objects_sam_ids) >= 2:
+                self.view.btn_merge_objects.config(state='normal')
+            else:
+                self.view.btn_merge_objects.config(state='disabled')
+
+        if self.selected_objects_sam_ids and self.view and self.view.notebook and self.view.obj_control_tab:
+            tab_widget = getattr(self.view.obj_control_tab, '_tab_wrapper', self.view.obj_control_tab)
+            try:
+                self.view.notebook.select(tab_widget)
+            except tk.TclError:
+                pass
+
+        input_handlers.update_interaction_status_and_label(self)
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+        if newly_selected:
+            self.update_status(
+                f"Multi Choose: selected {len(newly_selected)} object(s) "
+                f"(total selected: {len(self.selected_objects_sam_ids)})."
+            )
+        else:
+            self.update_status("Multi Choose: no objects inside the drag area.")
+        return True
 
     def _on_ctrl_press(self, event=None):
         input_handlers.on_ctrl_press(self, event)
@@ -1517,6 +2025,23 @@ class SAM3AutolabelApp:
         self.cut_start_frame = 0
         self.cut_point_frame = None
         self.propagated_results = {}
+        self.review_current_frame = 0
+        self.label_anchor_frame_idx = None
+
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.propagation_paused = False
+        self.propagation_stop_requested = False
+        try:
+            self.propagation_pause_event.set()
+        except Exception:
+            pass
+        try:
+            self._remove_dlmi_persistent_hooks()
+        except Exception as _hook_err:
+            logger.debug(f"_reset_internal_states_for_new_source: dlmi hook cleanup skipped: {_hook_err}")
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
 
         self.discarded_frames.clear()
         if hasattr(self, 'view') and hasattr(self.view, 'update_discarded_frames_display'):
@@ -1736,23 +2261,35 @@ class SAM3AutolabelApp:
                 messagebox.showinfo("Info", "No objects to load.", parent=self.root)
                 return
 
-            if self.low_level_api_enabled_var.get():
-                self._apply_loaded_labels_as_polygon_masks(loaded_objects)
-                return
-
-            current_mode = self.prompt_mode_var.get()
-
-            if current_mode == "PVS" or current_mode == "PVS_CHUNK":
-                self._apply_loaded_labels_as_prompts(loaded_objects)
-            elif current_mode in ("PCS", "PCS_IMAGE"):
-                self._apply_loaded_labels_for_pcs(loaded_objects)
-
-            self.update_status(f"{len(loaded_objects)} objects loaded.")
-            logger.info(f"Label file loaded: {label_file_path}, objects: {len(loaded_objects)}")
+            self._apply_loaded_objects(loaded_objects, source_desc=label_file_path)
 
         except Exception as e:
             logger.exception(f"Label file load error: {e}")
             messagebox.showerror("Error", f"Error loading label file:\n{e}", parent=self.root)
+
+    def _apply_loaded_objects(self, loaded_objects, source_desc=""):
+        """Same downstream flow as load_label_file once parsing is done.
+        Used by both the button-driven file load and Cut+Load (which already
+        has the objects in memory and skips the file dialog entirely)."""
+        if not loaded_objects:
+            return
+
+        if self.low_level_api_enabled_var.get():
+            self._apply_loaded_labels_as_polygon_masks(loaded_objects)
+            return
+
+        current_mode = self.prompt_mode_var.get()
+
+        if current_mode == "PVS" or current_mode == "PVS_CHUNK":
+            self._apply_loaded_labels_as_prompts(loaded_objects)
+        elif current_mode in ("PCS", "PCS_IMAGE"):
+            self._apply_loaded_labels_for_pcs(loaded_objects)
+
+        self.update_status(f"{len(loaded_objects)} objects loaded.")
+        if source_desc:
+            logger.info(f"Label load: source='{source_desc}', objects: {len(loaded_objects)}")
+        else:
+            logger.info(f"Label load (in-memory): objects: {len(loaded_objects)}")
 
     def _apply_loaded_labels_as_polygon_masks(self, loaded_objects):
         if not loaded_objects:
@@ -1886,16 +2423,17 @@ class SAM3AutolabelApp:
 
             img_arr = np.array(self.current_frame_pil_rgb_original.convert("RGBA"))
             h, w = img_arr.shape[:2]
+            frame_diagonal = None  # lazily computed once per redraw if needed
 
             bbox_cache = {}
             special_focus_objs = []
+            group_bbox_cache = {}
 
             if masks_to_overlay:
                 erosion_k = self.erosion_kernel_size.get()
                 erosion_i = self.erosion_iterations.get()
                 base_alpha = self.mask_alpha_var.get() if hasattr(self, 'mask_alpha_var') else ALPHA_NORMAL
 
-                group_bbox_cache = {}
                 processed_groups = set()
                 for obj_id, mask_array_bool in masks_to_overlay.items():
                     if mask_array_bool is None: continue
@@ -1964,7 +2502,7 @@ class SAM3AutolabelApp:
                     if group_id in drawn_group_ids:
                         continue
                     drawn_group_ids.add(group_id)
-                    bbox = group_bbox_cache.get(group_id) if 'group_bbox_cache' in dir() else bbox_cache.get(obj_id)
+                    bbox = group_bbox_cache.get(group_id, bbox_cache.get(obj_id))
                 else:
                     bbox = bbox_cache.get(obj_id)
 
@@ -1988,7 +2526,7 @@ class SAM3AutolabelApp:
                         obj_data = self.tracked_objects.get(first_member, {})
                         member_count = len(self.object_groups.get(group_id, set()))
                         display_label = f"Group-{group_id} ({member_count}): {obj_data.get('custom_label', 'object')}"
-                        bbox_for_label = group_bbox_cache.get(group_id) if 'group_bbox_cache' in dir() else bbox_cache.get(obj_id)
+                        bbox_for_label = group_bbox_cache.get(group_id, bbox_cache.get(obj_id))
                     else:
                         obj_data = self.tracked_objects.get(obj_id, {})
                         display_label = obj_data.get("custom_label", f"Obj-{obj_id}")
@@ -1999,25 +2537,22 @@ class SAM3AutolabelApp:
 
                     if bbox_for_label is not None:
                         x1, y1, x2, y2 = bbox_for_label
-                        import math
-                        diagonal = math.sqrt(w**2 + h**2)
+                        if frame_diagonal is None:
+                            frame_diagonal = math.sqrt(w * w + h * h)
+                        diagonal = frame_diagonal
                         font_size_percent = self.label_font_size_percent_var.get()
                         dynamic_font_size = max(8, int(diagonal * font_size_percent / 100))
-                        dynamic_font = None
-                        font_paths = [
-                            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                            "arial.ttf",
-                            "/System/Library/Fonts/Helvetica.ttc"
-                        ]
-                        for font_path in font_paths:
-                            try:
-                                dynamic_font = ImageFont.truetype(font_path, dynamic_font_size)
-                                break
-                            except:
-                                continue
+                        dynamic_font = self._dynamic_font_cache.get(dynamic_font_size)
                         if dynamic_font is None:
-                            dynamic_font = ImageFont.load_default()
+                            for font_path in self._dynamic_font_paths:
+                                try:
+                                    dynamic_font = ImageFont.truetype(font_path, dynamic_font_size)
+                                    break
+                                except Exception:
+                                    continue
+                            if dynamic_font is None:
+                                dynamic_font = ImageFont.load_default()
+                            self._dynamic_font_cache[dynamic_font_size] = dynamic_font
                         text_pos = (int(x1 + 5), int(y1 - dynamic_font_size - 5 if y1 > dynamic_font_size + 5 else y1 + 5))
                         try: draw_final.text(text_pos, display_label, fill="yellow", font=dynamic_font)
                         except Exception: pass
@@ -2030,9 +2565,11 @@ class SAM3AutolabelApp:
 
             if getattr(self, 'polygon_mode_active', False):
                 polygon_color = (0, 255, 255)
-                import math
-                diagonal = math.sqrt(w**2 + h**2)
-                point_size_percent = self.polygon_point_size_percent_var.get()
+                if frame_diagonal is None:
+                    frame_diagonal = math.sqrt(w * w + h * h)
+                diagonal = frame_diagonal
+                vertex_size_var = getattr(self, 'polygon_vertex_size_percent_var', None)
+                point_size_percent = vertex_size_var.get() if vertex_size_var is not None else self.polygon_point_size_percent_var.get()
                 point_radius = max(2, int(diagonal * point_size_percent / 100))
 
                 if hasattr(self, 'polygon_points') and self.polygon_points:
@@ -2060,8 +2597,9 @@ class SAM3AutolabelApp:
 
             if (hasattr(self, 'show_prompt_visualization_var') and self.show_prompt_visualization_var.get()
                 and hasattr(self, 'object_prompt_history') and self.object_prompt_history):
-                import math
-                diagonal = math.sqrt(w**2 + h**2)
+                if frame_diagonal is None:
+                    frame_diagonal = math.sqrt(w * w + h * h)
+                diagonal = frame_diagonal
                 point_size_percent = self.polygon_point_size_percent_var.get()
                 line_width = max(1, int(diagonal * point_size_percent / 100))
                 point_radius = max(2, int(diagonal * point_size_percent / 100))
@@ -2215,6 +2753,7 @@ class SAM3AutolabelApp:
             messagebox.showwarning("Clear Failed", "Stop auto-labeling or interaction before clearing objects.", parent=self.root); return
         logger.info("Clearing all tracked objects/prompts and resetting SAM3 predictor.")
         self._remove_dlmi_persistent_hooks()
+        self.label_anchor_frame_idx = None
         self.tracked_objects.clear(); self.next_obj_id_to_propose = 1
         self.is_predictor_loaded_first_frame = False; self.is_tracking_ever_started = False
         self.last_active_tracked_sam_ids.clear(); self.selected_object_sam_id = None
@@ -2481,6 +3020,114 @@ class SAM3AutolabelApp:
         if dir_path:
             self.custom_save_dir_var.set(dir_path)
 
+    def select_custom_pose_save_dir(self):
+        dir_path = filedialog.askdirectory(title="Select Pose Label Save Folder", parent=self.root)
+        if dir_path:
+            self.custom_pose_save_dir_var.set(dir_path)
+
+    def _on_custom_pose_save_toggle(self):
+        if hasattr(self, 'view') and hasattr(self.view, 'update_custom_pose_save_options_state'):
+            self.view.update_custom_pose_save_options_state()
+
+    # ---------- User settings persistence (Save Settings button) ----------
+
+    # Tk Variables we never persist: live video metadata + transient
+    # interaction-mode toggles. Everything else (object-control, save/batch,
+    # advanced) is auto-discovered from self.__dict__.
+    _SETTINGS_EXCLUDE_NAMES = frozenset({
+        "info_video_name_var",
+        "info_video_resolution_var",
+        "info_video_total_frames_var",
+        "info_video_fps_var",
+        "info_batch_progress_var",
+        "pose_add_mode_var",
+        "pose_chain_mode_var",
+        "tabs_visible_var",
+        "pose_idx_var",
+        "pose_class_var",
+    })
+
+    def _iter_persistable_vars(self):
+        """Yield (name, var) for every tk.Variable on self that should be
+        persisted across runs."""
+        excludes = self._SETTINGS_EXCLUDE_NAMES
+        for name, value in vars(self).items():
+            if name in excludes:
+                continue
+            if isinstance(value, tk.Variable):
+                yield name, value
+
+    def save_user_settings(self):
+        """Snapshot every persistable tk.Variable on this app to a JSON file
+        next to app.py. Triggered by the Save Settings button in the top bar.
+        """
+        import json
+        snapshot = {}
+        for name, var in self._iter_persistable_vars():
+            try:
+                snapshot[name] = var.get()
+            except Exception as _v_err:
+                logger.debug(f"save_user_settings: skipping {name}: {_v_err}")
+        try:
+            with open(self._user_settings_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.exception(f"save_user_settings write failed: {e}")
+            messagebox.showerror("Error", f"Failed to save settings:\n{e}", parent=self.root)
+            return
+        logger.info(f"User settings saved: {self._user_settings_path} ({len(snapshot)} keys)")
+        self.update_status(f"Settings saved to {os.path.basename(self._user_settings_path)} ({len(snapshot)} entries).")
+        messagebox.showinfo(
+            "Settings Saved",
+            f"{len(snapshot)} settings saved to:\n{self._user_settings_path}\n\n"
+            f"They will be auto-loaded on the next launch.",
+            parent=self.root,
+        )
+
+    def _load_user_settings(self):
+        """Apply persisted settings if a JSON file exists next to app.py.
+        Called once during __init__ before AppView is built so widgets bound
+        to tk Variables show the persisted values on first paint."""
+        path = self._user_settings_path
+        if not os.path.exists(path):
+            return
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+        except Exception as e:
+            logger.warning(f"User settings file unreadable ({path}): {e}")
+            return
+        if not isinstance(snapshot, dict):
+            logger.warning(f"User settings file malformed: {path}")
+            return
+
+        applied = 0
+        skipped_keys = []
+        excludes = self._SETTINGS_EXCLUDE_NAMES
+        for name, value in snapshot.items():
+            if name in excludes:
+                continue
+            attr = getattr(self, name, None)
+            if not isinstance(attr, tk.Variable):
+                continue
+            try:
+                # tk.IntVar / DoubleVar / BooleanVar will refuse strings; coerce.
+                if isinstance(attr, tk.BooleanVar):
+                    attr.set(bool(value))
+                elif isinstance(attr, tk.IntVar):
+                    attr.set(int(value))
+                elif isinstance(attr, tk.DoubleVar):
+                    attr.set(float(value))
+                else:
+                    attr.set(value if value is not None else "")
+                applied += 1
+            except Exception as set_err:
+                skipped_keys.append((name, str(set_err)))
+        if skipped_keys:
+            logger.debug(f"User settings: skipped {len(skipped_keys)} keys: {skipped_keys[:5]}...")
+        logger.info(f"User settings auto-loaded: {applied} keys from {path}")
+
     def select_batch_source_dir(self):
         dir_path = filedialog.askdirectory(title="Select Batch Video Folder", parent=self.root)
         if dir_path:
@@ -2508,6 +3155,30 @@ class SAM3AutolabelApp:
 
         self._release_video_capture()
         self._reset_internal_states_for_new_source()
+
+        # Defensive: enforce a clean slate so cut/DLMI state from the previous
+        # video can never leak into propagation of the next one. In particular
+        # cut_start_frame would otherwise cause Start Propagate on the new
+        # video to seek to the previous video's cut frame.
+        self.cut_start_frame = 0
+        self.cut_point_frame = None
+        self.propagated_results = {}
+        self.review_current_frame = 0
+        self.label_anchor_frame_idx = None
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.propagation_paused = False
+        self.propagation_stop_requested = False
+        try:
+            self.propagation_pause_event.set()
+        except Exception:
+            pass
+        try:
+            self._remove_dlmi_persistent_hooks()
+        except Exception as _hook_err:
+            logger.debug(f"_load_next_batch_video: dlmi hook cleanup skipped: {_hook_err}")
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
 
         self.video_source_path = next_video_path
         self.cap = cv2.VideoCapture(self.video_source_path)
@@ -2550,10 +3221,14 @@ class SAM3AutolabelApp:
         return True
 
     def _execute_pcs_with_exemplars(self):
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return None
         from util import pcs_controller
         return pcs_controller.execute_pcs_with_exemplars(self)
 
     def execute_pcs_detection(self):
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return None
         from util import pcs_controller
         return pcs_controller.execute_pcs_detection(self)
 
@@ -2609,6 +3284,10 @@ class SAM3AutolabelApp:
         self.propagation_pause_event.set()
         self.propagated_results = {}
         self.propagation_progress = 0
+
+        # Pre-propagate anchor served its purpose; from here on
+        # propagated_results is the source of truth for display.
+        self.label_anchor_frame_idx = None
 
         if hasattr(self, 'object_prompt_history'):
             self.object_prompt_history.clear()
@@ -2884,7 +3563,20 @@ class SAM3AutolabelApp:
                 ret, frame_bgr = self.cap.read()
                 if ret:
                     self.current_cv_frame = frame_bgr
-                    self._display_cv_frame_on_view(frame_bgr, {})
+                    # Pre-propagate phase: when the user navigates back to
+                    # the anchor frame, restore the in-progress masks they
+                    # were composing. On any other frame in this phase,
+                    # show the raw frame only — labels still live on the
+                    # anchor and will reappear when the user returns.
+                    if (self._is_pre_propagate_phase()
+                            and self.label_anchor_frame_idx is not None
+                            and frame_idx == self.label_anchor_frame_idx
+                            and self.tracked_objects):
+                        self._display_cv_frame_on_view(
+                            frame_bgr, self._get_current_masks_for_display()
+                        )
+                    else:
+                        self._display_cv_frame_on_view(frame_bgr, {})
                 else:
                     logger.warning(f"Review: Frame {actual_frame_idx} read failed")
             else:
@@ -2926,6 +3618,8 @@ class SAM3AutolabelApp:
         return pose_controller.default_pose_class_name(self)
 
     def add_pose_point_at(self, img_x, img_y):
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return None
         from util import pose_controller
         return pose_controller.add_pose_point_at(self, img_x, img_y)
 
