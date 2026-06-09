@@ -1,11 +1,41 @@
+# DLMI-SAM Labeler — dependencies
+# PyTorch CUDA wheels (12.8 index); change for other CUDA versions
+# (see https://pytorch.org/get-started/locally/).
 --extra-index-url https://download.pytorch.org/whl/cu128
 
-torch>=2.9.0
-torchvision>=0.24.0
-transformers @ git+https://github.com/huggingface/transformers@3a8d291ac439fca3decb9b800ea22500cffeaf50
-numpy>=2.0.0
-opencv-python>=4.10.0
-Pillow>=10.0.0
-matplotlib>=3.9.0
+# --- Core (directly imported by the app) ---
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+pillow>=9.0.0
+opencv-python>=4.8.0
+matplotlib>=3.7.0
 PyYAML>=6.0
-scipy>=1.13.0
+
+# --- "hug" backend (HuggingFace transformers SAM3) ---
+# (pulls safetensors/tokenizers/accelerate-free loading itself)
+transformers @ git+https://github.com/huggingface/transformers@3a8d291ac439fca3decb9b800ea22500cffeaf50
+
+# --- "git" / "3.1" backends (official Meta sam3 from GitHub) ---
+# `sam3` pulls its own core deps (timm, ftfy, iopath, regex, huggingface_hub, tqdm).
+# pycocotools + einops are imported by sam3's import chain but are NOT in its core
+# deps, so they must be listed explicitly:
+sam3 @ git+https://github.com/facebookresearch/sam3.git
+pycocotools>=2.0.8
+einops>=0.7.0
+# NOTE: official sam3 declares numpy<2 (resolves to 1.26.x); works with numpy 2.x too.
+# NOTE: gated checkpoints need HF access to facebook/sam3 (+ facebook/sam3.1 for the
+#       3.1 backend) and `hf auth login`.
+
+# --- Pose (optional) ---
+# YOLO-pose (the "Detect Pose (YOLO)" button):
+ultralytics>=8.0.0
+# TAPNext++ pose tracking is OPTIONAL + heavy; the app auto-installs it on first use.
+# Uncomment to pin a reproducible pose environment:
+# tapnet @ git+https://github.com/google-deepmind/tapnet.git
+# mediapy>=1.2.0
+# chex>=0.1.80
+# flax>=0.8.0
+# optax>=0.2.0
+# tensorflow>=2.14.0
+# tensorflow_datasets>=4.9.0

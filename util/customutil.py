@@ -131,9 +131,24 @@ def process_sam_mask(mask_from_sam_np, target_pil_size_wh,
     if apply_closing and closing_kernel_size > 0:
         kernel_size_odd = closing_kernel_size if closing_kernel_size % 2 != 0 else closing_kernel_size + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size_odd, kernel_size_odd))
-        mask_uint8_for_closing = squeezed_mask.astype(np.uint8) * 255
-        closed_mask_uint8 = cv2.morphologyEx(mask_uint8_for_closing, cv2.MORPH_CLOSE, kernel)
-        squeezed_mask = closed_mask_uint8 > 0
+        mask_uint8 = squeezed_mask.astype(np.uint8)
+
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_uint8, connectivity=8)
+        if n_labels <= 2:
+            closed = cv2.morphologyEx(mask_uint8 * 255, cv2.MORPH_CLOSE, kernel)
+            squeezed_mask = closed > 0
+        else:
+            H, W = mask_uint8.shape
+            pad = kernel_size_odd
+            out = np.zeros((H, W), dtype=np.uint8)
+            for lbl in range(1, n_labels):
+                x, y, w, h, _area = stats[lbl]
+                x0 = max(0, x - pad); y0 = max(0, y - pad)
+                x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+                sub = (labels[y0:y1, x0:x1] == lbl).astype(np.uint8) * 255
+                closed_sub = cv2.morphologyEx(sub, cv2.MORPH_CLOSE, kernel)
+                out[y0:y1, x0:x1] |= (closed_sub > 0).astype(np.uint8)
+            squeezed_mask = out > 0
 
     return squeezed_mask
 
@@ -175,66 +190,80 @@ def is_bbox_on_edge(bbox, image_shape, margin):
 
     return False
 
+def simplify_contours_for_save(contours, epsilon_ratio=0.002):
+    """Reduce vertex density of each contour using Douglas-Peucker
+    (cv2.approxPolyDP) with ε proportional to its perimeter. Default ratio
+    0.002 gives roughly the same density used historically by the inject
+    pipeline (≈1/5 of CHAIN_APPROX_SIMPLE output) without distorting the
+    visible boundary.
+
+    Contours that collapse to fewer than 3 vertices after simplification are
+    dropped. Input/output are both lists of (N,1,2) int32 contours, the same
+    shape returned by cv2.findContours.
+    """
+    if not contours or epsilon_ratio <= 0:
+        return list(contours) if contours else []
+    simplified = []
+    for c in contours:
+        try:
+            perim = cv2.arcLength(c, True)
+            if perim <= 0:
+                continue
+            eps = epsilon_ratio * perim
+            approx = cv2.approxPolyDP(c, eps, True)
+            if approx is not None and len(approx) >= 3:
+                simplified.append(approx)
+        except Exception:
+            simplified.append(c)
+    return simplified
+
+
 def merge_contours_into_single_polygon(contours, min_area=10):
     from scipy.spatial.distance import cdist
 
-    valid_contours = [c for c in contours if cv2.contourArea(c) >= min_area]
-    if not valid_contours:
+    valid = []
+    for c in contours:
+        arr = np.asarray(c).reshape(-1, 2)
+        if arr.shape[0] < 3:
+            continue
+        if cv2.contourArea(arr.reshape(-1, 1, 2).astype(np.int32)) < min_area:
+            continue
+        valid.append(arr.astype(np.int64))
+    if not valid:
         return None
-    if len(valid_contours) == 1:
-        return valid_contours[0]
+    if len(valid) == 1:
+        return valid[0].reshape(-1, 1, 2).astype(np.int32)
 
-    valid_contours.sort(key=cv2.contourArea, reverse=True)
+    valid.sort(key=lambda a: cv2.contourArea(a.reshape(-1, 1, 2).astype(np.int32)),
+               reverse=True)
 
-    merged_contour = valid_contours[0]
+    merged = valid[0]
+    remaining = valid[1:]
 
-    remaining_contours = valid_contours[1:]
-    while remaining_contours:
-        merged_pts_2d = merged_contour.reshape(-1, 2)
-
-        closest_dist = float('inf')
-        closest_contour_idx = -1
-        closest_idx_merged = -1
-        closest_idx_to_merge = -1
-
-        for i, contour_to_check in enumerate(remaining_contours):
-            check_pts_2d = contour_to_check.reshape(-1, 2)
-
-            dist_matrix = cdist(merged_pts_2d, check_pts_2d, 'euclidean')
-
-            min_idx = np.unravel_index(np.argmin(dist_matrix), dist_matrix.shape)
-            min_dist = dist_matrix[min_idx]
-
-            if min_dist < closest_dist:
-                closest_dist = min_dist
-                closest_contour_idx = i
-                closest_idx_merged = min_idx[0]
-                closest_idx_to_merge = min_idx[1]
-
-        if closest_contour_idx == -1:
+    while remaining:
+        best = None
+        for ci, cont in enumerate(remaining):
+            dm = cdist(merged, cont, 'euclidean')
+            flat = int(np.argmin(dm))
+            im, ic = divmod(flat, dm.shape[1])
+            d = dm[im, ic]
+            if best is None or d < best[0]:
+                best = (d, ci, im, ic)
+        if best is None:
             break
 
-        contour_to_merge = remaining_contours.pop(closest_contour_idx)
+        _, ci, im, ic = best
+        cont = remaining.pop(ci)
 
-        idx_merged = closest_idx_merged
-        idx_to_merge = closest_idx_to_merge
+        b_loop = np.concatenate([cont[ic:], cont[:ic], cont[ic:ic + 1]], axis=0)
 
-        merged_part1 = merged_contour[:idx_merged + 1]
-        merged_part2 = merged_contour[idx_merged:]
+        merged = np.concatenate([merged[:im + 1], b_loop, merged[im:]], axis=0)
 
-        reordered_to_merge = np.roll(contour_to_merge, -idx_to_merge, axis=0)
+        ret_idx = im + 1 + b_loop.shape[0]
+        if not np.array_equal(merged[ret_idx], merged[im]):
+            merged[ret_idx] = merged[im]
 
-        bridge_end_point = contour_to_merge[idx_to_merge : idx_to_merge + 1]
-
-        merged_contour = np.concatenate([
-            merged_part1,
-            bridge_end_point,
-            reordered_to_merge,
-            bridge_end_point,
-            merged_part2,
-        ], axis=0)
-
-    return merged_contour
+    return merged.reshape(-1, 1, 2).astype(np.int32)
 
 def compute_dlmi_logits(mask_np, mode="Fixed", intensity=10.0, falloff=20):
     """Convert a binary mask to DLMI logits for memory encoding.

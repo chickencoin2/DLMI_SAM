@@ -43,10 +43,33 @@ class AppView:
             self.top_frame, text="Hide Tabs",
             command=self._toggle_tabs_visibility, bg="#fff9c4"
         )
+        self.btn_save_settings = tk.Button(
+            self.top_frame, text="Save Settings",
+            command=self.app.save_user_settings if hasattr(self.app, 'save_user_settings') else None,
+            bg="#c8e6c9"
+        )
+
+        # --- Model backend selector (hug / git / 3.1), top-right of toolbar ---
+        self.backend_frame = tk.Frame(self.top_frame)
+        self.backend_label = tk.Label(self.backend_frame, text="Backend:")
+        self.backend_buttons = {}
+        for _bkey, _btxt in (("hug", "hug"), ("git", "git"), ("3.1", "3.1")):
+            self.backend_buttons[_bkey] = tk.Radiobutton(
+                self.backend_frame, text=_btxt, value=_bkey,
+                variable=self.app.active_backend_var, indicatoron=False,
+                width=4, command=self._on_backend_select,
+                selectcolor="#90caf9", state=tk.DISABLED,
+            )
+        # fp32 compute indicator/toggle. Mirrors the active backend's precision: HF is
+        # always fp32 (checked + disabled); git/3.1 is the editable preference. Bound to
+        # a display var so reflecting HF never clobbers the git/3.1 setting.
+        self.backend_fp32_check = tk.Checkbutton(
+            self.backend_frame, text="fp32", variable=self.app.backend_fp32_display_var,
+            command=getattr(self.app, "_on_git_precision_toggle", None))
 
         self.notebook = ttk.Notebook(self.controls_and_config_frame)
 
-        self.obj_control_tab = tk.Frame(self.notebook)
+        self.obj_control_tab = self._make_scrollable_tab_frame("  Object Control  ")
         self.prompt_frame = tk.LabelFrame(self.obj_control_tab, text="Object Prompt")
         self.selected_obj_action_frame = tk.LabelFrame(self.obj_control_tab, text="Selected Object Actions")
         self.batch_control_frame = tk.LabelFrame(self.obj_control_tab, text="Batch Control")
@@ -108,6 +131,16 @@ class AppView:
         self.guide_toggle_frame = tk.Frame(self.selected_obj_action_frame)
         self.guide_visible = False
         self.btn_guide_toggle = tk.Button(self.guide_toggle_frame, text="▶ Guide", font=("TkDefaultFont", 8), command=self._toggle_guide_visibility)
+        self.btn_negative_area = tk.Button(
+            self.guide_toggle_frame, text="✂ Negative Area", font=("TkDefaultFont", 8),
+            command=self.app.toggle_negative_area_mode if hasattr(self.app, 'toggle_negative_area_mode') else None,
+            bg="#ffe0b2"
+        )
+        self.btn_multi_choose = tk.Button(
+            self.guide_toggle_frame, text="▦ Multi Choose", font=("TkDefaultFont", 8),
+            command=self.app.toggle_multi_choose_mode if hasattr(self.app, 'toggle_multi_choose_mode') else None,
+            bg="#c5e1a5"
+        )
         self.guide_label = tk.Label(self.selected_obj_action_frame, text=selection_guide_text, justify=tk.LEFT, fg="gray50", font=("TkDefaultFont", 8))
         self.button_frame = tk.Frame(self.selected_obj_action_frame)
         self.btn_set_custom_label = tk.Button(self.button_frame, text="Set Name", command=self.app._set_custom_label_for_selected, state=tk.DISABLED)
@@ -149,29 +182,114 @@ class AppView:
         self.polygon_point_size_entry.bind("<FocusOut>", self._on_point_size_change)
         self.polygon_status_label = tk.Label(self.polygon_point_size_frame, text="Left-click to add points", fg="gray50", font=("TkDefaultFont", 8))
 
+        self.pose_control_frame = tk.LabelFrame(self.obj_control_tab, text="Pose Points")
+        self.pose_btn_row1 = tk.Frame(self.pose_control_frame)
+        self.btn_pose_add = tk.Checkbutton(
+            self.pose_btn_row1, text="\u2795 Add Pose", indicatoron=False,
+            variable=self.app.pose_add_mode_var if hasattr(self.app, 'pose_add_mode_var') else None,
+            command=self._on_pose_add_mode_toggle if hasattr(self, '_on_pose_add_mode_toggle') else None,
+            width=10, bg="#e3f2fd", selectcolor="#64b5f6"
+        )
+        self.btn_pose_chain = tk.Checkbutton(
+            self.pose_btn_row1, text="\u26d3 Chain", indicatoron=False,
+            variable=self.app.pose_chain_mode_var if hasattr(self.app, 'pose_chain_mode_var') else None,
+            width=7, bg="#f3e5f5", selectcolor="#ba68c8"
+        )
+        self.btn_pose_new_obj = tk.Button(
+            self.pose_btn_row1, text="\u2795 New Obj",
+            command=self.app.new_pose_object if hasattr(self.app, 'new_pose_object') else None,
+            width=10, bg="#c8e6c9"
+        )
+
+        self.pose_btn_row2 = tk.Frame(self.pose_control_frame)
+        self.btn_pose_connect = tk.Button(
+            self.pose_btn_row2, text="\U0001F517 Connect",
+            command=self.app.connect_selected_pose_points if hasattr(self.app, 'connect_selected_pose_points') else None,
+            state=tk.DISABLED, width=9
+        )
+        self.btn_pose_delete = tk.Button(
+            self.pose_btn_row2, text="\U0001F5D1 Delete",
+            command=self.app.delete_selected_pose_points if hasattr(self.app, 'delete_selected_pose_points') else None,
+            state=tk.DISABLED, width=8, bg="#ffebee"
+        )
+        self.pose_idx_label = tk.Label(self.pose_btn_row2, text="idx:", font=("TkDefaultFont", 8))
+        self.pose_idx_var = tk.StringVar(value="")
+        self.pose_idx_entry = tk.Entry(
+            self.pose_btn_row2, textvariable=self.pose_idx_var,
+            width=4, justify=tk.CENTER, state=tk.DISABLED
+        )
+        self.btn_pose_set_idx = tk.Button(
+            self.pose_btn_row2, text="Set",
+            command=self.app.reassign_selected_pose_idx if hasattr(self.app, 'reassign_selected_pose_idx') else None,
+            state=tk.DISABLED, width=4
+        )
+        self.btn_pose_toggle_vis = tk.Button(
+            self.pose_btn_row2, text="Vis/Occ",
+            command=self.app.toggle_selected_pose_visibility if hasattr(self.app, 'toggle_selected_pose_visibility') else None,
+            state=tk.DISABLED, width=7, bg="#fff3e0"
+        )
+
+        self.pose_btn_row3 = tk.Frame(self.pose_control_frame)
+        self.pose_class_label = tk.Label(self.pose_btn_row3, text="Class:", font=("TkDefaultFont", 8))
+        self.pose_class_var = tk.StringVar(value="")
+        self.pose_class_menu = tk.OptionMenu(self.pose_btn_row3, self.pose_class_var, "")
+        self.pose_class_menu.config(width=12, font=("TkDefaultFont", 8))
+        if hasattr(self.app, '_on_pose_class_selected'):
+            self.pose_class_var.trace_add('write', lambda *_: self.app._on_pose_class_selected())
+        self.btn_pose_delete_obj = tk.Button(
+            self.pose_btn_row3, text="\U0001F5D1 Obj Pose",
+            command=self.app.delete_selected_object_pose if hasattr(self.app, 'delete_selected_object_pose') else None,
+            state=tk.DISABLED, width=11, bg="#ffcdd2"
+        )
+
+        self.pose_status_label = tk.Label(
+            self.pose_control_frame,
+            text=("Add Pose: click canvas to drop a keypoint (works mid-video too \u2014\n"
+                  "points added while reviewing frame N are anchored at N and TAPNext\n"
+                  "propagates them both forward and backward from that frame).\n"
+                  "Chain: auto-connect consecutive clicks.\n"
+                  "Shift+click: select single point \u2022 Shift+right-click: select entire chain.\n"
+                  "Vis/Occ: toggle v=2 (visible, filled) \u2194 v=1 (occluded, dashed ring).\n"
+                  "idx/Set: renumber the selected point \u2022 Obj Pose: delete the whole pose\n"
+                  "of the currently selected object \u2022 Class: assigns schema."),
+            fg="gray50", font=("TkDefaultFont", 7), justify=tk.LEFT
+        )
+
         self.ui_display_frame = tk.LabelFrame(self.obj_control_tab, text="UI Display Settings")
         self.label_font_size_frame = tk.Frame(self.ui_display_frame)
-        self.label_font_size_label = tk.Label(self.label_font_size_frame, text="Font Size(%):", font=("TkDefaultFont", 8))
-        self.label_font_size_entry = tk.Entry(self.label_font_size_frame, width=6, justify=tk.CENTER)
+        self.label_font_size_label = tk.Label(self.label_font_size_frame, text="Font(%):", font=("TkDefaultFont", 8))
+        self.label_font_size_entry = tk.Entry(self.label_font_size_frame, width=5, justify=tk.CENTER)
         self.label_font_size_entry.insert(0, "0.70")
         self.label_font_size_entry.bind("<Return>", self._on_font_size_change)
         self.label_font_size_entry.bind("<FocusOut>", self._on_font_size_change)
         self.show_border_check = tk.Checkbutton(
-            self.label_font_size_frame, text="Object Border",
+            self.label_font_size_frame, text="Border",
             variable=self.app.show_object_border_var if hasattr(self.app, 'show_object_border_var') else None,
-            command=self._on_ui_display_change
+            command=self._on_ui_display_change, font=("TkDefaultFont", 8)
         )
-        self.prompt_viz_frame = tk.Frame(self.ui_display_frame)
         self.show_prompt_viz_check = tk.Checkbutton(
-            self.prompt_viz_frame, text="Show Prompts",
+            self.label_font_size_frame, text="Show Prompts",
             variable=self.app.show_prompt_visualization_var if hasattr(self.app, 'show_prompt_visualization_var') else None,
             command=self._on_ui_display_change, font=("TkDefaultFont", 8)
         )
         self.show_prompt_per_object_check = tk.Checkbutton(
-            self.prompt_viz_frame, text="Per-Object",
+            self.label_font_size_frame, text="Per-Object",
             variable=self.app.show_prompt_per_object_var if hasattr(self.app, 'show_prompt_per_object_var') else None,
             command=self._on_ui_display_change, font=("TkDefaultFont", 8)
         )
+
+        self.polygon_vertex_size_frame = tk.Frame(self.ui_display_frame)
+        self.polygon_vertex_size_label = tk.Label(self.polygon_vertex_size_frame, text="Polygon Point(%):", font=("TkDefaultFont", 8))
+        self.polygon_vertex_size_entry = tk.Entry(self.polygon_vertex_size_frame, width=5, justify=tk.CENTER)
+        _pv_default = 0.40
+        if hasattr(self.app, 'polygon_vertex_size_percent_var'):
+            try:
+                _pv_default = float(self.app.polygon_vertex_size_percent_var.get())
+            except Exception:
+                _pv_default = 0.40
+        self.polygon_vertex_size_entry.insert(0, f"{_pv_default:.2f}")
+        self.polygon_vertex_size_entry.bind("<Return>", self._on_polygon_vertex_size_change)
+        self.polygon_vertex_size_entry.bind("<FocusOut>", self._on_polygon_vertex_size_change)
 
         self.small_obj_filter_frame = tk.Frame(self.batch_control_frame)
         self.check_filter_small_obj = tk.Checkbutton(
@@ -235,7 +353,7 @@ class AppView:
             fg="gray50", font=("TkDefaultFont", 8)
         )
 
-        self.save_batch_tab = tk.Frame(self.notebook)
+        self.save_batch_tab = self._make_scrollable_tab_frame("  Save/Batch  ")
         self.save_options_frame = tk.LabelFrame(self.save_batch_tab, text="Save Options")
         self.batch_options_frame = tk.LabelFrame(self.save_batch_tab, text="Batch Processing Options")
 
@@ -250,17 +368,39 @@ class AppView:
         self.entry_custom_file_name = tk.Entry(self.custom_save_widgets_frame, textvariable=self.app.custom_file_name_var)
         self.custom_format_label = tk.Label(self.custom_save_widgets_frame, text="* Format: {video_name} available", fg="gray50")
 
+        # Separate pose-label save path. When enabled, YOLO-pose .txt files go
+        # exclusively to this root (with per-video subfolder rules mirroring
+        # the seg save), so videos that have no pose data emit nothing into
+        # this folder while seg labels for the same video continue to land
+        # under the regular Save Location.
+        self.check_custom_pose_save = tk.Checkbutton(
+            self.save_options_frame,
+            text="Use Separate Pose Save Path",
+            variable=self.app.use_custom_pose_save_path_var,
+            command=self.app._on_custom_pose_save_toggle,
+        )
+        self.custom_pose_save_widgets_frame = tk.Frame(self.save_options_frame)
+        self.custom_pose_save_dir_label = tk.Label(self.custom_pose_save_widgets_frame, text="Pose Save Location:")
+        self.entry_custom_pose_save_dir = tk.Entry(
+            self.custom_pose_save_widgets_frame,
+            textvariable=self.app.custom_pose_save_dir_var, width=18
+        )
+        self.btn_select_pose_save_dir = tk.Button(
+            self.custom_pose_save_widgets_frame, text="...",
+            command=self.app.select_custom_pose_save_dir, width=3
+        )
+
         self.check_batch_mode = tk.Checkbutton(self.batch_options_frame, text="Enable Batch Processing Mode", variable=self.app.batch_processing_mode_var, command=self.app._on_batch_mode_toggle)
         self.batch_widgets_frame = tk.Frame(self.batch_options_frame)
         self.batch_dir_label = tk.Label(self.batch_widgets_frame, text="Video Folder:")
         self.entry_batch_dir = tk.Entry(self.batch_widgets_frame, textvariable=self.app.batch_source_dir_var, width=18)
         self.btn_select_batch_dir = tk.Button(self.batch_widgets_frame, text="...", command=self.app.select_batch_source_dir, width=3)
         self.btn_start_batch = tk.Button(self.batch_widgets_frame, text="Start Batch", command=self.app.start_batch_processing)
-        self.batch_save_label = tk.Label(self.batch_widgets_frame, text="Save Method:")
+        self.batch_save_label = tk.Label(self.batch_widgets_frame, text="Save:")
         self.batch_save_rb_frame = tk.Frame(self.batch_widgets_frame)
         self.rb_subfolder = tk.Radiobutton(self.batch_save_rb_frame, text="Create Subfolder", variable=self.app.batch_save_option_var, value="subfolder")
         self.rb_singlefolder = tk.Radiobutton(self.batch_save_rb_frame, text="Single Folder", variable=self.app.batch_save_option_var, value="singlefolder")
-        self.batch_filename_label = tk.Label(self.batch_widgets_frame, text="Filename Method:")
+        self.batch_filename_label = tk.Label(self.batch_widgets_frame, text="Filename:")
         self.batch_filename_rb_frame = tk.Frame(self.batch_widgets_frame)
         self.rb_fname_video = tk.Radiobutton(self.batch_filename_rb_frame, text="Use Video Name", variable=self.app.batch_filename_option_var, value="video_name")
         self.rb_fname_custom = tk.Radiobutton(self.batch_filename_rb_frame, text="Use Custom Name", variable=self.app.batch_filename_option_var, value="custom")
@@ -272,7 +412,7 @@ class AppView:
         self.entry_batch_move_dir = tk.Entry(self.batch_move_widgets_frame, textvariable=self.app.batch_completed_dir_var, width=15)
         self.btn_select_move_dir = tk.Button(self.batch_move_widgets_frame, text="...", command=self.app.select_batch_completed_dir, width=3)
 
-        self.advanced_config_tab = tk.Frame(self.notebook)
+        self.advanced_config_tab = self._make_scrollable_tab_frame("  Advanced  ")
         self.sam_adv_config_frame = tk.LabelFrame(self.advanced_config_tab, text="SAM Mask/Prompt")
         self.misc_settings_frame = tk.LabelFrame(self.advanced_config_tab, text="Other Settings")
 
@@ -296,9 +436,10 @@ class AppView:
             command=self._on_mask_alpha_change
         )
 
-        self.check_apply_closing = tk.Checkbutton(self.sam_adv_config_frame, text="Apply Closing", variable=self.app.sam_apply_closing_var)
-        self.sam_closing_kernel_label = tk.Label(self.sam_adv_config_frame, text="Closing Kernel:")
-        self.scale_sam_closing_kernel = tk.Scale(self.sam_adv_config_frame, from_=1, to=11, orient=tk.HORIZONTAL, variable=self.app.sam_closing_kernel_size_var, length=72)
+        self.sam_closing_row_frame = tk.Frame(self.sam_adv_config_frame)
+        self.check_apply_closing = tk.Checkbutton(self.sam_closing_row_frame, text="Closing", variable=self.app.sam_apply_closing_var)
+        self.sam_closing_kernel_label = tk.Label(self.sam_closing_row_frame, text="Kernel:", font=("TkDefaultFont", 8))
+        self.scale_sam_closing_kernel = tk.Scale(self.sam_closing_row_frame, from_=1, to=11, orient=tk.HORIZONTAL, variable=self.app.sam_closing_kernel_size_var, length=100, showvalue=True)
 
         self.erosion_kernel_label = tk.Label(self.erosion_frame, text="Erosion Kernel:")
         self.scale_erosion_kernel = tk.Scale(self.erosion_frame, from_=0, to=7, orient=tk.HORIZONTAL, variable=self.app.erosion_kernel_size, length=63)
@@ -322,7 +463,7 @@ class AppView:
         self.dlmi_alpha_slider = tk.Scale(
             self.dlmi_alpha_frame, from_=0.5, to=30.0, orient=tk.HORIZONTAL,
             variable=self.app.dlmi_alpha_var if hasattr(self.app, 'dlmi_alpha_var') else None,
-            length=252, resolution=0.5
+            length=120, resolution=0.5
         )
         self.dlmi_alpha_info = tk.Label(
             self.low_level_api_frame,
@@ -355,7 +496,30 @@ class AppView:
             variable=self.app.dlmi_boost_cond_var if hasattr(self.app, 'dlmi_boost_cond_var') else None,
         )
 
-        self.propagate_review_tab = tk.Frame(self.notebook)
+        self.tapnext_frame = tk.LabelFrame(self.advanced_config_tab, text="TAPNext++ Pose (Advanced)")
+        self.tapnext_row_frame = tk.Frame(self.tapnext_frame)
+        self.btn_tapnext_settings = tk.Button(
+            self.tapnext_row_frame, text="\u2699",
+            command=self.app.open_pose_settings if hasattr(self.app, 'open_pose_settings') else None,
+            width=3, font=("TkDefaultFont", 10)
+        )
+        self.check_tapnext_enabled = tk.Checkbutton(
+            self.tapnext_row_frame, text="TAPNext++ On",
+            variable=self.app.pose_tapnext_enabled_var if hasattr(self.app, 'pose_tapnext_enabled_var') else None,
+            font=("TkDefaultFont", 9)
+        )
+        self.check_pose_automatch = tk.Checkbutton(
+            self.tapnext_row_frame, text="Auto-match",
+            variable=self.app.pose_automatch_var if hasattr(self.app, 'pose_automatch_var') else None,
+            font=("TkDefaultFont", 9)
+        )
+        self.tapnext_info_label = tk.Label(
+            self.tapnext_frame,
+            text="* \u2699: configure. Auto-match: merge pose-only objects into segments when \u226570% of points fall inside a mask.",
+            fg="gray50", font=("TkDefaultFont", 7), justify=tk.LEFT
+        )
+
+        self.propagate_review_tab = self._make_scrollable_tab_frame("  Propagate/Review  ")
 
         self.propagate_control_frame = tk.LabelFrame(self.propagate_review_tab, text="Propagate Control")
         self.btn_start_propagate = tk.Button(
@@ -386,6 +550,23 @@ class AppView:
             self.propagate_control_frame, text="",
             fg="#d84315", font=("TkDefaultFont", 8)
         )
+
+        self.mid_new_object_frame = tk.Frame(self.propagate_control_frame)
+        self.mid_new_object_label = tk.Label(
+            self.mid_new_object_frame,
+            text="Mid-session new object:",
+            font=("TkDefaultFont", 8), fg="gray30"
+        )
+        mid_var = getattr(self.app, 'mid_new_object_method_var', None)
+        self.mid_new_object_radios = []
+        if mid_var is not None:
+            for label_text, val in (("Off (block)", "off"), ("DLMI inject", "dlmi"), ("Load labels", "load")):
+                rb = tk.Radiobutton(
+                    self.mid_new_object_frame, text=label_text,
+                    variable=mid_var, value=val,
+                    font=("TkDefaultFont", 8)
+                )
+                self.mid_new_object_radios.append(rb)
 
         self.review_mode_frame = tk.LabelFrame(self.propagate_review_tab, text="Review & Refine")
         self.review_slider_label = tk.Label(self.review_mode_frame, text="Frame:")
@@ -426,6 +607,18 @@ class AppView:
             state=tk.DISABLED, bg="#c8e6c9", width=12
         )
 
+        self.review_buttons_frame2 = tk.Frame(self.review_mode_frame)
+        self.btn_cut_dlmi = tk.Button(
+            self.review_buttons_frame2, text="Cut + DLMI ✂▶",
+            command=self.app.cut_and_dlmi_propagate if hasattr(self.app, 'cut_and_dlmi_propagate') else None,
+            state=tk.DISABLED, width=14, bg="#e1bee7"
+        )
+        self.btn_cut_load = tk.Button(
+            self.review_buttons_frame2, text="Cut + Load ✂📂",
+            command=self.app.cut_and_load_labels if hasattr(self.app, 'cut_and_load_labels') else None,
+            state=tk.DISABLED, width=14, bg="#bbdefb"
+        )
+
         self.review_guide_collapsed = True
         review_guide_text = (
             "1. 'Start Propagate' to process entire video\n"
@@ -457,6 +650,25 @@ class AppView:
             length=100
         )
 
+        self.pose_tool_frame = tk.LabelFrame(self.propagate_review_tab, text="Pose Tools (manual)")
+        self.btn_pose_detect_yolo = tk.Button(
+            self.pose_tool_frame, text="Detect Pose (YOLO)",
+            command=self.app.run_yolo_pose_detect if hasattr(self.app, 'run_yolo_pose_detect') else None,
+            width=18, bg="#fff3e0"
+        )
+        self.btn_pose_run_tapnext = tk.Button(
+            self.pose_tool_frame, text="Run TAPNext Post",
+            command=self.app.run_tapnext_post_process if hasattr(self.app, 'run_tapnext_post_process') else None,
+            width=18, bg="#e1bee7"
+        )
+        self.pose_tool_status_label = tk.Label(
+            self.pose_tool_frame,
+            text=("\u2022 Detect Pose (YOLO): run a YOLO-pose model on the CURRENT frame to add keypoints.\n"
+                  "\u2022 Run TAPNext Post: propagate existing pose points across all propagated frames.\n"
+                  "  (auto-runs after SAM3 propagation when TAPNext++ toggle is ON)"),
+            fg="gray50", font=("TkDefaultFont", 8), justify=tk.LEFT
+        )
+
         self.progress_label = tk.Label(self.status_bar_frame, text="Status: Loading model...")
         self.obj_id_info_label = tk.Label(self.status_bar_frame, text=f"Next manual BBox ObjID (proposed): {self.app.next_obj_id_to_propose}")
         logger.debug("Widgets setup complete.")
@@ -483,8 +695,15 @@ class AppView:
 
         self.btn_select_source.pack(side=tk.LEFT, padx=2)
         self.btn_clear_tracked.pack(side=tk.LEFT, padx=2)
+        # Backend selector packed first among the RIGHT group -> far right.
+        self.backend_frame.pack(side=tk.RIGHT, padx=(10, 4))
+        self.backend_label.pack(side=tk.LEFT, padx=(0, 4))
+        for _bkey in ("hug", "git", "3.1"):
+            self.backend_buttons[_bkey].pack(side=tk.LEFT, padx=1)
+        self.backend_fp32_check.pack(side=tk.LEFT, padx=(4, 0))
         self.btn_load_label.pack(side=tk.RIGHT, padx=2)
         self.btn_toggle_tabs.pack(side=tk.RIGHT, padx=2)
+        self.btn_save_settings.pack(side=tk.RIGHT, padx=2)
 
         self.notebook.pack(fill=tk.BOTH, expand=True)
         self.obj_control_tab.columnconfigure(0, weight=1)
@@ -519,6 +738,8 @@ class AppView:
         self.selected_obj_action_frame.grid(row=1, column=0, padx=5, pady=5, sticky='ew')
         self.guide_toggle_frame.pack(side=tk.TOP, anchor='w', padx=5, pady=2)
         self.btn_guide_toggle.pack(side=tk.LEFT)
+        self.btn_negative_area.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_multi_choose.pack(side=tk.LEFT, padx=(4, 0))
         self.button_frame.pack(side=tk.TOP, fill=tk.X)
         self.btn_low_data_inject = tk.Button(self.button_frame, text="Inject Data", command=self.app.inject_low_level_mask_prompt if hasattr(self.app, 'inject_low_level_mask_prompt') else None, state=tk.DISABLED, bg="#e1bee7")
         self.btn_low_data_inject.pack(side=tk.LEFT, padx=3)
@@ -540,16 +761,36 @@ class AppView:
         self.polygon_point_size_entry.pack(side=tk.LEFT, padx=5)
         self.polygon_status_label.pack(side=tk.LEFT, padx=(10, 0))
 
-        self.ui_display_frame.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
+        self.pose_control_frame.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
+        self.pose_btn_row1.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.btn_pose_add.pack(side=tk.LEFT, padx=2)
+        self.btn_pose_chain.pack(side=tk.LEFT, padx=2)
+        self.btn_pose_new_obj.pack(side=tk.LEFT, padx=2)
+        self.pose_btn_row2.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.btn_pose_connect.pack(side=tk.LEFT, padx=2)
+        self.btn_pose_delete.pack(side=tk.LEFT, padx=2)
+        self.btn_pose_toggle_vis.pack(side=tk.LEFT, padx=2)
+        self.pose_idx_label.pack(side=tk.LEFT, padx=(10, 2))
+        self.pose_idx_entry.pack(side=tk.LEFT, padx=2)
+        self.btn_pose_set_idx.pack(side=tk.LEFT, padx=2)
+        self.pose_btn_row3.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.pose_class_label.pack(side=tk.LEFT, padx=2)
+        self.pose_class_menu.pack(side=tk.LEFT, padx=2)
+        self.btn_pose_delete_obj.pack(side=tk.LEFT, padx=(10, 2))
+        self.pose_status_label.pack(side=tk.TOP, anchor='w', padx=5, pady=(0, 3))
+
+        self.ui_display_frame.grid(row=4, column=0, padx=5, pady=5, sticky='ew')
         self.label_font_size_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
         self.label_font_size_label.pack(side=tk.LEFT)
-        self.label_font_size_entry.pack(side=tk.LEFT, padx=5)
-        self.show_border_check.pack(side=tk.LEFT, padx=(15, 5))
-        self.prompt_viz_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
-        self.show_prompt_viz_check.pack(side=tk.LEFT)
-        self.show_prompt_per_object_check.pack(side=tk.LEFT, padx=5)
+        self.label_font_size_entry.pack(side=tk.LEFT, padx=(2, 8))
+        self.show_border_check.pack(side=tk.LEFT, padx=2)
+        self.show_prompt_viz_check.pack(side=tk.LEFT, padx=2)
+        self.show_prompt_per_object_check.pack(side=tk.LEFT, padx=2)
+        self.polygon_vertex_size_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.polygon_vertex_size_label.pack(side=tk.LEFT)
+        self.polygon_vertex_size_entry.pack(side=tk.LEFT, padx=(2, 8))
 
-        self.batch_control_frame.grid(row=4, column=0, padx=5, pady=5, sticky='ew')
+        self.batch_control_frame.grid(row=5, column=0, padx=5, pady=5, sticky='ew')
         self.small_obj_filter_frame.pack(pady=2, padx=5, fill=tk.X)
         self.check_filter_small_obj.pack(side=tk.LEFT)
         self.small_obj_threshold_label.pack(side=tk.LEFT, padx=(5, 2))
@@ -562,10 +803,10 @@ class AppView:
         self.rb_contour_base_image.pack(side=tk.LEFT)
         self.rb_contour_base_object.pack(side=tk.LEFT)
 
-        self.skip_video_frame.grid(row=5, column=0, padx=5, pady=5, sticky='ew')
+        self.skip_video_frame.grid(row=6, column=0, padx=5, pady=5, sticky='ew')
         self.btn_skip_batch.pack(expand=True, fill=tk.BOTH)
 
-        self.sam2_control_frame.grid(row=6, column=0, padx=5, pady=5, sticky='ew')
+        self.sam2_control_frame.grid(row=7, column=0, padx=5, pady=5, sticky='ew')
         self.sam2_toggle_frame.pack(side=tk.LEFT, padx=5, pady=2)
         self.check_sam2_enabled.pack(side=tk.LEFT)
         self.sam2_status_label.pack(side=tk.LEFT, padx=(2, 0))
@@ -586,6 +827,13 @@ class AppView:
         self.custom_file_name_label.grid(row=2, column=0, sticky='e', pady=2, padx=2)
         self.entry_custom_file_name.grid(row=2, column=1, columnspan=2, sticky='ew')
         self.custom_format_label.grid(row=3, column=1, sticky='w')
+
+        self.check_custom_pose_save.pack(anchor='w', padx=5, pady=(6, 0))
+        self.custom_pose_save_widgets_frame.pack(anchor='w', padx=5, fill='x')
+        self.custom_pose_save_widgets_frame.columnconfigure(1, weight=1)
+        self.custom_pose_save_dir_label.grid(row=0, column=0, sticky='e', pady=2, padx=2)
+        self.entry_custom_pose_save_dir.grid(row=0, column=1, sticky='ew')
+        self.btn_select_pose_save_dir.grid(row=0, column=2, padx=(2, 0))
         
         self.check_batch_mode.pack(anchor='w', padx=5)
         self.batch_widgets_frame.pack(anchor='w', padx=5, fill='x')
@@ -619,6 +867,12 @@ class AppView:
         self.sam_adv_config_frame.grid(row=0, column=0, padx=5, pady=5, sticky='ew')
         self.misc_settings_frame.grid(row=1, column=0, padx=5, pady=5, sticky='ew')
         self.low_level_api_frame.grid(row=2, column=0, padx=5, pady=5, sticky='ew')
+        self.tapnext_frame.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
+        self.tapnext_row_frame.pack(anchor='w', fill=tk.X, padx=5, pady=2)
+        self.btn_tapnext_settings.pack(side=tk.LEFT, padx=2)
+        self.check_tapnext_enabled.pack(side=tk.LEFT, padx=(8, 2))
+        self.check_pose_automatch.pack(side=tk.LEFT, padx=(8, 2))
+        self.tapnext_info_label.pack(anchor='w', padx=5, pady=(0, 3))
         self.check_low_level_api.pack(anchor='w', padx=5, pady=2)
         self.low_level_api_guide.pack(anchor='w', padx=5, pady=2)
         self.dlmi_alpha_frame.pack(anchor='w', padx=5, pady=(5, 0), fill='x')
@@ -633,9 +887,10 @@ class AppView:
         self.dlmi_preserve_check.pack(anchor='w', padx=5, pady=(2, 0))
         self.dlmi_boost_check.pack(anchor='w', padx=5, pady=(0, 5))
 
-        self.check_apply_closing.pack(anchor='w', padx=5)
-        self.sam_closing_kernel_label.pack(anchor='w', padx=5, pady=(5,0))
-        self.scale_sam_closing_kernel.pack(anchor='w', fill=tk.X, padx=5)
+        self.sam_closing_row_frame.pack(anchor='w', fill=tk.X, padx=5, pady=(2, 2))
+        self.check_apply_closing.pack(side=tk.LEFT)
+        self.sam_closing_kernel_label.pack(side=tk.LEFT, padx=(8, 2))
+        self.scale_sam_closing_kernel.pack(side=tk.LEFT)
 
         self.mask_display_frame.pack(anchor='w', fill=tk.X, padx=5, pady=(5,0))
         self.mask_alpha_label.pack(side=tk.LEFT, padx=5)
@@ -654,10 +909,7 @@ class AppView:
         self.edge_margin_label.pack(side=tk.LEFT, padx=(10,2))
         self.scale_edge_margin.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=5)
 
-        self.notebook.add(self.obj_control_tab, text="  Object Control  ")
-        self.notebook.add(self.save_batch_tab, text="  Save/Batch  ")
-        self.notebook.add(self.advanced_config_tab, text="  Advanced  ")
-        self.notebook.add(self.propagate_review_tab, text="  Propagate/Review  ")
+        # Tabs are registered during _make_scrollable_tab_frame()
 
         self.propagate_review_tab.columnconfigure(0, weight=1)
 
@@ -669,6 +921,10 @@ class AppView:
         self.propagate_progressbar.grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky='ew')
         self.propagate_status_label.grid(row=2, column=0, columnspan=3, sticky='w', padx=5, pady=2)
         self.discarded_frames_label.grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=2)
+        self.mid_new_object_frame.grid(row=4, column=0, columnspan=3, sticky='w', padx=5, pady=(2, 4))
+        self.mid_new_object_label.pack(side=tk.LEFT, padx=(0, 4))
+        for rb in self.mid_new_object_radios:
+            rb.pack(side=tk.LEFT, padx=2)
 
         self.review_mode_frame.grid(row=1, column=0, padx=5, pady=5, sticky='ew')
         self.review_slider_label.grid(row=0, column=0, sticky='w', padx=5, pady=2)
@@ -684,14 +940,23 @@ class AppView:
         self.btn_cut_from_here.pack(side=tk.LEFT, padx=3)
         self.btn_discard_frame.pack(side=tk.LEFT, padx=3)
         self.btn_confirm_labels.pack(side=tk.LEFT, padx=3)
-        self.review_guide_frame.grid(row=3, column=0, columnspan=3, sticky='w', padx=5, pady=2)
+        self.review_buttons_frame2.grid(row=3, column=0, columnspan=3, pady=(0, 5))
+        self.btn_cut_dlmi.pack(side=tk.LEFT, padx=3)
+        self.btn_cut_load.pack(side=tk.LEFT, padx=3)
+        self.review_guide_frame.grid(row=4, column=0, columnspan=3, sticky='w', padx=5, pady=2)
         self.btn_toggle_review_guide.pack(anchor='w')
+
+        self.pose_tool_frame.grid(row=2, column=0, padx=5, pady=5, sticky='ew')
+        self.btn_pose_detect_yolo.grid(row=0, column=0, padx=3, pady=3)
+        self.btn_pose_run_tapnext.grid(row=0, column=1, padx=3, pady=3)
+        self.pose_tool_status_label.grid(row=1, column=0, columnspan=2, sticky='w', padx=5)
 
         self.progress_label.pack(side=tk.LEFT, padx=10)
         self.obj_id_info_label.pack(side=tk.LEFT, padx=10)
         logger.debug("Widget layout complete.")
 
         self.update_custom_save_options_state()
+        self.update_custom_pose_save_options_state()
         self.update_batch_options_state()
         self._update_pcs_mode_ui()
 
@@ -776,6 +1041,11 @@ class AppView:
                 self.btn_stop_propagate.config(state=tk.NORMAL)
                 self.btn_cut_from_here.config(state=tk.DISABLED)
                 self.btn_confirm_labels.config(state=tk.DISABLED)
+                try:
+                    self.btn_cut_dlmi.config(state=tk.DISABLED)
+                    self.btn_cut_load.config(state=tk.DISABLED)
+                except (tk.TclError, AttributeError):
+                    pass
             else:
                 self.btn_start_propagate.config(state=tk.NORMAL, text="Start Propagate \u25b6")
                 self.btn_pause_propagate.config(state=tk.DISABLED)
@@ -811,6 +1081,11 @@ class AppView:
             self.btn_confirm_labels.config(state=state)
             self.review_frame_slider.config(state=tk.NORMAL)
         except tk.TclError:
+            pass
+        try:
+            self.btn_cut_dlmi.config(state=state)
+            self.btn_cut_load.config(state=state)
+        except (tk.TclError, AttributeError):
             pass
 
     def update_review_slider_range(self, max_frame):
@@ -912,6 +1187,18 @@ class AppView:
             except tk.TclError:
                 pass
 
+    def update_custom_pose_save_options_state(self):
+        state = tk.NORMAL if self.app.use_custom_pose_save_path_var.get() else tk.DISABLED
+        for widget in self.custom_pose_save_widgets_frame.winfo_children():
+            try:
+                if isinstance(widget, tk.Entry) and state == tk.DISABLED:
+                    widget.config(state=tk.NORMAL)
+                    widget.config(state='readonly')
+                else:
+                    widget.config(state=state)
+            except tk.TclError:
+                pass
+
     def update_batch_options_state(self):
         state = tk.NORMAL if self.app.batch_processing_mode_var.get() else tk.DISABLED
         for widget in self.batch_widgets_frame.winfo_children():
@@ -928,6 +1215,76 @@ class AppView:
         if self.app.autolabel_active:
             return "break"
         return None
+
+    def _make_scrollable_tab_frame(self, tab_text):
+        """Create a scrollable container frame for a notebook tab. Returns the
+        inner frame that widgets should use as their parent. The canvas keeps
+        the inner frame at its natural requested width so the vertical
+        scrollbar does NOT eat horizontal space from the content; the whole
+        notebook simply grows wider by the scrollbar width.
+        Mouse-wheel scrolls only while the cursor is over the tab."""
+        wrapper = tk.Frame(self.notebook)
+        canvas = tk.Canvas(wrapper, highlightthickness=0, borderwidth=0)
+        scrollbar = tk.Scrollbar(wrapper, orient=tk.VERTICAL, command=canvas.yview)
+        inner = tk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _on_inner_configure(_event=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                req_w = inner.winfo_reqwidth()
+                if req_w > 1:
+                    cur = canvas.cget('width')
+                    try:
+                        cur_int = int(float(cur))
+                    except (TypeError, ValueError):
+                        cur_int = 0
+                    if req_w != cur_int:
+                        canvas.configure(width=req_w)
+                    canvas.itemconfig(inner_id, width=req_w)
+            except tk.TclError:
+                pass
+
+        def _on_canvas_configure(event):
+            try:
+                req_w = inner.winfo_reqwidth()
+                target = max(event.width, req_w)
+                canvas.itemconfig(inner_id, width=target)
+            except tk.TclError:
+                pass
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_wheel(event):
+            try:
+                if getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0:
+                    canvas.yview_scroll(-3, "units")
+                elif getattr(event, 'num', 0) == 5 or getattr(event, 'delta', 0) < 0:
+                    canvas.yview_scroll(3, "units")
+            except tk.TclError:
+                pass
+
+        def _enter(_event=None):
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+            canvas.bind_all("<Button-4>", _on_wheel)
+            canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _leave(_event=None):
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        for w in (canvas, inner):
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+
+        self.notebook.add(wrapper, text=tab_text)
+        inner._tab_wrapper = wrapper
+        return inner
 
     def _on_tab_changed(self, event=None):
         if hasattr(self.app, 'current_cv_frame') and self.app.current_cv_frame is not None:
@@ -1047,6 +1404,112 @@ class AppView:
             self.canvas_image_item = None
             self.tk_image = None 
 
+    def _on_backend_select(self):
+        """Backend radiobutton callback (active_backend_var is already updated)."""
+        key = self.app.active_backend_var.get()
+        if hasattr(self.app, "on_backend_button"):
+            self.app.on_backend_button(key)
+
+    def set_backend_buttons_enabled(self, enabled):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for rb in getattr(self, "backend_buttons", {}).values():
+            try:
+                rb.config(state=state)
+            except tk.TclError:
+                pass
+
+    def refresh_backend_buttons(self, avail, active_key=None):
+        """Enable only available backends; reflect the active selection."""
+        for key, rb in getattr(self, "backend_buttons", {}).items():
+            try:
+                rb.config(state=(tk.NORMAL if avail.get(key, False) else tk.DISABLED))
+            except tk.TclError:
+                pass
+        if active_key:
+            try:
+                self.app.active_backend_var.set(active_key)
+            except Exception:
+                pass
+        self._sync_fp32_checkbox(active_key or self.app.active_backend_var.get())
+
+    def _sync_fp32_checkbox(self, active_key):
+        """Reflect the active backend's compute precision in the fp32 checkbox: HF is
+        always fp32 (checked + disabled); git/3.1 shows its toggleable preference."""
+        chk = getattr(self, "backend_fp32_check", None)
+        try:
+            if active_key == "hug":
+                self.app.backend_fp32_display_var.set(True)
+                if chk is not None:
+                    chk.config(state=tk.DISABLED)
+            else:
+                self.app.backend_fp32_display_var.set(bool(self.app.git_fp32_var.get()))
+                if chk is not None:
+                    chk.config(state=tk.NORMAL)
+        except tk.TclError:
+            pass
+
+    # ----- modal loading dialog (backend switch) -------------------------- #
+    def show_loading_dialog(self, message="Loading..."):
+        """Pop a small modal window with an animated indeterminate progress bar
+        so the user can see a backend switch is in progress (not frozen)."""
+        self.hide_loading_dialog()
+        win = tk.Toplevel(self.root)
+        win.title("Please wait")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(padx=26, pady=22)
+        try:
+            win.protocol("WM_DELETE_WINDOW", lambda: None)  # block close during load
+        except Exception:
+            pass
+        self._loading_label = tk.Label(win, text=message, font=("", 11))
+        self._loading_label.pack(pady=(0, 12))
+        pb = ttk.Progressbar(win, mode="indeterminate", length=340)
+        pb.pack()
+        pb.start(12)
+        self._loading_pb = pb
+        self._loading_win = win
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 2
+            win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.update()
+
+    def update_loading_message(self, message):
+        lbl = getattr(self, "_loading_label", None)
+        if lbl is not None:
+            try:
+                lbl.config(text=message)
+                lbl.update_idletasks()
+            except Exception:
+                pass
+
+    def hide_loading_dialog(self):
+        win = getattr(self, "_loading_win", None)
+        if win is not None:
+            try:
+                self._loading_pb.stop()
+            except Exception:
+                pass
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._loading_win = None
+        self._loading_label = None
+        self._loading_pb = None
+
     def set_ui_element_state(self, element_name, state):
         widget_map = {
             "btn_select_source": self.btn_select_source,
@@ -1080,11 +1543,17 @@ class AppView:
         if isinstance(widget, tk.Entry):
             try: widget.config(state=entry_state)
             except tk.TclError: pass
-        elif hasattr(widget, 'config') and 'state' in widget.config():
-            try: widget.config(state=state)
+        elif hasattr(widget, 'config'):
+            try:
+                if 'state' in widget.config():
+                    widget.config(state=state)
             except tk.TclError: pass
 
-        if isinstance(widget, (tk.Frame, tk.LabelFrame)):
+        # tk.Canvas is needed so the scrollable-tab wrappers (Frame→Canvas→Frame)
+        # propagate state to their inner-frame children. Without Canvas in this
+        # tuple, every widget inside a scrollable notebook tab becomes
+        # unreachable from set_ui_element_state("notebook_tabs", ...).
+        if isinstance(widget, (tk.Frame, tk.LabelFrame, tk.Canvas)):
             for child in widget.winfo_children():
                 self._set_widget_state_recursively(child, state)
 
@@ -1095,6 +1564,24 @@ class AppView:
                     self.app.current_cv_frame,
                     self.app._get_current_masks_for_display()
                 )
+
+    def _on_pose_add_mode_toggle(self):
+        if not hasattr(self.app, 'pose_add_mode_var'):
+            return
+        if self.app.pose_add_mode_var.get():
+            if hasattr(self.app, 'clear_pose_selection'):
+                self.app.clear_pose_selection()
+            if hasattr(self, 'delete_temp_bbox'):
+                self.delete_temp_bbox()
+        else:
+            classified = 0
+            if hasattr(self.app, '_automatch_all_new_pose_objects'):
+                try:
+                    classified = self.app._automatch_all_new_pose_objects()
+                except Exception as _e:
+                    logger.debug(f"automatch classify failed: {_e}")
+            if classified > 0 and hasattr(self.app, 'update_status'):
+                self.app.update_status(f"Auto-matched class for {classified} pose object(s).")
 
     def _toggle_tabs_visibility(self):
         if hasattr(self.app, 'tabs_visible_var'):
@@ -1117,6 +1604,29 @@ class AppView:
             self.guide_label.pack(side=tk.TOP, anchor='w', padx=5, pady=(2, 5), after=self.guide_toggle_frame)
             self.btn_guide_toggle.config(text="▼ Guide")
             self.guide_visible = True
+
+    def update_negative_area_mode_ui(self, active):
+        """Reflect the negative-area-mode state on the toggle button."""
+        if not hasattr(self, 'btn_negative_area') or self.btn_negative_area is None:
+            return
+        try:
+            if active:
+                self.btn_negative_area.config(text="✂ Negative ON", bg="#ef9a9a", relief=tk.SUNKEN)
+            else:
+                self.btn_negative_area.config(text="✂ Negative Area", bg="#ffe0b2", relief=tk.RAISED)
+        except tk.TclError:
+            pass
+
+    def update_multi_choose_mode_ui(self, active):
+        if not hasattr(self, 'btn_multi_choose') or self.btn_multi_choose is None:
+            return
+        try:
+            if active:
+                self.btn_multi_choose.config(text="▦ Multi ON", bg="#9ccc65", relief=tk.SUNKEN)
+            else:
+                self.btn_multi_choose.config(text="▦ Multi Choose", bg="#c5e1a5", relief=tk.RAISED)
+        except tk.TclError:
+            pass
 
     def _on_small_obj_filter_change(self):
         if hasattr(self.app, 'current_cv_frame') and self.app.current_cv_frame is not None:
@@ -1176,6 +1686,21 @@ class AppView:
             logger.warning("Point size must be a number.")
             self.polygon_point_size_entry.delete(0, tk.END)
             self.polygon_point_size_entry.insert(0, "0.40")
+
+    def _on_polygon_vertex_size_change(self, event=None):
+        try:
+            value = float(self.polygon_vertex_size_entry.get())
+            value = max(0.1, min(5.0, value))
+            self.polygon_vertex_size_entry.delete(0, tk.END)
+            self.polygon_vertex_size_entry.insert(0, f"{value:.2f}")
+            if hasattr(self.app, 'polygon_vertex_size_percent_var'):
+                self.app.polygon_vertex_size_percent_var.set(value)
+            self._on_ui_display_change()
+            logger.info(f"Polygon vertex point size changed: {value}%")
+        except ValueError:
+            logger.warning("Polygon point size must be a number.")
+            self.polygon_vertex_size_entry.delete(0, tk.END)
+            self.polygon_vertex_size_entry.insert(0, "0.40")
 
     def _on_font_size_change(self, event=None):
         try:

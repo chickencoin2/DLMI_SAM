@@ -2,15 +2,14 @@
 
 Interactive GUI tool for semi-automatic video/image segmentation and annotation, powered by [SAM 3 (Segment Anything Model 3)](https://github.com/facebookresearch/sam3) from Meta AI. Supports point/box prompts, polygon input, text-conditioned detection (PCS), and frame-by-frame mask propagation to produce LabelMe-compatible annotations.
 
+Downloading the SAM 3 model weights requires a Hugging Face account with access granted to the gated SAM 3 model. Log in and authorize a token with `hf auth login` before running, otherwise the weights cannot be downloaded.
+
 
 ## Installation
 
 ```bash
 git clone https://github.com/chickencoin2/DLMI_SAM.git
 cd DLMI_SAM
-
-python -m venv venv
-source venv/bin/activate
 
 pip install -r requirements.txt
 ```
@@ -70,9 +69,9 @@ If you use this labeling tool in your research, please cite our manuscript curre
 
 ```bibtex
 @article{sim2026dlmisam,
-  title={DLMI-SAM: Direct Latent Memory Injection for Robust Human-in-the-Loop Instance Segmentation Labeling},
+  title={DLMI-SAM: Direct Latent Memory Injection into Foundation Models for Robust Human-in-the-Loop Annotation in Precision Agriculture},
   author={Sim, Myongbo and Seo, Dasom and Noh Donghee and Hea-Min, Lee and Baek, Na Rae},
-  journal={Under review at Computers and Electronics in Agriculture},
+  journal={},
   year={2026},
   url={}
 }

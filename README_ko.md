@@ -2,15 +2,14 @@
 
 Meta AI의 [SAM 3 (Segment Anything Model 3)](https://github.com/facebookresearch/sam3)를 기반으로 한 반자동 비디오/이미지 세그멘테이션 및 어노테이션 GUI 도구입니다. 포인트/박스 프롬프트, 폴리곤 입력, 텍스트 기반 탐지(PCS), 프레임 단위 마스크 전파를 지원하며 LabelMe 호환 어노테이션을 생성합니다.
 
+SAM 3 가중치 파일을 다운로드하려면 게이트된 SAM 3 모델 접근 권한이 있는 Hugging Face 계정이 필요합니다. 실행 전 `hf auth login`으로 로그인하여 토큰을 허용해야 가중치를 받아 정상 작동합니다.
+
 
 ## 설치
 
 ```bash
 git clone https://github.com/chickencoin2/DLMI_SAM.git
 cd DLMI_SAM
-
-python -m venv venv
-source venv/bin/activate
 
 pip install -r requirements.txt
 ```
@@ -70,9 +69,9 @@ SAM 3를 사용하시는 경우 원본 논문을 인용해 주세요:
 
 ```bibtex
 @article{sim2026dlmisam,
-  title={DLMI-SAM: Direct Latent Memory Injection for Robust Human-in-the-Loop Instance Segmentation Labeling},
+  title={DLMI-SAM: Direct Latent Memory Injection into Foundation Models for Robust Human-in-the-Loop Annotation in Precision Agriculture},
   author={Sim, Myongbo and Seo, Dasom and Noh Donghee and Hea-Min, Lee and Baek, Na Rae},
-  journal={Under review at Computers and Electronics in Agriculture},
+  journal={},
   year={2026},
   url={}
 }
