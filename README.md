@@ -38,7 +38,18 @@ On launch, the initial screen appears as shown below. The left side is the video
 
 Below is an example of segmentation and propagation in action:
 
-![Segmentation Example](images/demo.gif)
+<img src="images/demo.gif" width="100%" alt="Segmentation Example">
+
+To apply DLMI (Direct Latent Memory Injection):
+
+1. In the **Advanced** tab, enable **Use Low-level API**
+2. Click **Add Polygon** and draw a polygon around the object
+3. Click **Complete** to finalize the object
+4. Click **Inject Data** to apply DLMI
+
+<img src="images/DLMI_demo.gif" width="100%" alt="DLMI Example">
+
+> **Note:** You can also Ctrl + right-click to select multiple objects, click **Merge Objects**, then apply DLMI so that SAM 3 treats them as a single object.
 
 
 ## License

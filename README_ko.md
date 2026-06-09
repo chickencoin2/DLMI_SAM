@@ -38,7 +38,18 @@ python app.py
 
 아래는 실제 세그멘테이션 및 전파 과정 예시입니다:
 
-![세그멘테이션 예시](images/demo.gif)
+<img src="images/demo.gif" width="100%" alt="세그멘테이션 예시">
+
+DLMI(Direct Latent Memory Injection)를 적용하려면:
+
+1. **Advanced** 탭에서 **Use Low-level API**를 활성화합니다
+2. **Add Polygon**을 눌러 객체 주위에 폴리곤을 그립니다
+3. **Complete**를 눌러 객체를 완성합니다
+4. **Inject Data**를 눌러 DLMI를 적용합니다
+
+<img src="images/DLMI_demo.gif" width="100%" alt="DLMI 예시">
+
+> **참고:** Ctrl + 우클릭으로 여러 객체를 선택한 뒤 **Merge Objects**를 누르고 DLMI를 적용하면 SAM 3가 이들을 하나의 객체로 취급하도록 만들 수 있습니다.
 
 
 ## 라이선스
