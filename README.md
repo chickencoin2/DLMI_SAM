@@ -49,7 +49,7 @@ To apply DLMI (Direct Latent Memory Injection):
 
 <img src="images/DLMI_demo.gif" width="100%" alt="DLMI Example">
 
-> **Note:** You can also Ctrl + right-click to select multiple objects, click **Merge Objects**, then apply DLMI so that SAM 3 treats them as a single object.
+> **Note:** You can also Ctrl + left-click to select multiple objects, click **Merge Objects**, then apply DLMI so that SAM 3 treats them as a single object.
 
 
 ## License

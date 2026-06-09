@@ -49,7 +49,7 @@ DLMI(Direct Latent Memory Injection)를 적용하려면:
 
 <img src="images/DLMI_demo.gif" width="100%" alt="DLMI 예시">
 
-> **참고:** Ctrl + 우클릭으로 여러 객체를 선택한 뒤 **Merge Objects**를 누르고 DLMI를 적용하면 SAM 3가 이들을 하나의 객체로 취급하도록 만들 수 있습니다.
+> **참고:** Ctrl + 좌클릭으로 여러 객체를 선택한 뒤 **Merge Objects**를 누르고 DLMI를 적용하면 SAM 3가 이들을 하나의 객체로 취급하도록 만들 수 있습니다.
 
 
 ## 라이선스
