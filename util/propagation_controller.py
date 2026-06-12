@@ -12,8 +12,7 @@ logger = logging.getLogger("DLMI_SAM_LABELER.PropagationController")
 
 
 def _wait_if_paused(app):
-    """Block thread while paused. Returns False if stop was requested during wait.
-    Sets app._resume_needs_cap_seek = True if pause was actually engaged."""
+    """Block thread while paused."""
     was_paused = not app.propagation_pause_event.is_set()
     app.propagation_pause_event.wait()
     if was_paused:
@@ -22,18 +21,7 @@ def _wait_if_paused(app):
 
 
 def _setup_dlmi_injection_hook(app, frame_bgr, frame_idx):
-    """Set up DLMI injection before a frame's forward pass.
-
-    Registers ALL injection objects with the inference session via a
-    SINGLE call to add_inputs_to_inference_session (both new and existing).
-    This is critical because each call to add_inputs_to_inference_session
-    REPLACES obj_with_new_inputs (not extends), so separate calls would
-    cause the first batch to lose their has_new_inputs flag.
-
-    Installs _encode_new_memory hook to:
-    1. Replace pred_masks_high_res with DLMI logits (Fixed or Gradient)
-    2. Set is_mask_from_pts=False to use sigmoid path instead of binarization
-    """
+    """Set up DLMI injection before a frame's forward pass."""
     masks_to_inject = getattr(app, 'dlmi_pending_masks', {})
     if not masks_to_inject:
         app.dlmi_pending_injection = False
@@ -85,24 +73,18 @@ def _setup_dlmi_injection_hook(app, frame_bgr, frame_idx):
                 f"({len(new_obj_ids)} new, {len(existing_injection_ids)} existing) at frame {frame_idx}")
 
     # Pre-compute DLMI logits and install the injection hook via shared helper.
-    dlmi_mode = app.dlmi_boundary_mode_var.get()
-    dlmi_intensity = app.dlmi_alpha_var.get()
-    dlmi_falloff = app.dlmi_gradient_falloff_var.get()
+    dlmi_settings = dlmi_hooks.collect_dlmi_settings(app)
 
     injection_queue = dlmi_hooks.build_injection_queue(
         obj_ids=obj_ids,
         masks_by_oid={oid: masks_to_inject[oid]['mask'] for oid in obj_ids},
-        intensity=dlmi_intensity,
-        mode=dlmi_mode,
-        falloff=dlmi_falloff,
         device=app.device,
+        **dlmi_settings,
     )
 
-    logger.info(f"DLMI mid-propagation: logit maps computed (mode={dlmi_mode}, "
-                f"intensity={dlmi_intensity}, falloff={dlmi_falloff})")
+    logger.info(f"DLMI mid-propagation: logit maps computed ({dlmi_settings})")
 
-    # Manual install (not context-manager) because restore happens per-frame via
-    # _cleanup_dlmi_hook in the propagation loop, not inside this function's scope.
+    # Manual install (not a context manager): restore happens per-frame via _cleanup_dlmi_hook.
     original_encode = app.tracker_model._encode_new_memory
     app._dlmi_original_encode = original_encode
     app.tracker_model._encode_new_memory = dlmi_hooks.create_injection_hook(
@@ -212,7 +194,7 @@ def propagate_pcs_mode(app, start_frame, actual_total_frames):
         logger.error("PCS model or processor not available.")
         return
 
-    if app.pcs_streaming_session is None:
+    if app.pcs_streaming_session is None and not getattr(app, 'pcs_multi_streaming', None):
         logger.error("PCS streaming session not available. Please perform detection first.")
         return
 

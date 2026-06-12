@@ -99,8 +99,26 @@ def get_stabilized_bbox(history_bboxes, current_bbox_xyxy, stabilize_bbox_histor
 
     return np.array([stable_x1, stable_y1, stable_x2, stable_y2], dtype=np.float32)
 
+def resize_confidence_map(mask_np, target_pil_size_wh):
+    """Squeeze a raw logit map to 2D float32 at frame size for current_confidence_masks; None if not map-shaped."""
+    conf = np.squeeze(np.asarray(mask_np)).astype(np.float32)
+    if conf.ndim > 2:
+        conf = conf[0]
+    if conf.ndim != 2:
+        return None
+    target_w, target_h = target_pil_size_wh
+    if conf.shape != (target_h, target_w):
+        try:
+            conf = cv2.resize(conf, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        except Exception:
+            return None
+    return conf
+
+
 def process_sam_mask(mask_from_sam_np, target_pil_size_wh,
-                     apply_closing=False, closing_kernel_size=3):
+                     apply_closing=False, closing_kernel_size=3,
+                     logit_threshold=0.0):
+    """`logit_threshold` binarises non-bool (logit) masks; 0.0 = the historical 50%-confidence cut."""
     if not isinstance(mask_from_sam_np, np.ndarray):
         return None
 
@@ -115,7 +133,7 @@ def process_sam_mask(mask_from_sam_np, target_pil_size_wh,
         return None
 
     if squeezed_mask.dtype != bool:
-        squeezed_mask = squeezed_mask > 0.0
+        squeezed_mask = squeezed_mask > logit_threshold
 
     target_w, target_h = target_pil_size_wh
 
@@ -191,16 +209,7 @@ def is_bbox_on_edge(bbox, image_shape, margin):
     return False
 
 def simplify_contours_for_save(contours, epsilon_ratio=0.002):
-    """Reduce vertex density of each contour using Douglas-Peucker
-    (cv2.approxPolyDP) with ε proportional to its perimeter. Default ratio
-    0.002 gives roughly the same density used historically by the inject
-    pipeline (≈1/5 of CHAIN_APPROX_SIMPLE output) without distorting the
-    visible boundary.
-
-    Contours that collapse to fewer than 3 vertices after simplification are
-    dropped. Input/output are both lists of (N,1,2) int32 contours, the same
-    shape returned by cv2.findContours.
-    """
+    """Reduce vertex density of each contour using Douglas-Peucker (cv2.approxPolyDP) with ε proportional to its perimeter."""
     if not contours or epsilon_ratio <= 0:
         return list(contours) if contours else []
     simplified = []
@@ -264,30 +273,3 @@ def merge_contours_into_single_polygon(contours, min_area=10):
             merged[ret_idx] = merged[im]
 
     return merged.reshape(-1, 1, 2).astype(np.int32)
-
-def compute_dlmi_logits(mask_np, mode="Fixed", intensity=10.0, falloff=20):
-    """Convert a binary mask to DLMI logits for memory encoding.
-
-    Args:
-        mask_np: Binary mask (H, W), values 0/1 or boolean.
-        mode: "Fixed" for uniform logits, "Gradient" for distance-based continuous logits.
-        intensity: Max logit magnitude. Range [-intensity, +intensity].
-        falloff: Pixels from boundary to reach full intensity (Gradient mode only).
-
-    Returns:
-        np.ndarray (H, W) float32, logit values in [-intensity, +intensity].
-    """
-    if mode == "Fixed":
-        return (mask_np.astype(np.float32) * 2.0 * intensity) - intensity
-
-    mask_uint8 = (mask_np > 0).astype(np.uint8)
-    dist_inside = cv2.distanceTransform(mask_uint8, cv2.DIST_L2, 5)
-    dist_outside = cv2.distanceTransform(1 - mask_uint8, cv2.DIST_L2, 5)
-
-    falloff = max(falloff, 1)
-    logits = np.zeros_like(dist_inside, dtype=np.float32)
-    inside = mask_uint8 > 0
-    outside = ~inside
-    logits[inside] = np.clip(dist_inside[inside] / falloff, 0, 1) * intensity
-    logits[outside] = -np.clip(dist_outside[outside] / falloff, 0, 1) * intensity
-    return logits

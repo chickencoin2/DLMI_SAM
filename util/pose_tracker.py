@@ -1,20 +1,4 @@
-"""TAPNext++ and YOLO-pose wrappers for the SAM3 autolabel app.
-
-Design:
-- `TAPNextPPTracker` uses the PyTorch port shipped in
-  `google-deepmind/tapnet`. If the tapnet package isn't installed, this wrapper
-  attempts a one-shot `pip install git+https://...` before retrying the import.
-- If tapnet still can't be loaded (no network, build failure, etc.), callers
-  can use `OpticalFlowPoseTracker` as a graceful fallback using OpenCV's
-  Lucas-Kanade sparse optical flow. It's lower-quality but dependency-free.
-- `YOLOPoseDetector` wraps ultralytics YOLO-pose for initial keypoint
-  detection on a single frame.
-
-The tracker `track(frames_rgb, query_points_xy_t0)` contract is shared:
-  - frames_rgb: list of np.uint8 [H, W, 3] RGB frames (len >= 1)
-  - query_points_xy_t0: np.float32 [N, 2] pixel coords at t=0
-Returns (tracks[T, N, 2] pixel xy, visibilities[T, N] bool).
-"""
+"""TAPNext++ and YOLO-pose wrappers for the SAM3 autolabel app."""
 import os
 import sys
 import logging
@@ -31,27 +15,12 @@ class LibraryMissingError(RuntimeError):
 
 
 class TAPNextPPTracker:
-    """PyTorch wrapper for TAPNext++ following the official colab demo pattern:
-        from tapnet.tapnext.tapnext_torch import TAPNext
-        model = TAPNext(image_size=(256, 256))
-        ckpt = torch.load(ckpt_path, map_location='cpu')
-        model.load_state_dict({k.replace('tapnext.', ''): v for k, v in ckpt['state_dict'].items()})
-        pred_tracks, track_logits, visible_logits, tracking_state = model(
-            video=video, query_points=query_points
-        )
-    Video frames are resized to 256x256 internally; track outputs are rescaled
-    back to original pixel coordinates.
-    """
+    """PyTorch TAPNext++ wrapper following the official colab demo pattern."""
     MODEL_IMAGE_SIZE = (256, 256)
     TAPNET_GIT_URL = "git+https://github.com/google-deepmind/tapnet.git"
 
     def __init__(self, ckpt_path: str, device: str = "cuda", auto_install_cb=None):
-        """
-        ckpt_path: path to tapnextpp_ckpt.pt
-        device: 'cuda' | 'cpu'
-        auto_install_cb: optional callable(stage_str) invoked with progress
-                         messages during auto-install ("installing...", etc.)
-        """
+        """ckpt_path: tapnextpp_ckpt.pt; device: 'cuda'|'cpu'; auto_install_cb: optional progress callback."""
         self.ckpt_path = ckpt_path
         self.device_str = device
         self.auto_install_cb = auto_install_cb
@@ -116,9 +85,7 @@ class TAPNextPPTracker:
             raise RuntimeError(f"PyTorch not available: {e}")
         self._torch = _torch
 
-        # Import attempt with up to 3 passes: first import, after pip install
-        # tapnet, and a third pass that picks off any missing-module errors one
-        # by one (einops, mediapy, chex, etc.) by pip-installing them.
+        # Up to 3 import passes: plain import, after pip install tapnet, then pip-install any missing modules one by one.
         last_err = None
         for attempt in range(4):
             try:
@@ -175,17 +142,7 @@ class TAPNextPPTracker:
         self._log("TAPNext++ ready.")
 
     def track(self, frames_rgb, query_points):
-        """Track query points through a video.
-
-        Args:
-            frames_rgb: list of np.uint8 [H, W, 3] RGB frames.
-            query_points: np.float32 array of shape either
-                - [N, 2] with (x, y) in pixel coords; all queries anchored at t=0, OR
-                - [N, 3] with (t_frame_index, x, y); each query anchored at its
-                  own frame. t_frame_index is the index into frames_rgb.
-        Returns:
-            (tracks [T, N, 2] pixel xy, visibilities [T, N] bool)
-        """
+        """Track query points through a video."""
         if self.model is None:
             raise RuntimeError("TAPNext++ not initialized.")
         if not frames_rgb:
@@ -263,8 +220,7 @@ class TAPNextPPTracker:
             tracks_np = tracks_np[:, 0]
         if tracks_np.shape[-1] != 2:
             raise RuntimeError(f"Unexpected tracks shape: {tracks_np.shape}")
-        # TAPNext tracks come out as (y, x) in the resized-frame pixel space,
-        # matching the (t, y, x) order of the query points.
+        # TAPNext tracks come out as (y, x) in the resized-frame pixel space, matching the (t, y, x) order of the query points.
         tracks_xy_resized = tracks_np[..., ::-1].copy()  # -> (x, y)
         tracks_xy = tracks_xy_resized.copy()
         tracks_xy[..., 0] *= (W / max(rW, 1))
@@ -293,8 +249,7 @@ class TAPNextPPTracker:
 
 
 class OpticalFlowPoseTracker:
-    """OpenCV Lucas-Kanade sparse optical flow fallback. Supports per-query t
-    via bidirectional tracking from each anchor frame (forward + backward)."""
+    """OpenCV Lucas-Kanade sparse optical flow fallback."""
     def __init__(self, ckpt_path=None, device=None, auto_install_cb=None):
         self.ckpt_path = ckpt_path
         self.auto_install_cb = auto_install_cb
@@ -349,9 +304,7 @@ class OpticalFlowPoseTracker:
 
 
 class YOLOPoseDetector:
-    """Ultralytics YOLO-pose wrapper. Returns list of dicts per detection:
-        {'class_id', 'class_name', 'confidence', 'bbox':[x1,y1,x2,y2],
-         'keypoints':[[x,y,v], ...]}"""
+    """Ultralytics YOLO-pose wrapper."""
     def __init__(self, weights: str, device: str = "cuda"):
         self.weights = weights
         self.device = device

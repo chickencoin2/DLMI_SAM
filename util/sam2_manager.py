@@ -1,12 +1,4 @@
-"""SAM2 integration: load/unload, mask transfer between SAM3 and SAM2 sessions,
-and SAM2-direct prompt handling.
-
-Everything is optional; if the `transformers` version installed does not expose
-`Sam2Model`/`Sam2Processor`, the module sets `SAM2_AVAILABLE = False` and the
-`load_sam2_model_async` guard reports it to the user.
-
-Public functions all take `app` as the first parameter.
-"""
+"""SAM2 integration: load/unload, mask transfer between SAM3 and SAM2 sessions, and SAM2-direct prompt handling."""
 import logging
 import threading
 
@@ -115,6 +107,8 @@ def transfer_sam3_masks_to_sam2(app):
     logger.info(f"SAM2 activation - Transferring {len(current_masks)} masks from frame {frame_idx} to SAM2")
 
     app.tracked_objects.clear()
+    if hasattr(app, 'current_confidence_masks'):
+        app.current_confidence_masks = {}
     if app.inference_session is not None:
         app.inference_session = None
     app.is_tracking_ever_started = False
@@ -194,6 +188,8 @@ def transfer_sam2_masks_to_sam3_and_unload(app):
     unload_sam2_model(app)
 
     app.tracked_objects.clear()
+    if hasattr(app, 'current_confidence_masks'):
+        app.current_confidence_masks = {}
     if app.inference_session is not None:
         app.inference_session = None
     app.is_tracking_ever_started = False
@@ -223,9 +219,7 @@ def transfer_sam2_masks_to_sam3_and_unload(app):
 
 
 def get_current_frame_masks(app):
-    """Resolve the "current display masks" across SAM2-active / propagated /
-    tracked_objects states. Used by several consumers including the SAM2
-    tab-handover logic."""
+    """Resolve the "current display masks" across SAM2-active / propagated / tracked_objects states."""
     current_frame_idx = getattr(app, 'review_current_frame', 0)
     sam2_active = app.sam2_enabled_var.get() and app.sam2_model is not None
 

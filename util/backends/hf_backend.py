@@ -1,11 +1,4 @@
-"""HFBackend - HuggingFace `transformers` SAM3 backend (the original path).
-
-Migration "Layer 1" (handle mirroring): `load()` delegates to the app's existing,
-known-good `_init_sam3_models()`, which sets `app.pcs_model / tracker_model /
-image_model` (+ processors) and `app.model_dtype` directly. Because those handles
-live on the app, every existing model call-site keeps working unchanged while the
-normalized SamBackend operations are added incrementally in later phases.
-"""
+"""HFBackend - HuggingFace `transformers` SAM3 backend (the original path)."""
 
 from __future__ import annotations
 
@@ -41,8 +34,7 @@ class HFBackend(SamBackend):
         if self._loaded:
             return
         app = self.app
-        # Reuse the existing loader; it sets app.* handles + app.model_dtype and
-        # logs/handles its own errors (leaving handles None on failure).
+        # Reuse the existing loader; it sets the app.* handles and handles its own errors.
         app._init_sam3_models()
         if getattr(app, "tracker_model", None) is None:
             raise BackendLoadError("HuggingFace SAM3 model load failed (see logs).")
@@ -126,5 +118,4 @@ class HFBackend(SamBackend):
                         det.boxes.append(tuple(float(x) for x in flat[:4]))
         return det
 
-    # NOTE: process_frame / tracker_* / pcs_* / dlmi_* are added in later phases
-    # (those call-sites still use the mirrored app.* handles for now).
+    # tracker_*/pcs_*/dlmi_* still go through the mirrored app.* handles.

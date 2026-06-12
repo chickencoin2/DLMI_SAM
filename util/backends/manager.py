@@ -1,10 +1,4 @@
-"""BackendManager - owns the single active SamBackend and handles switching.
-
-Only one backend is resident at a time. `switch()` tears down the old backend's
-sessions/hooks, unloads it (freeing VRAM), then constructs + loads the new one,
-rolling back to the previous backend if the new one fails to load. git/3.1 are
-lazily loaded on first selection.
-"""
+"""BackendManager - owns the single active SamBackend and handles switching."""
 
 from __future__ import annotations
 
@@ -29,9 +23,7 @@ class BackendManager:
         self.active = None
         self._availability_cache = None
 
-    # ------------------------------------------------------------------ #
     # Availability probing (cached)
-    # ------------------------------------------------------------------ #
     def availability(self, refresh: bool = False) -> dict:
         if self._availability_cache is not None and not refresh:
             return self._availability_cache
@@ -55,9 +47,7 @@ class BackendManager:
         self._availability_cache = avail
         return avail
 
-    # ------------------------------------------------------------------ #
     # Construction
-    # ------------------------------------------------------------------ #
     def _construct(self, key: str):
         app = self.app
         device = app.device
@@ -74,9 +64,7 @@ class BackendManager:
             return backend
         raise BackendError(f"Unknown backend key: {key!r}")
 
-    # ------------------------------------------------------------------ #
     # Switching
-    # ------------------------------------------------------------------ #
     def switch(self, key: str, on_status=None) -> bool:
         def status(msg):
             logger.info(msg)

@@ -1,6 +1,4 @@
-"""Save controller: "Confirm Labels" dialog, threaded frame save, completion
-callback. Thin orchestration layer over `autolabel_workflow.save_frame_dispatch`
-(which itself is the single save entry point added in Phase 3)."""
+"""Save controller: "Confirm Labels" dialog, threaded frame save, completion callback."""
 import os
 import logging
 import threading
@@ -36,11 +34,7 @@ def confirm_and_save_labels(app):
 
     fmt = app.save_format_var.get()
 
-    # Pose YOLO save runs whenever any frame has pose data, even when seg fmt
-    # is "labelme" (segment as LabelMe JSON, pose as YOLO-pose). In that case
-    # we still need a valid YOLO class list and data.yaml so the pose .txt
-    # files have meaningful class indices and the resulting folder is a
-    # trainable YOLO-pose dataset.
+    # Pose YOLO save runs whenever any frame has pose data, even when seg fmt is "labelme" (segment as LabelMe JSON, pose as YOLO-pose).
     has_any_pose_overall = False
     try:
         for _frame_idx, _result in app.propagated_results.items():
@@ -61,10 +55,7 @@ def confirm_and_save_labels(app):
     needs_yolo_dataset = fmt in ["yolo", "both"] or has_any_pose_overall
 
     if needs_yolo_dataset:
-        # Pick the dataset root: when the user has configured a dedicated
-        # pose root AND seg fmt is labelme-only, the YOLO dataset (= pose
-        # dataset) belongs under that pose root. Otherwise it lives under
-        # the regular save dir.
+        # Dataset root: dedicated pose root when configured with labelme-only seg, else the regular save dir.
         use_pose_root = bool(getattr(app, 'use_custom_pose_save_path_var', None) and
                              app.use_custom_pose_save_path_var.get())
         if use_pose_root and fmt == "labelme":
@@ -135,9 +126,7 @@ def _save_labels_thread(app):
             logger.info(f"Label saving: {skipped_count} frames excluded by discard marking")
 
         saved_count = 0
-        # Throttle progress callbacks: at most ~50 idle-callbacks across the
-        # whole save run (every ~2% of progress) so the Tk main loop isn't
-        # flooded by per-frame `after(0, ...)` posts when saving many frames.
+        # Throttle progress callbacks to ~50 over the run so the Tk loop isn't flooded.
         progress_step = max(1, total_frames // 50) if total_frames > 0 else 1
         last_reported_progress = -1
         for i, (frame_idx, result) in enumerate(sorted(frames_to_save.items())):

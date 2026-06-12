@@ -18,7 +18,7 @@ from util.gui_view import AppView
 from util.customutil import (
     rgb_to_tkinter_hex, get_bbox_from_mask,
     calculate_iou, get_stabilized_bbox, process_sam_mask, draw_star_marker,
-    get_hashable_obj_id, is_bbox_on_edge, compute_dlmi_logits
+    get_hashable_obj_id, is_bbox_on_edge
 )
 from util import sam_interaction
 from util import autolabel_workflow
@@ -73,7 +73,7 @@ class SAM3AutolabelApp:
 
     def __init__(self, root_window):
         self.root = root_window
-        self.root.title("DLMI-SAM labeler v1.3")
+        self.root.title("DLMI-SAM labeler v1.31")
 
         self.video_source_path = None
         self.cap = None
@@ -83,6 +83,8 @@ class SAM3AutolabelApp:
         self.pcs_processor = None
         self.pcs_inference_session = None
         self.pcs_streaming_session = None
+        # Multi-class PCS: one streaming session per comma-separated phrase ([{'text', 'session', 'offset'}], empty = single-prompt mode).
+        self.pcs_multi_streaming = []
         self.tracker_model = None
         self.tracker_processor = None
         self.inference_session = None
@@ -117,6 +119,8 @@ class SAM3AutolabelApp:
         self.chunk_processing = False
 
         self.tracked_objects = {}
+        # Raw (pre-threshold) logit maps per object for the CURRENT frame.
+        self.current_confidence_masks = {}
         self.next_obj_id_to_propose = 1
         self.playback_paused = True
         self.autolabel_active = False
@@ -174,14 +178,7 @@ class SAM3AutolabelApp:
         self.polygon_points = []
         self.polygon_objects = []
 
-        # Slider-relative index of the frame the user started pre-propagate
-        # labelling on. Stays None until the first label is created. While
-        # set, that frame is the only one where new labels are allowed; if
-        # the user navigates elsewhere and comes back, the existing masks
-        # are re-displayed; if they try to label on a different frame, a
-        # confirm dialog asks whether to discard the anchor labels and
-        # re-anchor here. After Start Propagate fires, propagated_results
-        # becomes the source of truth and this anchor is cleared.
+        # Slider-relative index of the frame the user started pre-propagate labelling on.
         self.label_anchor_frame_idx = None
 
         self.negative_area_mode_active = False
@@ -206,11 +203,7 @@ class SAM3AutolabelApp:
         self.custom_folder_name_var = tk.StringVar(value="{video_name}_dataset")
         self.custom_file_name_var = tk.StringVar(value="{video_name}_frame")
 
-        # Optional: route YOLO-pose labels to a separate root that's fully
-        # decoupled from the seg-label save dir. When a video in batch has no
-        # pose points, no pose file is emitted for it (existing data-driven
-        # behaviour) — combined with this routing, pose-less and pose-having
-        # videos in the same batch end up in cleanly separated folders.
+        # Optional: route YOLO-pose labels to a separate root that's fully decoupled from the seg-label save dir.
         self.use_custom_pose_save_path_var = tk.BooleanVar(value=False)
         self.custom_pose_save_dir_var = tk.StringVar(
             value=os.path.join(os.getcwd(), AUTOLABEL_FOLDER, "custom_pose_output")
@@ -257,22 +250,27 @@ class SAM3AutolabelApp:
 
 
         self.low_level_api_enabled_var = tk.BooleanVar(value=False)
-        # git / 3.1 backend compute precision PREFERENCE. Default False = bf16 (the
-        # official sam3 package is bf16-native: it wraps inference in autocast(bf16) and
-        # its tracker attention hardcodes FlashAttention, which has no fp32 kernel). True
-        # = fp32 (HF-parity), enabled via the decoder sdpa MATH patch; slower + more
-        # VRAM. Persisted automatically (it is a tk.Variable). Read by GitBackend only.
+        # git / 3.1 backend compute precision PREFERENCE.
         self.git_fp32_var = tk.BooleanVar(value=False)
-        # What the toolbar "fp32" checkbox actually displays: it mirrors the ACTIVE
-        # backend's precision (HF is always fp32 -> checked+disabled; git/3.1 ->
-        # editable git_fp32_var). Kept separate so showing HF as fp32 never overwrites
-        # the user's git/3.1 preference. Synced in AppView.refresh_backend_buttons.
+        # Mirrors the ACTIVE backend's precision in the toolbar fp32 checkbox without clobbering the git/3.1 preference.
         self.backend_fp32_display_var = tk.BooleanVar(value=False)
         self.dlmi_alpha_var = tk.DoubleVar(value=10.0)
-        self.dlmi_boundary_mode_var = tk.StringVar(value="Fixed")
-        self.dlmi_gradient_falloff_var = tk.IntVar(value=20)
         self.dlmi_preserve_memory_var = tk.BooleanVar(value=False)
         self.dlmi_boost_cond_var = tk.BooleanVar(value=False)
+        # Background confidence (%): keep some foreground belief on the background to absorb labelling misses.
+        self.dlmi_bg_conf_enabled_var = tk.BooleanVar(value=False)
+        self.dlmi_bg_conf_value_var = tk.DoubleVar(value=5.0)
+        # Boundary softening: hold a band around the mask edge at a user-picked confidence (in/out selectable, optional gradient, width in % of image width).
+        self.dlmi_boundary_soft_enabled_var = tk.BooleanVar(value=False)
+        self.dlmi_boundary_soft_inside_var = tk.BooleanVar(value=True)
+        self.dlmi_boundary_soft_outside_var = tk.BooleanVar(value=True)
+        self.dlmi_boundary_soft_gradient_var = tk.BooleanVar(value=False)
+        self.dlmi_boundary_soft_width_var = tk.DoubleVar(value=1.0)
+        self.dlmi_boundary_soft_conf_var = tk.DoubleVar(value=50.0)
+        # Mask binarisation threshold as a confidence %, applied wherever a tracker logit map is turned into an object mask.
+        self.mask_conf_threshold_var = tk.DoubleVar(value=50.0)
+        # PCS results recorded for the automatic PCS→PVS DLMI hand-off.
+        self.pcs_dlmi_transfer_record = {}
 
         self.sam2_enabled_var = tk.BooleanVar(value=False)
         self.sam2_tracking_enabled_var = tk.BooleanVar(value=False)
@@ -318,8 +316,6 @@ class SAM3AutolabelApp:
         except IOError: self.label_font = ImageFont.load_default()
 
         # Cache for dynamic-sized labels in _display_cv_frame_on_view.
-        # Keys: int font_size; values: ImageFont object. Avoids opening the
-        # TrueType file from disk for every label on every redraw.
         self._dynamic_font_cache = {}
         self._dynamic_font_paths = (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -338,16 +334,11 @@ class SAM3AutolabelApp:
         self.sam_interaction_module = sam_interaction
         self.autolabel_workflow_module = autolabel_workflow
 
-        # Active model backend selector ("hug" | "git" | "3.1"). Declared as a
-        # tk.StringVar BEFORE _load_user_settings() so the persisted choice is
-        # restored automatically by the settings machinery. The BackendManager
-        # owns the single live backend (app.backend property).
+        # Active model backend selector ("hug" | "git" | "3.1").
         self.active_backend_var = tk.StringVar(value="hug")
         self.backend_manager = get_backend_manager(self)
 
-        # Auto-load persisted user settings before AppView is constructed so
-        # widgets that bind directly to tk.Variables pick up the loaded
-        # values on first paint instead of resetting to module defaults.
+        # Load persisted settings before AppView so bound widgets show them on first paint.
         self._user_settings_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "user_settings.json"
         )
@@ -374,11 +365,6 @@ class SAM3AutolabelApp:
             return canvas_x, canvas_y
 
         # Recompute canvas size drift between last display_image call and now.
-        # Window resize, scroll-bar layout changes, etc. can make the cached
-        # scale_x/offset_x stale relative to the current canvas geometry; if
-        # the canvas is now visibly different from what display_image saw, we
-        # refresh by asking the view to re-render which will update these
-        # values before we use them.
         try:
             canvas_w = self.view.canvas.winfo_width()
             canvas_h = self.view.canvas.winfo_height()
@@ -414,9 +400,7 @@ class SAM3AutolabelApp:
         return result
 
     def _is_pre_propagate_phase(self):
-        """True when no propagation has run yet for the current source/cut.
-        In this phase the user is composing prompts at a single anchor
-        frame; navigating to other frames must not destroy that work."""
+        """True when no propagation has run yet for the current source/cut."""
         if self.app_state in ("PROPAGATING", "PAUSED", "REVIEWING", "LABELING"):
             return False
         if self.propagated_results:
@@ -424,16 +408,7 @@ class SAM3AutolabelApp:
         return True
 
     def _ensure_label_anchor_or_confirm_switch(self):
-        """Guard for any pre-propagate labeling action. Returns True when
-        the caller may proceed at the current slider frame.
-
-        - If we're not in pre-propagate, returns True (existing flow rules).
-        - If no anchor is set yet, captures the current frame as anchor.
-        - If the current frame is the anchor, returns True.
-        - Otherwise, prompts: discard anchor labels and re-anchor here
-          (Yes), or cancel and snap the slider back to the anchor frame
-          so the in-progress labels are preserved (No).
-        """
+        """Guard for any pre-propagate labeling action."""
         if not self._is_pre_propagate_phase():
             return True
 
@@ -503,10 +478,7 @@ class SAM3AutolabelApp:
             self.update_status("Paused: BBox/Point prompts blocked (session protection). Use polygon mode + DLMI injection instead.")
             return
 
-        # Pre-propagate cross-frame guard: a SAM3 session built at one
-        # anchor frame is meaningless on other frames, so any prompt input
-        # has to be on the anchor. If the user is on a different frame,
-        # ask whether to discard the anchor labels and restart here.
+        # Prompts only make sense on the anchor frame; on another frame ask whether to re-anchor there.
         if not self._ensure_label_anchor_or_confirm_switch():
             return
 
@@ -545,10 +517,7 @@ class SAM3AutolabelApp:
             )
 
     def _mid_session_snapshot_precise_masks(self):
-        """Collect exact masks for existing objects at the current frame, so
-        we can restore them after running SAM3's standard new-object flow
-        (which would otherwise degrade existing masks via center-point
-        reprompting)."""
+        """Snapshot exact masks of existing objects so the standard new-object flow can't degrade them."""
         snap = {}
         for oid, data in self.tracked_objects.items():
             mask = data.get('last_mask')
@@ -561,10 +530,7 @@ class SAM3AutolabelApp:
         return snap
 
     def _mid_session_polygon_roundtrip(self, snapshot):
-        """Emulate 'save labels then reload' by converting each preserved mask
-        into a polygon and back into a filled mask. This loses sub-polygon
-        detail (which mirrors what the actual Load Labels flow would produce)
-        but keeps obj_ids intact."""
+        """Emulate 'save labels then reload' by converting each preserved mask into a polygon and back into a filled mask."""
         converted = {}
         for oid, data in snapshot.items():
             mask = data['last_mask']
@@ -592,21 +558,7 @@ class SAM3AutolabelApp:
     def _mid_session_macro_add(self, prompt_type, coords, label,
                                proposed_obj_id_for_new, custom_label,
                                use_load=False):
-        """One-click macro for mid-session new-object addition.
-
-        Steps:
-          1. Snapshot exact masks of all existing objects at the current frame.
-          2. Clear tracked_objects and the inference session.
-          3. Apply the new bbox/point as a FRESH first-prompt on the current
-             frame. SAM3 produces a clean mask for the new object because the
-             session is brand new (no DLMI memory interference).
-          4. Merge the snapshotted existing masks back into tracked_objects.
-          5. Re-seed the session via DLMI (input_masks) using all masks,
-             exactly preserving their shape. For `use_load=True`, each mask is
-             first polygon-roundtripped to mimic the labelme file path.
-
-        The result: user sees their existing labels + the new object, session
-        is primed, and Start Propagate continues from here."""
+        """One-click macro for mid-session new-object addition."""
         if self.current_cv_frame is None:
             messagebox.showerror("Error", "No current frame.", parent=self.root)
             return
@@ -634,6 +586,7 @@ class SAM3AutolabelApp:
         self.sam_id_to_group.clear()
         self.next_group_id = 1
         self.suppressed_sam_ids.clear()
+        self.current_confidence_masks = {}
         if hasattr(self, 'object_prompt_history'):
             self.object_prompt_history.clear()
         self.is_tracking_ever_started = False
@@ -713,15 +666,63 @@ class SAM3AutolabelApp:
             f"Mid-session {mode_name}: added object {new_id}, {len(snapshot)} existing preserved."
         )
     
-    def update_status(self, message): 
+    def update_status(self, message):
         if self.view: self.view.update_status(message)
+
+    def _mask_logit_threshold(self):
+        """Mask binarisation threshold in logit space, derived from the user's object-confidence threshold (%)."""
+        from util.backends.dlmi_core import confidence_to_logit
+        try:
+            pct = float(self.mask_conf_threshold_var.get())
+        except Exception:
+            pct = 50.0
+        return confidence_to_logit(min(max(pct, 1.0), 99.0))
+
+    def reapply_mask_threshold(self):
+        """Re-binarise current masks from their stored logit maps so the threshold slider takes effect immediately; returns #updated."""
+        if self.app_state in ("PROPAGATING", "REVIEWING"):
+            return 0
+        conf_maps = getattr(self, 'current_confidence_masks', None)
+        if not conf_maps or not self.tracked_objects or self.current_cv_frame is None:
+            return 0
+
+        thr = self._mask_logit_threshold()
+        h, w = self.current_cv_frame.shape[:2]
+        apply_closing = self.sam_apply_closing_var.get()
+        closing_kernel = self.sam_closing_kernel_size_var.get()
+
+        updated = 0
+        for obj_id, data in self.tracked_objects.items():
+            if not data or data.get('last_mask') is None:
+                continue
+            conf = conf_maps.get(obj_id)
+            if conf is None:
+                continue
+            proc = process_sam_mask(conf, (w, h), apply_closing=apply_closing,
+                                    closing_kernel_size=closing_kernel,
+                                    logit_threshold=thr)
+            if proc is None:
+                continue
+            data['last_mask'] = proc
+            updated += 1
+            # Keep the synthetic frame-0 snapshot (cut+DLMI / cut+load) in sync so slider-triggered redraws don't show the stale mask.
+            rf = getattr(self, 'review_current_frame', 0)
+            entry = self.propagated_results.get(rf)
+            if entry and obj_id in entry.get('masks', {}):
+                entry['masks'][obj_id]['last_mask'] = proc
+
+        if updated:
+            self._display_cv_frame_on_view(
+                self.current_cv_frame, self._get_current_masks_for_display())
+            logger.info(f"Object conf threshold re-applied to {updated} mask(s) "
+                        f"(logit thr {thr:+.3f}).")
+        return updated
 
     def _update_obj_id_info_label(self): 
         if self.view: self.view.update_obj_id_info_label()
 
     def _init_models(self):
-        # Resolve the desired backend (persisted selection), falling back to an
-        # available one. Model loading is delegated to the BackendManager.
+        # Resolve the desired backend (persisted selection), falling back to an available one.
         avail = self.backend_manager.availability(refresh=True)
         key = self.active_backend_var.get()
         if not avail.get(key, False):
@@ -747,8 +748,7 @@ class SAM3AutolabelApp:
             self.update_status("SAM3 model load failed.")
 
     def _teardown_for_backend_switch(self):
-        """Invalidate all model-bound session/hook state before switching the
-        active backend (sessions/hooks belong to the outgoing model)."""
+        """Invalidate all model-bound session/hook state before switching the active backend (sessions/hooks belong to the outgoing model)."""
         try:
             self._remove_dlmi_persistent_hooks()
         except Exception as e:
@@ -756,13 +756,14 @@ class SAM3AutolabelApp:
         for attr in ("inference_session", "pcs_inference_session", "pcs_streaming_session"):
             if hasattr(self, attr):
                 setattr(self, attr, None)
+        self.pcs_multi_streaming = []
+        self.current_confidence_masks = {}
         self.dlmi_pending_injection = False
         self.dlmi_pending_masks = {}
         self.dlmi_hook_active = False
 
     def on_backend_button(self, key):
-        """Backend radiobutton handler: confirm, then switch on a worker thread
-        (model load can take seconds). Reverts the selector on cancel/failure."""
+        """Backend radiobutton handler: confirm, then switch on a worker thread (model load can take seconds)."""
         mgr = self.backend_manager
         current = mgr.active.key if mgr.active else None
         if key == current:
@@ -1266,19 +1267,17 @@ class SAM3AutolabelApp:
                 original_size=inputs.original_sizes[0],
             )
 
-            dlmi_mode = self.dlmi_boundary_mode_var.get()
-            dlmi_intensity = self.dlmi_alpha_var.get()
-            dlmi_falloff = self.dlmi_gradient_falloff_var.get()
+            from util.backends import dlmi_inject as dlmi_hooks
+            dlmi_settings = dlmi_hooks.collect_dlmi_settings(self)
 
             logger.info(f"Preparing DLMI logits: {len(obj_ids_list)} objects, "
-                        f"mode={dlmi_mode}, intensity={dlmi_intensity}, falloff={dlmi_falloff}")
+                        f"settings={dlmi_settings}")
 
-            from util.backends import dlmi_inject as dlmi_hooks
             injection_queue = dlmi_hooks.build_injection_queue(
                 obj_ids=obj_ids_list,
                 masks_by_oid={oid: masks_to_inject[oid]['mask'] for oid in obj_ids_list},
-                intensity=dlmi_intensity, mode=dlmi_mode, falloff=dlmi_falloff,
                 device=self.device,
+                **dlmi_settings,
             )
             logger.info(f"Injection queue ready: {len(injection_queue)} logit maps")
 
@@ -1344,16 +1343,84 @@ class SAM3AutolabelApp:
                 except:
                     pass
 
+    def _record_pcs_results_for_transfer(self):
+        """Temp-record everything PCS produced (mask + label + score per object) into `pcs_dlmi_transfer_record`."""
+        record = {}
+        for oid, data in self.tracked_objects.items():
+            mask = data.get('last_mask')
+            if mask is None:
+                continue
+            mask_arr = np.asarray(mask)
+            if not mask_arr.any():
+                continue
+            record[int(oid)] = {
+                'mask': mask_arr.copy(),
+                'label': data.get('custom_label') or self.default_object_label_var.get(),
+                'pcs_score': data.get('pcs_score'),
+            }
+        self.pcs_dlmi_transfer_record = record
+        logger.info(f"PCS→PVS transfer record: {len(record)} objects captured "
+                    f"({sorted(record.keys())})")
+        return record
+
+    def _auto_pcs_to_pvs_dlmi(self):
+        """Automatic PCS→PVS DLMI pipeline (runs on mode switch when DLMI is on)."""
+        record = self._record_pcs_results_for_transfer()
+        if not record:
+            logger.warning("PCS→PVS auto DLMI: no PCS masks to transfer.")
+            return False
+        if self.current_cv_frame is None:
+            logger.warning("PCS→PVS auto DLMI: no current frame.")
+            return False
+
+        # PCS sessions belong to the outgoing mode; release them.
+        self.pcs_inference_session = None
+        self.pcs_streaming_session = None
+        self.pcs_multi_streaming = []
+
+        # Load the record back, then run the same DLMI injection the manual 'Inject Data' button uses.
+        self.tracked_objects.clear()
+        for oid, item in record.items():
+            self.tracked_objects[oid] = {
+                'last_mask': item['mask'] > 0,
+                'custom_label': item['label'],
+                'pcs_score': item.get('pcs_score'),
+            }
+        self.next_obj_id_to_propose = max(record.keys()) + 1
+        self.is_tracking_ever_started = False
+        self.inference_session = None
+        self._update_obj_id_info_label()
+
+        self.update_status(f"PCS→PVS: re-applying {len(record)} PCS objects via DLMI...")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        self.inject_low_level_mask_prompt(force=True)
+
+        applied = sum(
+            1 for d in self.tracked_objects.values()
+            if d.get('last_mask') is not None and np.asarray(d['last_mask']).any()
+        )
+        if applied == 0 or self.inference_session is None:
+            logger.error("PCS→PVS auto DLMI: injection produced no active objects.")
+            return False
+
+        # Record consumed; keep it until the next PCS run for inspection.
+        logger.info(f"PCS→PVS auto DLMI complete: {applied} objects injected.")
+        self.update_status(
+            f"PCS→PVS auto DLMI complete: {applied} objects re-applied via DLMI. "
+            f"Start Propagate to continue."
+        )
+        return True
+
     def _dlmi_is_git_backend(self):
         b = getattr(self, "backend", None)
         return b is not None and getattr(b, "key", None) in ("git", "3.1")
 
     def _install_dlmi_persistent_hooks(self):
-        """Install persistent DLMI hooks for Preserve Memory and Boost Conditioning.
-        These hooks persist across propagation frames (not cleaned up per-frame).
-        Backend-aware: HF uses config.max_cond_frame_num + _gather_memory_frame_outputs;
-        the official (git/3.1) tracker uses max_cond_frames_in_attn (Preserve) and has
-        no _gather hook (Boost is skipped with a notice)."""
+        """Install persistent DLMI hooks for Preserve Memory and Boost Conditioning."""
         is_git = self._dlmi_is_git_backend()
 
         # --- Preserve: keep ALL conditioning frames ---
@@ -1485,9 +1552,7 @@ class SAM3AutolabelApp:
         if not self.polygon_mode_active:
             return False
 
-        # Only check anchor on the FIRST point of a fresh polygon — once a
-        # polygon is in progress, subsequent points are obviously meant for
-        # the same anchor frame.
+        # Check the anchor only on the first point of a fresh polygon.
         if not self.polygon_points and not self._ensure_label_anchor_or_confirm_switch():
             return False
 
@@ -1662,14 +1727,7 @@ class SAM3AutolabelApp:
             self.view.update_polygon_mode_ui(False)
 
     def toggle_negative_area_mode(self):
-        """Toggle the 'negative area' editing mode. While active:
-          - Left-click drag erases the swept region from EVERY object's mask on
-            the current frame (treats it as background).
-          - Add Polygon -> Complete subtracts the polygon area from EVERY
-            object's mask on the current frame instead of creating a new object.
-        This is a frame-local mask edit. It is unrelated to SAM3 negative
-        prompts and does not modify the inference session inputs.
-        """
+        """Toggle the 'negative area' editing mode."""
         self.negative_area_mode_active = not self.negative_area_mode_active
         self.negative_drag_start_canvas = None
         self.negative_drag_last_canvas = None
@@ -1698,10 +1756,7 @@ class SAM3AutolabelApp:
             self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
 
     def _erase_region_from_all_masks(self, erase_mask_bool):
-        """Subtract erase_mask_bool (HxW) from every tracked object's last_mask.
-        Removes objects whose mask becomes empty. Returns the list of obj_ids
-        that were modified.
-        """
+        """Subtract erase_mask_bool (HxW) from every tracked object's last_mask."""
         if self.current_cv_frame is None or erase_mask_bool is None:
             return []
         if not isinstance(erase_mask_bool, np.ndarray) or erase_mask_bool.dtype != bool:
@@ -1730,6 +1785,9 @@ class SAM3AutolabelApp:
             if 'is_polygon_object' in data and data.get('is_polygon_object'):
                 data.pop('polygon_points', None)
                 data['is_polygon_object'] = False
+            # Hand-edited: drop the raw logit map so a later threshold re-apply can never undo the user's erasure.
+            if hasattr(self, 'current_confidence_masks'):
+                self.current_confidence_masks.pop(obj_id, None)
             modified.append(obj_id)
             if not new_mask.any():
                 emptied.append(obj_id)
@@ -2150,6 +2208,8 @@ class SAM3AutolabelApp:
 
         self.pcs_inference_session = None
         self.pcs_streaming_session = None
+        self.pcs_multi_streaming = []
+        self.current_confidence_masks = {}
         self.video_frames_cache = []
         self.pcs_exemplar_boxes = []
         self.pcs_exemplar_labels = []
@@ -2400,9 +2460,7 @@ class SAM3AutolabelApp:
             messagebox.showerror("Error", f"Error loading label file:\n{e}", parent=self.root)
 
     def _apply_loaded_objects(self, loaded_objects, source_desc=""):
-        """Same downstream flow as load_label_file once parsing is done.
-        Used by both the button-driven file load and Cut+Load (which already
-        has the objects in memory and skips the file dialog entirely)."""
+        """Same downstream flow as load_label_file once parsing is done."""
         if not loaded_objects:
             return
 
@@ -2933,10 +2991,7 @@ class SAM3AutolabelApp:
         self.object_colors.clear()
         logger.info("object_colors cache cleared.")
 
-        # Reset review slider position and cut offset so subsequent pose/bbox
-        # clicks anchor at frame 0 of a fresh propagation session (prevents a
-        # stale mid-frame review position from making the next propagate
-        # anchor pose queries to the wrong frame).
+        # Reset slider/cut offset so the next session anchors at frame 0 instead of a stale review position.
         self.review_current_frame = 0
         self.cut_start_frame = 0
         if hasattr(self, 'view') and hasattr(self.view, 'review_frame_slider'):
@@ -3068,7 +3123,8 @@ class SAM3AutolabelApp:
                         mask_np,
                         pil_size_for_mask,
                         apply_closing=apply_closing,
-                        closing_kernel_size=closing_kernel
+                        closing_kernel_size=closing_kernel,
+                        logit_threshold=self._mask_logit_threshold()
                     )
 
                     if mask_processed is not None:
@@ -3142,11 +3198,7 @@ class SAM3AutolabelApp:
         return pcs_controller.detect_objects_with_pcs(self, text_prompt, frame_idx=frame_idx)
 
     def _on_git_precision_toggle(self):
-        """Toolbar fp32 checkbox clicked. HF is always fp32 (the checkbox is disabled
-        while HF is active, so this only fires for git/3.1): copy the checkbox display
-        value into the persisted git/3.1 preference. Tracker sessions capture the
-        precision at creation, so the change applies to the NEXT fresh segmentation; an
-        in-progress session keeps its own precision (no mixed-dtype error)."""
+        """Toolbar fp32 checkbox clicked."""
         active = self.active_backend_var.get() if hasattr(self, "active_backend_var") else "hug"
         if active == "hug":
             self.backend_fp32_display_var.set(True)   # HF stays fp32
@@ -3181,9 +3233,7 @@ class SAM3AutolabelApp:
 
     # ---------- User settings persistence (Save Settings button) ----------
 
-    # Tk Variables we never persist: live video metadata + transient
-    # interaction-mode toggles. Everything else (object-control, save/batch,
-    # advanced) is auto-discovered from self.__dict__.
+    # Tk Variables we never persist: live video metadata + transient interaction-mode toggles.
     _SETTINGS_EXCLUDE_NAMES = frozenset({
         "info_video_name_var",
         "info_video_resolution_var",
@@ -3198,8 +3248,7 @@ class SAM3AutolabelApp:
     })
 
     def _iter_persistable_vars(self):
-        """Yield (name, var) for every tk.Variable on self that should be
-        persisted across runs."""
+        """Yield (name, var) for every tk.Variable on self that should be persisted across runs."""
         excludes = self._SETTINGS_EXCLUDE_NAMES
         for name, value in vars(self).items():
             if name in excludes:
@@ -3208,9 +3257,7 @@ class SAM3AutolabelApp:
                 yield name, value
 
     def save_user_settings(self):
-        """Snapshot every persistable tk.Variable on this app to a JSON file
-        next to app.py. Triggered by the Save Settings button in the top bar.
-        """
+        """Snapshot every persistable tk.Variable on this app to a JSON file next to app.py."""
         import json
         snapshot = {}
         for name, var in self._iter_persistable_vars():
@@ -3235,9 +3282,7 @@ class SAM3AutolabelApp:
         )
 
     def _load_user_settings(self):
-        """Apply persisted settings if a JSON file exists next to app.py.
-        Called once during __init__ before AppView is built so widgets bound
-        to tk Variables show the persisted values on first paint."""
+        """Apply persisted settings if a JSON file exists next to app.py."""
         path = self._user_settings_path
         if not os.path.exists(path):
             return
@@ -3306,10 +3351,7 @@ class SAM3AutolabelApp:
         self._release_video_capture()
         self._reset_internal_states_for_new_source()
 
-        # Defensive: enforce a clean slate so cut/DLMI state from the previous
-        # video can never leak into propagation of the next one. In particular
-        # cut_start_frame would otherwise cause Start Propagate on the new
-        # video to seek to the previous video's cut frame.
+        # Defensive: enforce a clean slate so cut/DLMI state from the previous video can never leak into propagation of the next one.
         self.cut_start_frame = 0
         self.cut_point_frame = None
         self.propagated_results = {}
@@ -3435,8 +3477,7 @@ class SAM3AutolabelApp:
         self.propagated_results = {}
         self.propagation_progress = 0
 
-        # Pre-propagate anchor served its purpose; from here on
-        # propagated_results is the source of truth for display.
+        # Pre-propagate anchor served its purpose; from here on propagated_results is the source of truth for display.
         self.label_anchor_frame_idx = None
 
         if hasattr(self, 'object_prompt_history'):
@@ -3521,8 +3562,7 @@ class SAM3AutolabelApp:
         self.view.set_propagate_button_states(is_propagating=False)
         self.view.enable_review_controls(True)
 
-        # Auto-disable "add" toggles so user goes into plain review mode,
-        # not an accidental add-pose or add-polygon state.
+        # Auto-disable "add" toggles so user goes into plain review mode, not an accidental add-pose or add-polygon state.
         self._auto_disable_polygon_mode()
         try:
             if hasattr(self, 'pose_add_mode_var') and self.pose_add_mode_var.get():
@@ -3573,9 +3613,7 @@ class SAM3AutolabelApp:
         except Exception as _am_err:
             logger.debug(f"Auto-match after propagation skipped: {_am_err}")
 
-        # Restore pose seeds into frame 0 if TAPNext did NOT populate per-frame
-        # pose data. Otherwise the user has no way to see/select pose points
-        # after propagation (they were hidden at start_propagation).
+        # Restore pose seeds into frame 0 if TAPNext did NOT populate per-frame pose data.
         try:
             seeds = getattr(self, '_pose_query_seeds', None)
             if seeds and propagated_count > 0:
@@ -3652,11 +3690,7 @@ class SAM3AutolabelApp:
 
             masks_for_display = {obj_id: data['last_mask'] for obj_id, data in masks.items() if 'last_mask' in data}
 
-            # Sync BOTH last_mask AND pose info into tracked_objects so that
-            # any later redraw (e.g. notebook tab-change handler that calls
-            # _get_current_masks_for_display) reflects THIS frame, not the last
-            # propagated frame. Objects not present in this frame's masks get
-            # their last_mask/pose fields removed to avoid stale display.
+            # Sync mask + pose info into tracked_objects so any redraw reflects THIS frame; objects absent here get their visual state stripped.
             frame_obj_ids = set(masks.keys())
             for _oid in list(self.tracked_objects.keys()):
                 if _oid in frame_obj_ids:
@@ -3674,14 +3708,10 @@ class SAM3AutolabelApp:
                         self.tracked_objects[_oid].pop('pose_points', None)
                         self.tracked_objects[_oid].pop('pose_edges', None)
                 elif self.tracked_objects[_oid].get('mid_session_added'):
-                    # Preserve mid-session-added objects. Their last_mask is
-                    # only registered at the frame where they were created;
-                    # keep it intact so the next DLMI/propagation cycle can
-                    # still use it.
+                    # Keep mid-session-added objects intact; their last_mask only exists at the frame they were created on.
                     continue
                 else:
-                    # Object doesn't appear in this frame's masks; strip its
-                    # visual state so it doesn't ghost across frames.
+                    # Object doesn't appear in this frame's masks; strip its visual state so it doesn't ghost across frames.
                     self.tracked_objects[_oid].pop('last_mask', None)
                     self.tracked_objects[_oid].pop('pose_points', None)
                     self.tracked_objects[_oid].pop('pose_edges', None)
@@ -3701,8 +3731,6 @@ class SAM3AutolabelApp:
             self._display_cv_frame_on_view(frame_bgr, masks_for_display)
         else:
             # During propagation/pause, propagation thread owns self.cap.
-            # Seeking/reading from this thread races with ffmpeg and triggers
-            # "Assertion fctx->async_lock failed" crashes. Show status only.
             if self.app_state in ("PAUSED", "PROPAGATING"):
                 self.update_status(
                     f"Frame {actual_frame_idx} not yet processed (propagation in progress). "
@@ -3713,11 +3741,7 @@ class SAM3AutolabelApp:
                 ret, frame_bgr = self.cap.read()
                 if ret:
                     self.current_cv_frame = frame_bgr
-                    # Pre-propagate phase: when the user navigates back to
-                    # the anchor frame, restore the in-progress masks they
-                    # were composing. On any other frame in this phase,
-                    # show the raw frame only — labels still live on the
-                    # anchor and will reappear when the user returns.
+                    # Pre-propagate phase: when the user navigates back to the anchor frame, restore the in-progress masks they were composing.
                     if (self._is_pre_propagate_phase()
                             and self.label_anchor_frame_idx is not None
                             and frame_idx == self.label_anchor_frame_idx

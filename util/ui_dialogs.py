@@ -1,17 +1,4 @@
-"""Reusable tkinter progress dialog helpers.
-
-`open_download_dialog(app, url, dest)` returns a dict with a determinate
-progress bar suitable for URL downloads (bar['value'] 0..100).
-`open_loading_dialog(app, title, subtitle)` returns a dict with an
-indeterminate spinner bar for "waiting for a background op" scenarios
-(pip install, model load, etc.).
-
-Both dialogs:
-  - are Toplevel grabbing modal focus
-  - centre themselves over `app.root`
-  - return a dict exposing the `window`, `bar`, `status` label and a
-    `close()` callable (loading) / `cancel_flag` dict (download).
-"""
+"""Reusable tkinter progress dialog helpers."""
 import tkinter as tk
 import tkinter.ttk as ttk
 
@@ -28,8 +15,7 @@ def _centre_over_root(app, win):
 
 
 def open_download_dialog(app, url, dest):
-    """Modal download progress dialog with a cancel flag.
-    Returns {'window', 'bar', 'status', 'cancel_flag': {'flag': bool}}."""
+    """Modal download progress dialog with a cancel flag."""
     win = tk.Toplevel(app.root)
     win.title("Downloading TAPNext++")
     win.transient(app.root)
@@ -62,9 +48,7 @@ def open_download_dialog(app, url, dest):
 
 
 def open_loading_dialog(app, title, subtitle):
-    """Modal indeterminate-progress dialog. The status label is writeable
-    to reflect sub-phase progress (e.g. 'Installing einops...').
-    Returns {'window', 'bar', 'status', 'close': callable}."""
+    """Modal indeterminate-progress dialog."""
     win = tk.Toplevel(app.root)
     win.title(title)
     win.transient(app.root)

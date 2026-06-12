@@ -60,9 +60,7 @@ class AppView:
                 width=4, command=self._on_backend_select,
                 selectcolor="#90caf9", state=tk.DISABLED,
             )
-        # fp32 compute indicator/toggle. Mirrors the active backend's precision: HF is
-        # always fp32 (checked + disabled); git/3.1 is the editable preference. Bound to
-        # a display var so reflecting HF never clobbers the git/3.1 setting.
+        # fp32 compute indicator/toggle.
         self.backend_fp32_check = tk.Checkbutton(
             self.backend_frame, text="fp32", variable=self.app.backend_fp32_display_var,
             command=getattr(self.app, "_on_git_precision_toggle", None))
@@ -368,11 +366,7 @@ class AppView:
         self.entry_custom_file_name = tk.Entry(self.custom_save_widgets_frame, textvariable=self.app.custom_file_name_var)
         self.custom_format_label = tk.Label(self.custom_save_widgets_frame, text="* Format: {video_name} available", fg="gray50")
 
-        # Separate pose-label save path. When enabled, YOLO-pose .txt files go
-        # exclusively to this root (with per-video subfolder rules mirroring
-        # the seg save), so videos that have no pose data emit nothing into
-        # this folder while seg labels for the same video continue to land
-        # under the regular Save Location.
+        # Separate pose-label save path.
         self.check_custom_pose_save = tk.Checkbutton(
             self.save_options_frame,
             text="Use Separate Pose Save Path",
@@ -441,6 +435,22 @@ class AppView:
         self.sam_closing_kernel_label = tk.Label(self.sam_closing_row_frame, text="Kernel:", font=("TkDefaultFont", 8))
         self.scale_sam_closing_kernel = tk.Scale(self.sam_closing_row_frame, from_=1, to=11, orient=tk.HORIZONTAL, variable=self.app.sam_closing_kernel_size_var, length=100, showvalue=True)
 
+        # Mask binarisation threshold as a confidence % (default 50% = the historical logit-0 cut: a pixel counts as object above this).
+        self.mask_conf_thr_frame = tk.Frame(self.sam_adv_config_frame)
+        self.mask_conf_thr_label = tk.Label(self.mask_conf_thr_frame, text="Object conf threshold(%):")
+        self.mask_conf_thr_slider = tk.Scale(
+            self.mask_conf_thr_frame, from_=1, to=99, orient=tk.HORIZONTAL,
+            variable=self.app.mask_conf_threshold_var if hasattr(self.app, 'mask_conf_threshold_var') else None,
+            length=120, resolution=1,
+            command=self._on_mask_conf_threshold_change
+        )
+        self.mask_conf_thr_info = tk.Label(
+            self.sam_adv_config_frame,
+            text="* a pixel becomes part of the object above this confidence (default 50%).\n"
+                 "  Applies LIVE to the masks on screen; already-propagated frames need re-propagation.",
+            fg="gray50", font=("TkDefaultFont", 7), justify=tk.LEFT
+        )
+
         self.erosion_kernel_label = tk.Label(self.erosion_frame, text="Erosion Kernel:")
         self.scale_erosion_kernel = tk.Scale(self.erosion_frame, from_=0, to=7, orient=tk.HORIZONTAL, variable=self.app.erosion_kernel_size, length=63)
         self.erosion_iter_label = tk.Label(self.erosion_frame, text="Iterations:")
@@ -463,30 +473,90 @@ class AppView:
         self.dlmi_alpha_slider = tk.Scale(
             self.dlmi_alpha_frame, from_=0.5, to=30.0, orient=tk.HORIZONTAL,
             variable=self.app.dlmi_alpha_var if hasattr(self.app, 'dlmi_alpha_var') else None,
-            length=120, resolution=0.5
+            length=120, resolution=0.5,
+            command=self._on_dlmi_setting_change
+        )
+        # Live user-friendly readout: what this alpha means as a final confidence percentage (the alpha itself stays, per the paper).
+        self.dlmi_alpha_conf_label = tk.Label(
+            self.dlmi_alpha_frame, text="", fg="#1565c0", font=("TkDefaultFont", 8)
         )
         self.dlmi_alpha_info = tk.Label(
             self.low_level_api_frame,
             text="Default=10 (99.995% confidence) | Lower = more uncertain",
             fg="gray50", font=("TkDefaultFont", 7)
         )
-        self.dlmi_boundary_frame = tk.Frame(self.low_level_api_frame)
-        self.dlmi_boundary_label = tk.Label(self.dlmi_boundary_frame, text="Boundary Mode:")
-        self.dlmi_boundary_combo = tk.OptionMenu(
-            self.dlmi_boundary_frame,
-            self.app.dlmi_boundary_mode_var if hasattr(self.app, 'dlmi_boundary_mode_var') else tk.StringVar(value="Fixed"),
-            "Fixed", "Gradient"
+        # ===== Confidence Tuning: ① background floor ② boundary softening =====
+        self.dlmi_tuning_frame = tk.LabelFrame(self.low_level_api_frame,
+                                               text="Confidence Tuning")
+
+        # ① background confidence + percentage
+        self.dlmi_bg_frame = tk.Frame(self.dlmi_tuning_frame)
+        self.dlmi_bg_check = tk.Checkbutton(
+            self.dlmi_bg_frame, text="① Background confidence",
+            variable=self.app.dlmi_bg_conf_enabled_var if hasattr(self.app, 'dlmi_bg_conf_enabled_var') else None,
+            command=self._on_dlmi_setting_change
         )
-        self.dlmi_falloff_slider = tk.Scale(
-            self.dlmi_boundary_frame, from_=1, to=100, orient=tk.HORIZONTAL,
-            variable=self.app.dlmi_gradient_falloff_var if hasattr(self.app, 'dlmi_gradient_falloff_var') else None,
-            length=100, resolution=1
+        self.dlmi_bg_value_label = tk.Label(self.dlmi_bg_frame, text="Value(%):")
+        self.dlmi_bg_value_entry = tk.Entry(
+            self.dlmi_bg_frame, width=6,
+            textvariable=self.app.dlmi_bg_conf_value_var if hasattr(self.app, 'dlmi_bg_conf_value_var') else None
         )
-        self.dlmi_boundary_info = tk.Label(
-            self.low_level_api_frame,
-            text="Fixed: uniform logits | Gradient: distance-based continuous logits (slider=falloff px)",
-            fg="gray50", font=("TkDefaultFont", 7)
+        self.dlmi_bg_info = tk.Label(
+            self.dlmi_tuning_frame,
+            text="   keep this much confidence on the WHOLE background instead of ~0% (1~10% suggested)",
+            fg="gray50", font=("TkDefaultFont", 7), justify=tk.LEFT
         )
+
+        # ② boundary softening: in/out/gradient switches + strength
+        self.dlmi_bsoft_row1 = tk.Frame(self.dlmi_tuning_frame)
+        self.dlmi_bsoft_check = tk.Checkbutton(
+            self.dlmi_bsoft_row1, text="② Boundary softening",
+            variable=self.app.dlmi_boundary_soft_enabled_var if hasattr(self.app, 'dlmi_boundary_soft_enabled_var') else None,
+            command=self._on_dlmi_setting_change
+        )
+        self.dlmi_bsoft_inside_check = tk.Checkbutton(
+            self.dlmi_bsoft_row1, text="In",
+            variable=self.app.dlmi_boundary_soft_inside_var if hasattr(self.app, 'dlmi_boundary_soft_inside_var') else None,
+            command=self._on_dlmi_setting_change
+        )
+        self.dlmi_bsoft_outside_check = tk.Checkbutton(
+            self.dlmi_bsoft_row1, text="Out",
+            variable=self.app.dlmi_boundary_soft_outside_var if hasattr(self.app, 'dlmi_boundary_soft_outside_var') else None,
+            command=self._on_dlmi_setting_change
+        )
+        self.dlmi_bsoft_gradient_check = tk.Checkbutton(
+            self.dlmi_bsoft_row1, text="Gradient",
+            variable=self.app.dlmi_boundary_soft_gradient_var if hasattr(self.app, 'dlmi_boundary_soft_gradient_var') else None,
+            command=self._on_dlmi_setting_change
+        )
+        self.dlmi_bsoft_row2 = tk.Frame(self.dlmi_tuning_frame)
+        self.dlmi_bsoft_conf_label = tk.Label(self.dlmi_bsoft_row2, text="Boundary conf(%):")
+        self.dlmi_bsoft_conf_slider = tk.Scale(
+            self.dlmi_bsoft_row2, from_=1, to=99, orient=tk.HORIZONTAL,
+            variable=self.app.dlmi_boundary_soft_conf_var if hasattr(self.app, 'dlmi_boundary_soft_conf_var') else None,
+            length=100, resolution=1,
+            command=self._on_dlmi_setting_change
+        )
+        self.dlmi_bsoft_width_label = tk.Label(self.dlmi_bsoft_row2, text="Band width(% of img W):")
+        self.dlmi_bsoft_width_entry = tk.Entry(
+            self.dlmi_bsoft_row2, width=6,
+            textvariable=self.app.dlmi_boundary_soft_width_var if hasattr(self.app, 'dlmi_boundary_soft_width_var') else None
+        )
+        self.dlmi_bsoft_info = tk.Label(
+            self.dlmi_tuning_frame,
+            text="   the band near the mask edge gets exactly this confidence (In/Out side;\n"
+                 "   Gradient = blends back to the object/background value with distance)",
+            fg="gray50", font=("TkDefaultFont", 7), justify=tk.LEFT
+        )
+
+        # ===== ③ Applied Confidence: object / near-boundary / background =====
+        self.dlmi_summary_frame = tk.LabelFrame(self.low_level_api_frame,
+                                                text="Applied Confidence (live)")
+        self.dlmi_conf_summary_label = tk.Label(
+            self.dlmi_summary_frame, text="", fg="#1565c0",
+            font=("TkFixedFont", 8), justify=tk.LEFT, anchor='w'
+        )
+
         self.dlmi_preserve_check = tk.Checkbutton(
             self.low_level_api_frame, text="Preserve DLMI Memory (permanent conditioning)",
             variable=self.app.dlmi_preserve_memory_var if hasattr(self.app, 'dlmi_preserve_memory_var') else None,
@@ -878,19 +948,42 @@ class AppView:
         self.dlmi_alpha_frame.pack(anchor='w', padx=5, pady=(5, 0), fill='x')
         self.dlmi_alpha_label.pack(side=tk.LEFT)
         self.dlmi_alpha_slider.pack(side=tk.LEFT, padx=5)
+        self.dlmi_alpha_conf_label.pack(side=tk.LEFT, padx=(6, 0))
         self.dlmi_alpha_info.pack(anchor='w', padx=10, pady=(0, 2))
-        self.dlmi_boundary_frame.pack(anchor='w', padx=5, pady=(2, 0), fill='x')
-        self.dlmi_boundary_label.pack(side=tk.LEFT)
-        self.dlmi_boundary_combo.pack(side=tk.LEFT, padx=5)
-        self.dlmi_falloff_slider.pack(side=tk.LEFT, padx=5)
-        self.dlmi_boundary_info.pack(anchor='w', padx=10, pady=(0, 2))
+        self.dlmi_tuning_frame.pack(anchor='w', padx=5, pady=(4, 2), fill='x')
+        self.dlmi_bg_frame.pack(anchor='w', padx=5, pady=(2, 0), fill='x')
+        self.dlmi_bg_check.pack(side=tk.LEFT)
+        self.dlmi_bg_value_label.pack(side=tk.LEFT, padx=(8, 2))
+        self.dlmi_bg_value_entry.pack(side=tk.LEFT)
+        self.dlmi_bg_info.pack(anchor='w', padx=5, pady=(0, 2))
+        self.dlmi_bsoft_row1.pack(anchor='w', padx=5, pady=(2, 0), fill='x')
+        self.dlmi_bsoft_check.pack(side=tk.LEFT)
+        self.dlmi_bsoft_inside_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.dlmi_bsoft_outside_check.pack(side=tk.LEFT, padx=(4, 0))
+        self.dlmi_bsoft_gradient_check.pack(side=tk.LEFT, padx=(4, 0))
+        self.dlmi_bsoft_row2.pack(anchor='w', padx=5, pady=(0, 0), fill='x')
+        self.dlmi_bsoft_conf_label.pack(side=tk.LEFT, padx=(18, 2))
+        self.dlmi_bsoft_conf_slider.pack(side=tk.LEFT)
+        self.dlmi_bsoft_width_label.pack(side=tk.LEFT, padx=(10, 2))
+        self.dlmi_bsoft_width_entry.pack(side=tk.LEFT)
+        self.dlmi_bsoft_info.pack(anchor='w', padx=5, pady=(0, 3))
+
+        self.dlmi_summary_frame.pack(anchor='w', padx=5, pady=(2, 2), fill='x')
+        self.dlmi_conf_summary_label.pack(anchor='w', padx=8, pady=(2, 4), fill='x')
+
         self.dlmi_preserve_check.pack(anchor='w', padx=5, pady=(2, 0))
         self.dlmi_boost_check.pack(anchor='w', padx=5, pady=(0, 5))
+        self._init_dlmi_confidence_bindings()
 
         self.sam_closing_row_frame.pack(anchor='w', fill=tk.X, padx=5, pady=(2, 2))
         self.check_apply_closing.pack(side=tk.LEFT)
         self.sam_closing_kernel_label.pack(side=tk.LEFT, padx=(8, 2))
         self.scale_sam_closing_kernel.pack(side=tk.LEFT)
+
+        self.mask_conf_thr_frame.pack(anchor='w', fill=tk.X, padx=5, pady=(2, 0))
+        self.mask_conf_thr_label.pack(side=tk.LEFT)
+        self.mask_conf_thr_slider.pack(side=tk.LEFT, padx=5)
+        self.mask_conf_thr_info.pack(anchor='w', padx=10, pady=(0, 2))
 
         self.mask_display_frame.pack(anchor='w', fill=tk.X, padx=5, pady=(5,0))
         self.mask_alpha_label.pack(side=tk.LEFT, padx=5)
@@ -975,20 +1068,33 @@ class AppView:
         )
 
         if is_from_pcs and is_to_pvs and has_masks:
-            logger.info(f"PCS → {new_mode} transition: masks retained")
-            if hasattr(self.app, 'inference_session') and self.app.inference_session is not None:
-                self.app.inference_session = None
-            if hasattr(self.app, 'is_tracking_ever_started'):
-                self.app.is_tracking_ever_started = False
-            try:
-                self.app._reinit_sam3_session_with_masks()
-                mask_count = len(self.app._get_current_frame_masks()) if hasattr(self.app, '_get_current_frame_masks') else 0
-                if hasattr(self.app, 'update_status'):
-                    self.app.update_status(f"Switched to {new_mode} mode. {mask_count} masks retained.")
-            except Exception as e:
-                logger.exception(f"SAM3 session reinitialization failed: {e}")
-                if hasattr(self.app, 'update_status'):
-                    self.app.update_status(f"Error during {new_mode} mode transition")
+            # DLMI on: run the automatic hand-off (record PCS results, switch, re-apply via DLMI injection).
+            dlmi_on = bool(getattr(self.app, 'low_level_api_enabled_var', None) and
+                           self.app.low_level_api_enabled_var.get())
+            handled_via_dlmi = False
+            if dlmi_on and hasattr(self.app, '_auto_pcs_to_pvs_dlmi'):
+                logger.info(f"PCS → {new_mode} transition: automatic DLMI pipeline (DLMI on)")
+                try:
+                    handled_via_dlmi = self.app._auto_pcs_to_pvs_dlmi()
+                except Exception as e:
+                    logger.exception(f"PCS → {new_mode} auto DLMI pipeline failed: {e}")
+                    handled_via_dlmi = False
+
+            if not handled_via_dlmi:
+                logger.info(f"PCS → {new_mode} transition: masks retained")
+                if hasattr(self.app, 'inference_session') and self.app.inference_session is not None:
+                    self.app.inference_session = None
+                if hasattr(self.app, 'is_tracking_ever_started'):
+                    self.app.is_tracking_ever_started = False
+                try:
+                    self.app._reinit_sam3_session_with_masks()
+                    mask_count = len(self.app._get_current_frame_masks()) if hasattr(self.app, '_get_current_frame_masks') else 0
+                    if hasattr(self.app, 'update_status'):
+                        self.app.update_status(f"Switched to {new_mode} mode. {mask_count} masks retained.")
+                except Exception as e:
+                    logger.exception(f"SAM3 session reinitialization failed: {e}")
+                    if hasattr(self.app, 'update_status'):
+                        self.app.update_status(f"Error during {new_mode} mode transition")
         else:
             if hasattr(self.app, 'inference_session') and self.app.inference_session is not None:
                 logger.info(f"Detection mode change: resetting inference_session")
@@ -1217,12 +1323,7 @@ class AppView:
         return None
 
     def _make_scrollable_tab_frame(self, tab_text):
-        """Create a scrollable container frame for a notebook tab. Returns the
-        inner frame that widgets should use as their parent. The canvas keeps
-        the inner frame at its natural requested width so the vertical
-        scrollbar does NOT eat horizontal space from the content; the whole
-        notebook simply grows wider by the scrollbar width.
-        Mouse-wheel scrolls only while the cursor is over the tab."""
+        """Create a scrollable container frame for a notebook tab."""
         wrapper = tk.Frame(self.notebook)
         canvas = tk.Canvas(wrapper, highlightthickness=0, borderwidth=0)
         scrollbar = tk.Scrollbar(wrapper, orient=tk.VERTICAL, command=canvas.yview)
@@ -1324,12 +1425,45 @@ class AppView:
         self.root.bind("<KeyRelease-Alt_L>", self.app._on_alt_release)
         self.root.bind("<KeyRelease-Alt_R>", self.app._on_alt_release)
         self.root.bind("<space>", self.app._on_spacebar_press)
+        # Polygon mode shortcuts: Enter = Complete, Ctrl+Z = Undo Point
+        self.root.bind("<Return>", self._on_polygon_enter_key)
+        self.root.bind("<KP_Enter>", self._on_polygon_enter_key)
+        self.root.bind("<Control-z>", self._on_polygon_undo_key)
+        self.root.bind("<Control-Z>", self._on_polygon_undo_key)
 
         self.notebook.bind("<ButtonPress-1>", self._on_notebook_tab_change_attempt)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self.root.protocol("WM_DELETE_WINDOW", self.app._on_closing_window_confirm)
         logger.debug("Event binding complete.")
+
+    def _on_polygon_enter_key(self, event=None):
+        # same as clicking Complete, but only in polygon mode and not while typing
+        if not getattr(self.app, 'polygon_mode_active', False):
+            return None
+        if event is not None and isinstance(event.widget, (tk.Entry, tk.Text)):
+            return None
+        try:
+            if str(self.btn_polygon_complete['state']) == 'disabled':
+                return None
+        except tk.TclError:
+            return None
+        self.app.complete_polygon_object()
+        return "break"
+
+    def _on_polygon_undo_key(self, event=None):
+        # same as clicking Undo Point, but only in polygon mode and not while typing
+        if not getattr(self.app, 'polygon_mode_active', False):
+            return None
+        if event is not None and isinstance(event.widget, (tk.Entry, tk.Text)):
+            return None
+        try:
+            if str(self.btn_polygon_undo['state']) == 'disabled':
+                return None
+        except tk.TclError:
+            return None
+        self.app.undo_last_polygon_point()
+        return "break"
 
     def update_status(self, message):
         self.progress_label.config(text=f"Status: {message}")
@@ -1433,8 +1567,7 @@ class AppView:
         self._sync_fp32_checkbox(active_key or self.app.active_backend_var.get())
 
     def _sync_fp32_checkbox(self, active_key):
-        """Reflect the active backend's compute precision in the fp32 checkbox: HF is
-        always fp32 (checked + disabled); git/3.1 shows its toggleable preference."""
+        """Reflect the active backend's precision in the fp32 checkbox (HF: checked+disabled; git/3.1: editable)."""
         chk = getattr(self, "backend_fp32_check", None)
         try:
             if active_key == "hug":
@@ -1450,8 +1583,7 @@ class AppView:
 
     # ----- modal loading dialog (backend switch) -------------------------- #
     def show_loading_dialog(self, message="Loading..."):
-        """Pop a small modal window with an animated indeterminate progress bar
-        so the user can see a backend switch is in progress (not frozen)."""
+        """Modal spinner so a backend switch doesn't look frozen."""
         self.hide_loading_dialog()
         win = tk.Toplevel(self.root)
         win.title("Please wait")
@@ -1549,10 +1681,7 @@ class AppView:
                     widget.config(state=state)
             except tk.TclError: pass
 
-        # tk.Canvas is needed so the scrollable-tab wrappers (Frame→Canvas→Frame)
-        # propagate state to their inner-frame children. Without Canvas in this
-        # tuple, every widget inside a scrollable notebook tab becomes
-        # unreachable from set_ui_element_state("notebook_tabs", ...).
+        # tk.Canvas is needed so the scrollable-tab wrappers (Frame→Canvas→Frame) propagate state to their inner-frame children.
         if isinstance(widget, (tk.Frame, tk.LabelFrame, tk.Canvas)):
             for child in widget.winfo_children():
                 self._set_widget_state_recursively(child, state)
@@ -1784,6 +1913,117 @@ class AppView:
             self.btn_low_data_inject.config(state='normal')
         else:
             self.btn_low_data_inject.config(state='disabled')
+
+    # ---- DLMI final-confidence readouts (user-friendly view of alpha etc.) ----
+
+    def _init_dlmi_confidence_bindings(self):
+        """Refresh the confidence summary when DLMI numeric entries change (sliders/checkbuttons refresh via their command callbacks)."""
+        for var_name in ('dlmi_bg_conf_value_var', 'dlmi_boundary_soft_width_var'):
+            var = getattr(self.app, var_name, None)
+            if var is not None:
+                try:
+                    var.trace_add('write', lambda *_a: self._update_dlmi_confidence_labels())
+                except Exception:
+                    pass
+        self._update_dlmi_confidence_labels()
+
+    def _on_dlmi_setting_change(self, _value=None):
+        self._update_dlmi_confidence_labels()
+
+    # ---- live Object-conf-threshold re-application ----
+
+    def _on_mask_conf_threshold_change(self, _value=None):
+        """Slider tick: debounce, then re-binarise the on-screen masks from their stored raw logit maps (no model re-run, no Apply button)."""
+        job = getattr(self, '_mask_thr_job', None)
+        if job is not None:
+            try:
+                self.app.root.after_cancel(job)
+            except Exception:
+                pass
+        try:
+            self._mask_thr_job = self.app.root.after(150, self._apply_mask_conf_threshold)
+        except Exception:
+            self._mask_thr_job = None
+
+    def _apply_mask_conf_threshold(self):
+        self._mask_thr_job = None
+        try:
+            pct = float(self.app.mask_conf_threshold_var.get())
+        except Exception:
+            pct = 50.0
+        try:
+            updated = self.app.reapply_mask_threshold()
+        except Exception as e:
+            logger.exception(f"Live conf-threshold re-apply failed: {e}")
+            return
+        if updated:
+            self.app.update_status(
+                f"Object conf threshold {pct:g}%: {updated} mask(s) re-thresholded.")
+        elif getattr(self.app, 'app_state', '') == "REVIEWING":
+            self.app.update_status(
+                f"Object conf threshold set to {pct:g}%. Already-propagated frames keep "
+                f"their masks — re-propagate to apply everywhere.")
+
+    def _update_dlmi_confidence_labels(self):
+        """Show the DLMI settings as the FINAL confidence per region (object / boundary / background)."""
+        try:
+            from .backends.dlmi_core import logit_to_confidence, MAX_BG_CONFIDENCE_PCT
+            app = self.app
+
+            def _num(var, default):
+                try:
+                    return float(var.get())
+                except Exception:
+                    return default
+
+            def _on(name):
+                var = getattr(app, name, None)
+                try:
+                    return bool(var is not None and var.get())
+                except Exception:
+                    return False
+
+            alpha = _num(getattr(app, 'dlmi_alpha_var', None), 10.0)
+            obj_conf = logit_to_confidence(alpha)
+            bg_conf = logit_to_confidence(-alpha)
+            self.dlmi_alpha_conf_label.config(text=f"= {obj_conf:.3f}% confidence")
+
+            # ① background (whole) — floored when the option is on
+            if _on('dlmi_bg_conf_enabled_var'):
+                bg_floor = min(max(_num(getattr(app, 'dlmi_bg_conf_value_var', None), 5.0), 0.0),
+                               MAX_BG_CONFIDENCE_PCT)
+                bg_line = f"{max(bg_conf, bg_floor):.3f}%  (floor on)"
+            else:
+                bg_line = f"{bg_conf:.3f}%"
+
+            # ② near-boundary — the band gets exactly the user's conf value
+            if _on('dlmi_boundary_soft_enabled_var'):
+                bconf = min(max(_num(getattr(app, 'dlmi_boundary_soft_conf_var', None), 50.0),
+                                1.0), 99.0)
+                width = _num(getattr(app, 'dlmi_boundary_soft_width_var', None), 1.0)
+                gradient = _on('dlmi_boundary_soft_gradient_var')
+                sides = []
+                if _on('dlmi_boundary_soft_inside_var'):
+                    sides.append(f"in {bconf:g}%→{obj_conf:.1f}%" if gradient else f"in {bconf:g}%")
+                if _on('dlmi_boundary_soft_outside_var'):
+                    bg_pct_now = (max(logit_to_confidence(-alpha),
+                                      _num(getattr(app, 'dlmi_bg_conf_value_var', None), 5.0))
+                                  if _on('dlmi_bg_conf_enabled_var') else logit_to_confidence(-alpha))
+                    sides.append(f"out {bconf:g}%→{bg_pct_now:.1f}%" if gradient else f"out {bconf:g}%")
+                if sides:
+                    bnd_line = f"{' / '.join(sides)}  (band {width:g}% of width)"
+                else:
+                    bnd_line = "no side selected"
+            else:
+                bnd_line = "— (softening off)"
+
+            self.dlmi_conf_summary_label.config(text=(
+                f"Object     : {obj_conf:.3f}%\n"
+                f"Boundary   : {bnd_line}\n"
+                f"Background : {bg_line}"
+            ))
+        except Exception as e:
+            logger.debug(f"DLMI confidence label update skipped: {e}")
 
     def update_polygon_mode_ui(self, is_active):
         is_paused = getattr(self.app, 'app_state', '') == "PAUSED"

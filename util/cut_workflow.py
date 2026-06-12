@@ -1,15 +1,4 @@
-"""Cut workflow: cut_and_repropagate, cut_and_dlmi_propagate, cut_and_load_labels.
-
-Every public function takes `app` (the SAM3AutolabelApp instance) as its first
-argument so this module is a pure "business logic" layer over app state. The
-`app.py` class keeps thin wrappers that forward to these functions; external
-callers (gui_view button commands etc.) continue to invoke the wrappers
-through the instance, so signatures are preserved.
-
-All DLMI injection uses `dlmi_hooks.create_injection_hook` (Phase 2) for
-consistency. All save paths go through `autolabel_workflow.save_frame_dispatch`
-(Phase 3).
-"""
+"""Cut workflow: cut_and_repropagate, cut_and_dlmi_propagate, cut_and_load_labels."""
 import os
 import logging
 import tkinter as tk
@@ -29,24 +18,12 @@ POSE_LABELS_SUBDIR = "pose_labels"
 
 
 def pose_labels_subdir(app):
-    """Pose labels always go to a dedicated subdir so they don't collide with
-    YOLO-seg label files. The advanced `merge_save_format` setting is advisory."""
+    """Pose labels always go to a dedicated subdir so they don't collide with YOLO-seg label files."""
     return POSE_LABELS_SUBDIR
 
 
 def save_frames_0_to_n(app, slider_idx, save_labels, current_offset, inclusive=True):
-    """Save propagated frames 0..slider_idx (default inclusive). When
-    `inclusive=False`, saves 0..slider_idx-1 instead — used by Cut+DLMI and
-    Cut+Load, which intentionally do NOT save frame N because frame N is the
-    starting frame of the new sub-video and its labels will be re-emitted
-    from there. Returns number of saved frames.
-
-    Drives the propagate progress bar in the same style as the threaded
-    Confirm-Labels save (throttled to ~50 updates across the run). Cut runs
-    on the main Tk thread, so each progress update is paired with
-    `update_idletasks()` to flush the redraw and let the user see progress
-    while saving.
-    """
+    """Save propagated frames 0..slider_idx (default inclusive)."""
     if not save_labels:
         return 0
     saved_count = 0
@@ -109,6 +86,7 @@ def reset_state_and_seek(app, next_start_frame):
     """Shared cut state reset + video seek + session reinit. Returns success bool."""
     app.propagated_results = {}
     app.tracked_objects.clear()
+    app.current_confidence_masks = {}
     app.next_obj_id_to_propose = 1
     app._update_obj_id_info_label()
     app.label_anchor_frame_idx = None
@@ -116,6 +94,7 @@ def reset_state_and_seek(app, next_start_frame):
     app.inference_session = None
     app.pcs_inference_session = None
     app.pcs_streaming_session = None
+    app.pcs_multi_streaming = []
     app.video_frames_cache = []
     app.discarded_frames.clear()
     if hasattr(app.view, 'update_discarded_frames_display'):
@@ -154,13 +133,7 @@ def reset_state_and_seek(app, next_start_frame):
 
 
 def dlmi_mini_propagate_n_to_n1(app, frame_n_bgr, frame_n_plus_1_bgr, obj_id_to_mask_label):
-    """Run a 2-frame mini inference session from frame n to n+1.
-
-    Apply saved n-masks as prompts at frame 0, optionally with DLMI injection,
-    propagate to frame 1, return {obj_id: mask_ndarray_bool} for frame n+1.
-
-    obj_id_to_mask_label: dict[int, {'mask': np.ndarray[bool], 'label': str}]
-    """
+    """Run a 2-frame mini inference session from frame n to n+1."""
     result_masks = {}
     original_encode = None
     try:
@@ -198,14 +171,12 @@ def dlmi_mini_propagate_n_to_n1(app, frame_n_bgr, frame_n_plus_1_bgr, obj_id_to_
         original_encode = app.tracker_model._encode_new_memory
 
         if dlmi_enabled:
-            dlmi_mode = app.dlmi_boundary_mode_var.get()
-            dlmi_intensity = app.dlmi_alpha_var.get()
-            dlmi_falloff = app.dlmi_gradient_falloff_var.get()
+            dlmi_settings = dlmi_hooks.collect_dlmi_settings(app)
             injection_queue = dlmi_hooks.build_injection_queue(
                 obj_ids=obj_ids_list,
                 masks_by_oid={oid: obj_id_to_mask_label[oid]['mask'] for oid in obj_ids_list},
-                intensity=dlmi_intensity, mode=dlmi_mode, falloff=dlmi_falloff,
                 device=app.device,
+                **dlmi_settings,
             )
             app.tracker_model._encode_new_memory = dlmi_hooks.create_injection_hook(
                 injection_queue, original_encode, log_prefix="mini-prop"
@@ -270,9 +241,7 @@ def dlmi_mini_propagate_n_to_n1(app, frame_n_bgr, frame_n_plus_1_bgr, obj_id_to_
 
 
 def seed_session_with_masks(app, oid_to_mask):
-    """Seed the current `inference_session` at frame 0 with the given obj_id→mask
-    dict, and run a forward pass so memory is established. Used after Cut+DLMI to
-    bootstrap the fresh session with the propagated masks as initial prompts."""
+    """Seed the current `inference_session` at frame 0 with the given obj_id→mask dict, and run a forward pass so memory is established."""
     if app.inference_session is None or app.current_cv_frame is None:
         return
     try:
@@ -307,11 +276,7 @@ def seed_session_with_masks(app, oid_to_mask):
 
 
 def _yolo_dataset_prechecks(app):
-    """Shared guard used by cut_and_{repropagate,dlmi_propagate,load_labels} when
-    save_format is YOLO/both, OR when seg fmt is labelme but pose data exists
-    (then pose still gets saved as YOLO-pose, which needs a proper YOLO
-    dataset root with class names + data.yaml).
-    Returns (ok: bool). False means user cancelled or init failed."""
+    """Shared YOLO-dataset guard for the cut_* flows; False = user cancelled or init failed."""
     fmt = app.save_format_var.get()
 
     has_any_pose_overall = False
@@ -432,13 +397,7 @@ def cut_and_repropagate(app):
 
 
 def cut_and_dlmi_propagate(app):
-    """Cut at frame N (slider position): save 0..N-1, then start the new
-    sub-video AT original frame N (one frame before a plain Cut Here would).
-    The propagated masks already computed at frame N are reused as-is and
-    DLMI-injected into a fresh inference session anchored at frame N — no
-    mini-video propagation is needed because the masks the user already
-    confirmed at N are exactly what should seed N going forward.
-    """
+    """Cut at frame N: save 0..N-1, then restart the sub-video AT frame N reusing its propagated masks via DLMI injection."""
     slider_idx = app.review_current_frame
     if slider_idx < 0:
         messagebox.showwarning("Info", "Please select a valid frame.", parent=app.root)
@@ -495,8 +454,7 @@ def cut_and_dlmi_propagate(app):
     if save_labels and not _yolo_dataset_prechecks(app):
         return
 
-    # Save 0..N-1 only — frame N is intentionally NOT saved here because it
-    # becomes the starting frame of the new sub-video.
+    # Save 0..N-1 only — frame N is intentionally NOT saved here because it becomes the starting frame of the new sub-video.
     saved_count = save_frames_0_to_n(app, slider_idx, save_labels, current_offset, inclusive=False)
 
     if not reset_state_and_seek(app, next_start_frame):
@@ -505,9 +463,7 @@ def cut_and_dlmi_propagate(app):
     if frame_n_bgr is not None:
         app.current_cv_frame = frame_n_bgr
 
-    # The new sub-video's frame 0 IS the original frame N. Use its already
-    # computed propagated masks directly — no mini-video propagation, no
-    # accuracy loss vs. the frame the user just reviewed.
+    # The new sub-video's frame 0 IS the original frame N.
     propagated_n1 = {oid: data['mask'] for oid, data in frame_n_masks.items()}
 
     if propagated_n1:
@@ -529,12 +485,7 @@ def cut_and_dlmi_propagate(app):
             app.next_obj_id_to_propose = max(app.next_obj_id_to_propose, int(oid) + 1)
         app._update_obj_id_info_label()
 
-        # Stamp a synthetic propagated_results[0] so any redraw triggered
-        # by slider events (review_frame_slider.set(0) inside
-        # reset_state_and_seek fires _on_review_slider_change →
-        # on_review_frame_change(0)) finds this frame in propagated_results
-        # and shows the masks instead of silently clearing them via the
-        # empty-results fallback path.
+        # Stamp a synthetic propagated_results[0] so slider-event redraws find the masks instead of clearing them.
         if synthetic_masks and app.current_cv_frame is not None:
             app.propagated_results[0] = {
                 'frame': app.current_cv_frame.copy(),
@@ -543,10 +494,7 @@ def cut_and_dlmi_propagate(app):
 
         if app.current_cv_frame is not None:
             app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
-        # Seed the fresh inference session at frame 0 (= original frame N)
-        # with these masks, optionally with DLMI injection on the memory
-        # encode path (controlled inside seed_session_with_masks via the
-        # standard injection flag).
+        # Seed the fresh session at frame 0 with these masks (DLMI injection applies inside seed_session_with_masks).
         seed_session_with_masks(app, propagated_n1)
         if app.current_cv_frame is not None:
             app._display_cv_frame_on_view(app.current_cv_frame, app._get_current_masks_for_display())
@@ -605,11 +553,7 @@ def cut_and_load_labels(app):
         if m is None or not m.any():
             continue
         label = odata.get('custom_label', f'Object_{int(oid)}')
-        # Derive bbox + polygon contour from the existing mask so
-        # _apply_loaded_labels_as_prompts (PVS) and
-        # _apply_loaded_labels_as_polygon_masks (low-level API) both have what
-        # they need. This mirrors the structure produced by
-        # parse_labelme_json / parse_yolo_txt.
+        # Derive bbox + polygon from the mask, mirroring what parse_labelme_json/parse_yolo_txt emit.
         ys, xs = np.where(m)
         if len(xs) == 0 or len(ys) == 0:
             continue
@@ -655,22 +599,16 @@ def cut_and_load_labels(app):
     if save_labels and not _yolo_dataset_prechecks(app):
         return
 
-    # Save 0..N-1 only — frame N is intentionally NOT saved here because it
-    # becomes the starting frame of the new sub-video and will be re-emitted
-    # from there.
+    # Save 0..N-1 only; frame N becomes the new sub-video's first frame and is re-emitted from there.
     saved_count = save_frames_0_to_n(app, slider_idx, save_labels, current_offset, inclusive=False)
 
     if not reset_state_and_seek(app, next_start_frame):
         return
 
-    # Feed the frame-N masks straight through the same path the Load Labels
-    # button uses (PVS bbox prompts, PCS exemplars, or low-level polygon-mask
-    # injection — picked by current prompt_mode_var and low_level_api_var).
+    # Feed the frame-N masks through the same path as the Load Labels button.
     app._apply_loaded_objects(frame_n_objects, source_desc=f"cut+load@frame{slider_idx}")
 
-    # Mirror tracked_objects into propagated_results[0] so any redraw
-    # triggered by slider/notebook events finds the masks instead of falling
-    # through to the empty-results fallback path that wipes the canvas.
+    # Mirror tracked_objects into propagated_results[0] so redraws don't fall through to the canvas-wiping fallback.
     if app.tracked_objects and app.current_cv_frame is not None:
         synthetic_masks = {}
         for oid, data in app.tracked_objects.items():

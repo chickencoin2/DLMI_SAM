@@ -1,14 +1,4 @@
-"""GitBackend - official GitHub `sam3` package backend (SAM3 and SAM3.1).
-
-Uses the LOW-LEVEL official model API (build_sam3_image_model / build_sam3_video_model
-/ build_sam3_multiplex_video_model). One class parametrised by `version`:
-  * version="sam3"   -> build_sam3_video_model().tracker          (Sam3TrackerPredictor)
-  * version="sam3.1" -> build_sam3_multiplex_video_model()        (demo model IS the tracker)
-
-The image model is loaded eagerly in load(); the (heavier) video model is loaded
-lazily on first tracker/pcs use. Image segmentation is implemented here; tracker /
-PCS / DLMI are added in later phases.
-"""
+"""GitBackend - official GitHub `sam3` package backend (SAM3 and SAM3.1)."""
 
 from __future__ import annotations
 
@@ -32,16 +22,7 @@ _SDPA_PATCHED = False
 
 
 def _patch_decoder_sdpa_allow_math():
-    """Let the official tracker run in fp32 as well as its native bf16.
-
-    The official decoder hardcodes ``with sdpa_kernel(SDPBackend.FLASH_ATTENTION)``
-    around its attention (sam3/model/decoder.py), and FlashAttention has no fp32
-    kernel -> fp32 raises "No available kernel. Aborting execution." We override the
-    decoder's ``sdpa_kernel`` name so it ALSO permits the MATH (and efficient)
-    backends: under bf16 PyTorch still selects Flash (fast, unchanged behaviour);
-    under fp32 it falls back to the MATH kernel. Harmless to the default bf16 path,
-    and it is what makes the optional fp32 mode work. HF (transformers) is untouched.
-    Applied once, process-wide."""
+    """Let the official tracker run in fp32 as well as its native bf16."""
     global _SDPA_PATCHED
     if _SDPA_PATCHED:
         return
@@ -60,8 +41,7 @@ def _patch_decoder_sdpa_allow_math():
 
 
 def _np(t):
-    """Tensor/array -> numpy, upcasting non-integer tensors to float32 first
-    (numpy() rejects bfloat16, which the official models use internally)."""
+    """Tensor/array -> numpy, upcasting non-integer tensors first (numpy() rejects bfloat16)."""
     if t is None:
         return None
     if torch.is_tensor(t):
@@ -122,9 +102,7 @@ class GitBackend(SamBackend):
             self._img_model = build_sam3_image_model(
                 device=self._device_str, load_from_HF=True,
                 enable_inst_interactivity=True)
-            # Precision policy (CLAUDE.md): official checkpoints ship in bf16;
-            # upcast to fp32 to match the HF backend (torch_dtype=float32) and
-            # avoid reducing precision relative to it.
+            # Upcast to fp32 to match the HF backend (precision policy).
             self._img_model = self._img_model.float()
             self._img_proc = Sam3Processor(self._img_model, device=self._device_str)
         except Exception as e:
@@ -136,9 +114,7 @@ class GitBackend(SamBackend):
         logger.info(f"GitBackend[{self.version}] image model ready (video lazy).")
 
     def _install_app_wrappers(self):
-        """Set HF-API-compatible tracker wrappers on the app so the existing PVS
-        streaming call-sites (sam_interaction / propagation_controller) work for git.
-        HF-only handles are nulled (git routes image via backend.image_detect)."""
+        """Install HF-API-compatible tracker wrappers on the app so existing PVS call-sites work for git."""
         from . import git_video
         app = self.app
         app.tracker_processor = git_video.GitTrackerProcessor(self)
@@ -170,10 +146,7 @@ class GitBackend(SamBackend):
 
     # ----- precision (option) --------------------------------------------- #
     def _fp32_mode(self) -> bool:
-        """True = run the official models in fp32 (HF-parity, via the sdpa MATH
-        patch); False (default) = the package-native bf16. Driven by app.git_fp32_var
-        so it can be toggled at runtime (the weights stay fp32 masters either way;
-        only the autocast compute dtype changes)."""
+        """True = run the official models in fp32 (HF-parity, via the sdpa MATH patch); False (default) = the package-native bf16."""
         v = getattr(self.app, "git_fp32_var", None)
         try:
             return bool(v.get()) if v is not None else False
@@ -181,14 +154,7 @@ class GitBackend(SamBackend):
             return False
 
     def _autocast_ctx(self, fp32=None):
-        """Autocast context wrapping every official-model forward so the whole git/3.1
-        pipeline runs at ONE consistent compute dtype (mixing fp32 weights with a
-        leaked bf16 autocast is what caused the 'BFloat16 vs Float' crashes).
-
-        `fp32` overrides the live setting — tracker sessions pass the value captured at
-        session creation so a session stays internally consistent even if the user
-        toggles the option mid-track (the new precision then applies to the next
-        fresh session). image_detect is stateless and reads the live setting."""
+        """Autocast context keeping the whole git/3.1 forward at one compute dtype; `fp32` overrides the live setting for session consistency."""
         if self._device_str != "cuda":
             return contextlib.nullcontext()
         use_fp32 = self._fp32_mode() if fp32 is None else bool(fp32)
@@ -205,18 +171,14 @@ class GitBackend(SamBackend):
         if self._tracker is not None:
             return
         if self.version == "sam3.1":
-            # sam3.1_multiplex.pt is a FULL-stack checkpoint (keys prefixed
-            # tracker.model.* / detector.*) → load via the predictor builder, then
-            # extract the low-level multiplex demo tracker model. use_fa3=False keeps
-            # us off FlashAttention3 (fp32 path).
+            # sam3.1_multiplex.pt is a full-stack checkpoint: load via the predictor builder, then extract the multiplex demo tracker (use_fa3=False for fp32).
             from sam3.model_builder import build_sam3_multiplex_video_predictor
             logger.info("GitBackend[sam3.1] building multiplex video predictor...")
             self._predictor = build_sam3_multiplex_video_predictor(
                 use_fa3=False, warm_up=False)
             self._predictor.model.float()
             self._tracker = self._predictor.model.tracker.model  # VideoTrackingMultiplexDemo
-            # Wire the shared VL backbone into the demo tracker (mirrors the SAM3
-            # `predictor.backbone = detector.backbone` step).
+            # Wire the shared VL backbone into the demo tracker (mirrors the SAM3 `predictor.backbone = detector.backbone` step).
             self._tracker.backbone = self._predictor.model.detector.backbone
         else:
             from sam3.model_builder import build_sam3_video_model
@@ -225,8 +187,7 @@ class GitBackend(SamBackend):
                 load_from_HF=True, device=self._device_str).float()
             self._tracker = self._video.tracker
             self._tracker.backbone = self._video.detector.backbone
-        # Remember the pristine memory-encoder so the video wrapper can detect when
-        # a DLMI injection hook has been installed (and then encode memory for it).
+        # Remember the pristine memory-encoder so the video wrapper can detect an installed DLMI hook.
         self._orig_encode = self._tracker._encode_new_memory
         logger.info(f"GitBackend[{self.version}] video tracker ready.")
 
@@ -260,9 +221,7 @@ class GitBackend(SamBackend):
 
         proc.confidence_threshold = float(threshold)
         has_box = boxes is not None and len(boxes) > 0
-        # Run the official image model under the selected compute dtype (bf16 default
-        # / fp32 option) so the backbone activations and weights never disagree
-        # (the "mat1 and mat2 ... BFloat16 vs Float" failure, facebookresearch/sam3#507).
+        # Run under the selected compute dtype so weights and activations never disagree (sam3#507).
         with self._autocast_ctx():
             state = proc.set_image(pil)
             if has_box:

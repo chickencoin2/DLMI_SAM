@@ -1,20 +1,4 @@
-"""DLMI memory-encoder injection - fresh, self-contained implementation.
-
-NEW code for the backend layer (does NOT reuse legacy `util.dlmi_hooks`). It
-performs genuine latent injection: it intercepts a tracker model's
-`_encode_new_memory(...)` and replaces the per-object `pred_masks_high_res`
-argument with our computed logit maps (see `dlmi_core`), forcing the sigmoid
-memory path (`is_mask_from_pts=False`). This drives the trained memory encoder
-directly with our latent field rather than substituting a standard mask prompt.
-
-Works for all three backends because the method signature is shared:
-  * HF      transformers `Sam3TrackerVideoModel._encode_new_memory`
-  * SAM3    official `Sam3TrackerBase._encode_new_memory`         (model.tracker)
-  * SAM3.1  official `VideoTrackingMultiplex._encode_new_memory`  (demo model)
-            - extra kw-only args (conditioning_objects, multiplex_state) ride
-              through untouched; when `multiplex=True` injected objects are added
-              to `conditioning_objects` so they encode as foreground.
-"""
+"""DLMI memory-encoder injection - fresh, self-contained implementation."""
 
 from __future__ import annotations
 
@@ -30,19 +14,41 @@ from . import dlmi_core
 logger = logging.getLogger("DLMI_SAM_LABELER.Backends.DLMIInject")
 
 
-def build_injection_queue(obj_ids: List[int], masks_by_oid: Dict[int, np.ndarray], *,
-                          intensity: float, mode: str, falloff: int,
-                          device) -> List[torch.Tensor]:
-    """Pre-compute one logit tensor per object id (in `obj_ids` order) on `device`.
+def collect_dlmi_settings(app) -> dict:
+    """Read all DLMI tk options into the kwargs for build_injection_queue; single source of truth for every injection call-site."""
+    def _get(name, default):
+        var = getattr(app, name, None)
+        if var is None:
+            return default
+        try:
+            return var.get()
+        except Exception:
+            return default
 
-    The queue order MUST match the model's per-object batch order (object
-    insertion order), since the hook consumes it positionally.
-    """
+    settings = {
+        "intensity": float(_get("dlmi_alpha_var", dlmi_core.DEFAULT_INTENSITY)),
+        "bg_confidence": (float(_get("dlmi_bg_conf_value_var", 0.0))
+                          if _get("dlmi_bg_conf_enabled_var", False) else None),
+        "boundary_soft": bool(_get("dlmi_boundary_soft_enabled_var", False)),
+        "boundary_soft_inside": bool(_get("dlmi_boundary_soft_inside_var", True)),
+        "boundary_soft_outside": bool(_get("dlmi_boundary_soft_outside_var", True)),
+        "boundary_gradient": bool(_get("dlmi_boundary_soft_gradient_var", False)),
+        "boundary_width_pct": float(_get("dlmi_boundary_soft_width_var", 1.0)),
+        # FINAL confidence (%) the user wants at the mask boundary; the logit conversion happens inside dlmi_core.
+        "boundary_conf_pct": float(_get("dlmi_boundary_soft_conf_var",
+                                        dlmi_core.DEFAULT_BOUNDARY_CONF_PCT)),
+    }
+    return settings
+
+
+def build_injection_queue(obj_ids: List[int], masks_by_oid: Dict[int, np.ndarray], *,
+                          intensity: float, device, **logit_kwargs) -> List[torch.Tensor]:
+    """Pre-compute one logit tensor per object id (in `obj_ids` order) on `device`."""
     queue: List[torch.Tensor] = []
     for oid in obj_ids:
         mask = masks_by_oid[oid]
-        logit_np = dlmi_core.compute_logit_map(mask, mode=mode, intensity=intensity,
-                                               falloff=falloff)
+        logit_np = dlmi_core.compute_logit_map(mask, intensity=intensity,
+                                               **logit_kwargs)
         queue.append(torch.from_numpy(logit_np).to(device))
     return queue
 
@@ -50,12 +56,7 @@ def build_injection_queue(obj_ids: List[int], masks_by_oid: Dict[int, np.ndarray
 def make_injection_hook(queue: List[torch.Tensor], original_encode, *,
                         multiplex: bool = False, log_prefix: str = "",
                         state: Optional[dict] = None):
-    """Return a closure replacing `<model>._encode_new_memory`.
-
-    Consumes `queue` positionally (one tensor per object in the current batch),
-    resizes each to the encoder's spatial size, concatenates, substitutes into
-    `kwargs['pred_masks_high_res']`, forces sigmoid path, then calls the original.
-    """
+    """Return a closure replacing `<model>._encode_new_memory`."""
     st = state if state is not None else {}
     st.setdefault("idx", 0)
 
@@ -105,9 +106,7 @@ def make_injection_hook(queue: List[torch.Tensor], original_encode, *,
                         f"vs {tuple(phr.shape)}: {e}")
             st["idx"] += n_obj
 
-            # Auto-detect the multiplex memory encoder (it receives a
-            # `multiplex_state` kwarg). Mark injected objects as conditioning so
-            # their injected memory encodes as foreground.
+            # Auto-detect the multiplex memory encoder (it receives a `multiplex_state` kwarg).
             if multiplex or ("multiplex_state" in kwargs):
                 injected_idxs = list(range(n_obj))
                 co = kwargs.get("conditioning_objects", None)
@@ -125,9 +124,7 @@ def make_injection_hook(queue: List[torch.Tensor], original_encode, *,
 
 def install_injection(model, queue: List[torch.Tensor], *, multiplex: bool = False,
                       log_prefix: str = "", state: Optional[dict] = None):
-    """Monkey-patch `model._encode_new_memory` with an injection hook.
-
-    Returns the original (bound) method; pass it to `restore_injection`."""
+    """Monkey-patch `model._encode_new_memory` with an injection hook."""
     original = model._encode_new_memory
     model._encode_new_memory = make_injection_hook(
         queue, original, multiplex=multiplex, log_prefix=log_prefix, state=state)
@@ -143,8 +140,7 @@ def restore_injection(model, original) -> None:
             logger.error(f"DLMI restore failed: {e}")
 
 
-# Drop-in alias matching the legacy util.dlmi_hooks API name (same principle),
-# so call-sites can `from util.backends import dlmi_inject as dlmi_hooks`.
+# Alias matching the legacy util.dlmi_hooks API name.
 create_injection_hook = make_injection_hook
 
 

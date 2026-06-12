@@ -1,16 +1,4 @@
-"""PCS (Prompted Class Segmentation) — SAM3 text-prompt and exemplar-box
-driven object detection + streaming tracking.
-
-Handles:
-  - Text-prompt session bootstrap (streaming + single-frame init)
-  - Text-prompt detection on frame 0 (`detect_objects_with_pcs`)
-  - Per-frame streaming tracking (`perform_pcs_streaming_tracking`)
-  - Exemplar-box detection (`execute_pcs_with_exemplars`)
-  - Single-image detection in PCS_IMAGE mode (`perform_pcs_single_image_detection`)
-  - Load-labels → PCS text prompt pipeline (`apply_loaded_labels_for_pcs`)
-
-Called by app.py wrappers and by `propagation_controller.propagate_pcs_*`.
-"""
+"""PCS (Prompted Class Segmentation) — SAM3 text-prompt and exemplar-box driven object detection + streaming tracking."""
 import logging
 
 import cv2
@@ -22,6 +10,36 @@ from tkinter import messagebox
 from .customutil import process_sam_mask
 
 logger = logging.getLogger("DLMI_SAM_LABELER.PCSController")
+
+# Global object-id stride per text phrase in multi-class PCS.
+PCS_MULTI_ID_STRIDE = 1000
+
+
+def split_text_prompts(text):
+    """'tomato, paprika' -> ['tomato', 'paprika']."""
+    if not text:
+        return []
+    return [p.strip() for p in str(text).split(",") if p.strip()]
+
+
+def _mask_logit_thr(app):
+    """User-adjustable binarisation threshold in logit space; 0.0 (=50%) when the app doesn't provide one."""
+    fn = getattr(app, '_mask_logit_threshold', None)
+    if fn is None:
+        return 0.0
+    try:
+        return float(fn())
+    except Exception:
+        return 0.0
+
+
+def _store_pcs_confidence_map(app, obj_id, conf_2d):
+    """Keep the raw (pre-threshold) PCS logit map so the Object-conf-threshold slider can re-binarise this object's mask live."""
+    if conf_2d is None or getattr(conf_2d, 'ndim', 0) != 2:
+        return
+    if not hasattr(app, 'current_confidence_masks'):
+        app.current_confidence_masks = {}
+    app.current_confidence_masks[obj_id] = conf_2d.astype(np.float32, copy=True)
 
 
 def init_pcs_streaming_session(app, text_prompt):
@@ -48,12 +66,64 @@ def init_pcs_streaming_session(app, text_prompt):
         return False
 
 
+def _ingest_pcs_frame_outputs(app, processed_outputs, display, labeling,
+                              id_offset=0, default_label=None):
+    """Merge one session's frame outputs into display/labeling dicts, remapping ids by id_offset."""
+    object_ids = processed_outputs.get("object_ids", [])
+    masks = processed_outputs.get("masks", [])
+    scores = processed_outputs.get("scores", [])
+    logit_thr = _mask_logit_thr(app)
+
+    for obj_id_tensor, mask, score in zip(object_ids, masks, scores):
+        local_id = int(obj_id_tensor.item()) if hasattr(obj_id_tensor, 'item') else int(obj_id_tensor)
+        obj_id = id_offset + local_id
+        if obj_id in app.suppressed_sam_ids:
+            logger.debug(f"PCS tracking: object {obj_id} deleted. Ignoring.")
+            continue
+
+        mask_2d = mask.float().cpu().numpy()
+        if mask_2d.ndim == 3:
+            mask_2d = mask_2d.squeeze()
+        _store_pcs_confidence_map(app, obj_id, mask_2d)
+        mask_2d = (mask_2d > logit_thr).astype(np.float32)
+
+        display[obj_id] = mask_2d
+
+        if obj_id in app.tracked_objects:
+            app.tracked_objects[obj_id]["last_mask"] = mask_2d
+            labeling[obj_id] = {
+                'last_mask': mask_2d.copy(),
+                'custom_label': app.tracked_objects[obj_id].get('custom_label', ''),
+                'points_for_reprompt': list(app.tracked_objects[obj_id].get('points_for_reprompt', [])),
+                'initial_bbox_prompt': app.tracked_objects[obj_id].get('initial_bbox_prompt'),
+            }
+        else:
+            obj_data = {
+                "last_mask": mask_2d,
+                "custom_label": default_label if default_label is not None
+                                else app.default_object_label_var.get(),
+                "points_for_reprompt": [],
+                "initial_bbox_prompt": None,
+            }
+            app.tracked_objects[obj_id] = obj_data
+            labeling[obj_id] = {
+                'last_mask': mask_2d.copy(),
+                'custom_label': obj_data.get('custom_label', ''),
+                'points_for_reprompt': list(obj_data.get('points_for_reprompt', [])),
+                'initial_bbox_prompt': obj_data.get('initial_bbox_prompt'),
+            }
+            if obj_id not in app.object_colors:
+                app._get_object_color(obj_id)
+
+
 def perform_pcs_streaming_tracking(app, frame_bgr, frame_num):
     logger.debug(f"PCS streaming tracking start. frame: {frame_num}")
     current_sam_masks_for_display = {}
     current_sam_masks_for_labeling = {}
 
-    if app.pcs_model is None or app.pcs_streaming_session is None:
+    multi_sessions = getattr(app, 'pcs_multi_streaming', None)
+
+    if app.pcs_model is None or (app.pcs_streaming_session is None and not multi_sessions):
         logger.debug(f"Frame {frame_num}: PCS streaming session not ready.")
         return current_sam_masks_for_display, current_sam_masks_for_labeling
 
@@ -63,62 +133,42 @@ def perform_pcs_streaming_tracking(app, frame_bgr, frame_num):
 
         inputs = app.pcs_processor(images=frame_pil, device=app.device, return_tensors="pt")
 
-        with torch.inference_mode():
-            model_outputs = app.pcs_model(
-                inference_session=app.pcs_streaming_session,
-                frame=inputs.pixel_values[0],
-                reverse=False,
+        if multi_sessions:
+            # Multi-class: one streaming session per text phrase; outputs are merged with per-phrase id offsets and per-phrase labels.
+            for entry in multi_sessions:
+                with torch.inference_mode():
+                    model_outputs = app.pcs_model(
+                        inference_session=entry['session'],
+                        frame=inputs.pixel_values[0],
+                        reverse=False,
+                    )
+                processed_outputs = app.pcs_processor.postprocess_outputs(
+                    entry['session'],
+                    model_outputs,
+                    original_sizes=inputs.original_sizes,
+                )
+                _ingest_pcs_frame_outputs(
+                    app, processed_outputs,
+                    current_sam_masks_for_display, current_sam_masks_for_labeling,
+                    id_offset=entry['offset'], default_label=entry['text'],
+                )
+        else:
+            with torch.inference_mode():
+                model_outputs = app.pcs_model(
+                    inference_session=app.pcs_streaming_session,
+                    frame=inputs.pixel_values[0],
+                    reverse=False,
+                )
+
+            processed_outputs = app.pcs_processor.postprocess_outputs(
+                app.pcs_streaming_session,
+                model_outputs,
+                original_sizes=inputs.original_sizes,
             )
-
-        processed_outputs = app.pcs_processor.postprocess_outputs(
-            app.pcs_streaming_session,
-            model_outputs,
-            original_sizes=inputs.original_sizes,
-        )
-
-        object_ids = processed_outputs.get("object_ids", [])
-        masks = processed_outputs.get("masks", [])
-        scores = processed_outputs.get("scores", [])
-
-        target_h, target_w = frame_bgr.shape[:2]
-
-        for obj_id_tensor, mask, score in zip(object_ids, masks, scores):
-            obj_id = int(obj_id_tensor.item()) if hasattr(obj_id_tensor, 'item') else int(obj_id_tensor)
-            if obj_id in app.suppressed_sam_ids:
-                logger.debug(f"PCS tracking: object {obj_id} deleted. Ignoring.")
-                continue
-
-            mask_2d = mask.float().cpu().numpy()
-            if mask_2d.ndim == 3:
-                mask_2d = mask_2d.squeeze()
-            mask_2d = (mask_2d > 0.0).astype(np.float32)
-
-            current_sam_masks_for_display[obj_id] = mask_2d
-
-            if obj_id in app.tracked_objects:
-                app.tracked_objects[obj_id]["last_mask"] = mask_2d
-                current_sam_masks_for_labeling[obj_id] = {
-                    'last_mask': mask_2d.copy(),
-                    'custom_label': app.tracked_objects[obj_id].get('custom_label', ''),
-                    'points_for_reprompt': list(app.tracked_objects[obj_id].get('points_for_reprompt', [])),
-                    'initial_bbox_prompt': app.tracked_objects[obj_id].get('initial_bbox_prompt'),
-                }
-            else:
-                obj_data = {
-                    "last_mask": mask_2d,
-                    "custom_label": app.default_object_label_var.get(),
-                    "points_for_reprompt": [],
-                    "initial_bbox_prompt": None,
-                }
-                app.tracked_objects[obj_id] = obj_data
-                current_sam_masks_for_labeling[obj_id] = {
-                    'last_mask': mask_2d.copy(),
-                    'custom_label': obj_data.get('custom_label', ''),
-                    'points_for_reprompt': list(obj_data.get('points_for_reprompt', [])),
-                    'initial_bbox_prompt': obj_data.get('initial_bbox_prompt'),
-                }
-                if obj_id not in app.object_colors:
-                    app._get_object_color(obj_id)
+            _ingest_pcs_frame_outputs(
+                app, processed_outputs,
+                current_sam_masks_for_display, current_sam_masks_for_labeling,
+            )
 
         logger.debug(f"PCS streaming tracking complete. frame: {frame_num}, "
                      f"objects: {len(current_sam_masks_for_display)}")
@@ -157,10 +207,124 @@ def init_pcs_session_with_single_frame(app):
         return False
 
 
+def init_pcs_multi_streaming_sessions(app, phrases):
+    """Create one streaming session per text phrase for multi-class tracking."""
+    app.pcs_multi_streaming = []
+    if app.pcs_model is None or app.pcs_processor is None:
+        logger.error("PCS model not initialized.")
+        return False
+    ok_all = True
+    for pi, phrase in enumerate(phrases):
+        try:
+            sess = app.pcs_processor.init_video_session(
+                inference_device=app.device,
+                processing_device="cpu",
+                video_storage_device="cpu",
+                dtype=torch.float32,
+            )
+            sess = app.pcs_processor.add_text_prompt(
+                inference_session=sess,
+                text=phrase,
+            )
+            app.pcs_multi_streaming.append({
+                'text': phrase,
+                'session': sess,
+                'offset': pi * PCS_MULTI_ID_STRIDE,
+            })
+            logger.info(f"PCS multi streaming session ready: '{phrase}' "
+                        f"(id offset {pi * PCS_MULTI_ID_STRIDE})")
+        except Exception as e:
+            logger.exception(f"PCS multi streaming session init failed for '{phrase}': {e}")
+            ok_all = False
+    return bool(app.pcs_multi_streaming) and ok_all
+
+
+def detect_objects_with_pcs_multi(app, phrases, frame_idx=0):
+    """Multi-class PCS: one detection session per phrase, merged with per-phrase id offsets/labels, then one streaming session each."""
+    if app.pcs_model is None or app.pcs_processor is None:
+        logger.error("PCS model not initialized.")
+        return False
+
+    app.pcs_multi_streaming = []
+    detected_objects = {}
+
+    for pi, phrase in enumerate(phrases):
+        offset = pi * PCS_MULTI_ID_STRIDE
+        if not init_pcs_session_with_single_frame(app):
+            logger.error(f"PCS multi: session init failed for '{phrase}'.")
+            continue
+        try:
+            app.pcs_inference_session = app.pcs_processor.add_text_prompt(
+                inference_session=app.pcs_inference_session,
+                text=phrase,
+            )
+            logger.info(f"PCS multi text prompt added: '{phrase}'")
+
+            with torch.inference_mode():
+                for model_outputs in app.pcs_model.propagate_in_video_iterator(
+                    inference_session=app.pcs_inference_session,
+                    start_frame_idx=frame_idx,
+                    max_frame_num_to_track=1,
+                ):
+                    processed_outputs = app.pcs_processor.postprocess_outputs(
+                        app.pcs_inference_session, model_outputs,
+                    )
+                    if model_outputs.frame_idx != frame_idx:
+                        continue
+                    object_ids = processed_outputs["object_ids"]
+                    masks = processed_outputs["masks"]
+                    scores = processed_outputs["scores"]
+                    logger.info(f"PCS multi detection: '{phrase}' - {len(object_ids)} objects")
+
+                    for obj_id_tensor, mask, score in zip(object_ids, masks, scores):
+                        local_id = int(obj_id_tensor.item())
+                        obj_id = offset + local_id
+                        mask_2d = mask.float().cpu().numpy()
+                        if mask_2d.ndim == 3:
+                            mask_2d = mask_2d.squeeze()
+                        _store_pcs_confidence_map(app, obj_id, mask_2d)
+                        mask_2d = (mask_2d > _mask_logit_thr(app)).astype(np.float32)
+                        score_val = float(score.item()) if hasattr(score, 'item') else float(score)
+
+                        app.tracked_objects[obj_id] = {
+                            "last_mask": mask_2d,
+                            "custom_label": phrase,
+                            "points_for_reprompt": [],
+                            "initial_bbox_prompt": None,
+                            "pcs_score": score_val,
+                        }
+                        if obj_id not in app.object_colors:
+                            app._get_object_color(obj_id)
+                        detected_objects[obj_id] = mask_2d
+                        logger.info(f"PCS multi object {obj_id} ('{phrase}') added "
+                                    f"(confidence: {score_val:.3f})")
+        except Exception as e:
+            logger.exception(f"PCS multi detection error for '{phrase}': {e}")
+
+    if not detected_objects:
+        logger.warning(f"PCS multi: No objects found for {phrases}.")
+        return False
+
+    app.next_obj_id_to_propose = max(detected_objects.keys()) + 1
+    app._update_obj_id_info_label()
+    if not init_pcs_multi_streaming_sessions(app, phrases):
+        logger.warning("PCS multi streaming session init incomplete. Tracking may be limited.")
+    else:
+        logger.info(f"PCS multi detection complete. {len(detected_objects)} objects "
+                    f"across {len(phrases)} classes. Streaming tracking ready.")
+    return True
+
+
 def detect_objects_with_pcs(app, text_prompt, frame_idx=0):
     if app.pcs_model is None or app.pcs_processor is None:
         logger.error("PCS model not initialized.")
         return False
+
+    # Comma-separated prompt = multi-class detection (one phrase per class).
+    phrases = split_text_prompts(text_prompt)
+    if len(phrases) >= 2:
+        return detect_objects_with_pcs_multi(app, phrases, frame_idx=frame_idx)
+    app.pcs_multi_streaming = []
 
     if not init_pcs_session_with_single_frame(app):
         return False
@@ -197,7 +361,8 @@ def detect_objects_with_pcs(app, text_prompt, frame_idx=0):
                             mask_2d = mask.float().cpu().numpy()
                             if mask_2d.ndim == 3:
                                 mask_2d = mask_2d.squeeze()
-                            mask_2d = (mask_2d > 0.0).astype(np.float32)
+                            _store_pcs_confidence_map(app, obj_id, mask_2d)
+                            mask_2d = (mask_2d > _mask_logit_thr(app)).astype(np.float32)
                             score_val = float(score.item()) if hasattr(score, 'item') else float(score)
 
                             app.tracked_objects[obj_id] = {
@@ -326,17 +491,26 @@ def perform_pcs_single_image_detection(app, frame_bgr, text_prompt, frame_idx):
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     frame_pil = Image.fromarray(frame_rgb)
 
-    det = app.backend.image_detect(
-        frame_pil, text=text_prompt,
-        threshold=app.pcs_detection_threshold_var.get(),
-        mask_threshold=app.pcs_mask_threshold_var.get(),
-    )
+    # Comma-separated prompt = detect each phrase independently and merge.
+    phrases = split_text_prompts(text_prompt)
+    is_multi = len(phrases) >= 2
+    if not phrases:
+        phrases = [text_prompt]
 
     masks_for_display = {}
     masks_for_labeling = {}
+    next_obj_id = 1
 
-    if det.masks:
-        for obj_idx, mask_np0 in enumerate(det.masks):
+    for phrase in phrases:
+        det = app.backend.image_detect(
+            frame_pil, text=phrase,
+            threshold=app.pcs_detection_threshold_var.get(),
+            mask_threshold=app.pcs_mask_threshold_var.get(),
+        )
+
+        if not det.masks:
+            continue
+        for mask_np0 in det.masks:
             mask_np = np.squeeze(np.asarray(mask_np0)).astype(np.uint8)
 
             pil_size = (frame_bgr.shape[1], frame_bgr.shape[0])
@@ -347,11 +521,13 @@ def perform_pcs_single_image_detection(app, frame_bgr, text_prompt, frame_idx):
             )
 
             if proc_mask is not None and proc_mask.any():
-                obj_id = obj_idx + 1
+                obj_id = next_obj_id
+                next_obj_id += 1
                 masks_for_display[obj_id] = proc_mask
                 masks_for_labeling[obj_id] = {
                     'last_mask': proc_mask,
-                    'custom_label': app.default_object_label_var.get()
+                    # Multi-class: each detection carries its own phrase as label; single prompt keeps the legacy default label.
+                    'custom_label': phrase if is_multi else app.default_object_label_var.get()
                 }
                 if obj_id not in app.object_colors:
                     app._get_object_color(obj_id)

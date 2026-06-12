@@ -1,18 +1,4 @@
-"""Pose estimation UI utilities for the SAM3 autolabel app.
-
-Provides:
-  - default COCO-17 pose schema
-  - pose_config.json load/save
-  - open_pose_settings_dialog: Toplevel to edit models, run mode, per-class schema
-  - hit_test_pose_point / draw_pose_overlay: canvas helpers consumed by
-    gui_view / input_handlers when pose points are rendered or selected.
-
-tracked_objects[obj_id] is extended with three OPTIONAL fields:
-  - "pose_points": List[{"x": int, "y": int, "visibility": int, "kpt_idx": int}]
-  - "pose_edges":  List[[int, int]]
-  - "pose_class":  str  (key into pose_config["schema"])
-All access uses .get(...) so existing objects without these fields keep working.
-"""
+"""Pose estimation UI utilities for the SAM3 autolabel app."""
 import os
 import json
 import logging
@@ -314,10 +300,7 @@ def draw_pose_overlay_on_image(pil_draw, app, obj_id_color_pair_iter, selected_p
 
 
 def render_pose_on_canvas(canvas, app, selected_pose_set=None):
-    """Draw pose points and edges on the tkinter canvas using create_* items.
-    Selected points are highlighted with a bright bold marker that stands out
-    from the object color: larger radius, yellow fill, thick white outline, and
-    a red crosshair, so selection is unambiguous."""
+    """Draw pose points and edges on the tkinter canvas using create_* items."""
     try:
         canvas.delete("pose_overlay")
     except tk.TclError:
@@ -377,9 +360,7 @@ def render_pose_on_canvas(canvas, app, selected_pose_set=None):
 
 
 def hit_test_pose_point(app, img_x, img_y, radius=None):
-    """Return (obj_id, kpt_idx) of the pose point nearest to (img_x, img_y).
-    When `radius` is None, computes a zoom-aware image-space radius so the
-    on-screen hit tolerance stays around ~22 canvas pixels regardless of zoom."""
+    """Return (obj_id, kpt_idx) of the pose point nearest to (img_x, img_y)."""
     if radius is None:
         sx = getattr(app, 'scale_x', 1.0) or 1.0
         sy = getattr(app, 'scale_y', 1.0) or 1.0

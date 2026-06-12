@@ -1,15 +1,4 @@
-"""Pose business logic: per-object pose mutations, auto-match class assignment,
-TAPNext++/YOLO pose integration, tracker lifecycle, and TAPNext checkpoint
-auto-download.
-
-This module is the "controller" layer for everything pose. The `pose_ui` module
-owns UI widgets (settings dialog, canvas rendering, hit-test) and
-`pose_tracker` owns the model wrappers. `pose_controller` glues them together
-into app-level operations that the main `SAM3AutolabelApp` exposes via thin
-method wrappers.
-
-All public functions take `app` (the app instance) as the first parameter.
-"""
+"""Pose business logic: pose mutations, auto-match, TAPNext++/YOLO integration, tracker lifecycle, checkpoint auto-download."""
 import os
 import logging
 import tkinter as tk
@@ -27,20 +16,7 @@ TAPNEXTPP_DEFAULT_URL = "https://storage.googleapis.com/dm-tapnet/tapnextpp/tapn
 
 
 def _track_bidirectional(tracker, frames_rgb, query_entries):
-    """Run TAPNext-style tracking with per-query anchor frames, producing
-    tracks in BOTH time directions (forward AND backward from each anchor).
-
-    TAPNext++ is trained as next-token prediction so a single forward pass
-    only tracks from a query's anchor-frame towards the end of the clip;
-    earlier frames would be filled with the anchor coordinate. To get proper
-    bidirectional coverage we run the tracker twice per unique anchor t:
-      - Forward  on frames[t:]   with the query at t=0 of that slice
-      - Backward on reversed(frames[:t+1]) with the query at t=0 of that slice
-    Results are merged into a single [T, N, 2] track array.
-
-    Query entries are expected as (oid, kpt_idx, t_anchor, x, y). The function
-    is agnostic to oid/kpt_idx — it only uses t_anchor + (x, y).
-    """
+    """Run TAPNext-style tracking with per-query anchors, producing tracks in both time directions from each anchor."""
     T = len(frames_rgb)
     N = len(query_entries)
     if N == 0:
@@ -49,8 +25,7 @@ def _track_bidirectional(tracker, frames_rgb, query_entries):
     tracks = np.zeros((T, N, 2), dtype=np.float32)
     vis = np.zeros((T, N), dtype=np.bool_)
 
-    # Initialise with anchor coords so any frames never written by either
-    # pass still have a sensible (static) position instead of zero.
+    # Initialise with anchor coords so any frames never written by either pass still have a sensible (static) position instead of zero.
     for qi, (_oid, _k, t_anchor, x, y) in enumerate(query_entries):
         tracks[:, qi] = [float(x), float(y)]
 
@@ -78,9 +53,7 @@ def _track_bidirectional(tracker, frames_rgb, query_entries):
                             f"frames[{t_anchor}:{T}]={len(fwd_frames)} frames, "
                             f"queries={len(qlist)}")
                 tr_fwd, vis_fwd = tracker.track(fwd_frames, q_fwd)
-                # tr_fwd has shape [len(fwd_frames), len(qlist), 2]
-                # Debug: log a representative query's track across frames so we
-                # can tell if the model output actually moves or stays static.
+                # tr_fwd: [n_frames, n_queries, 2]; log one query's track to verify the output actually moves.
                 if len(qlist) > 0 and tr_fwd.shape[0] >= 2:
                     sample_qi = 0
                     first_pos = tr_fwd[0, sample_qi]
@@ -188,8 +161,7 @@ def update_pose_class_display(app):
 
 
 def on_pose_class_selected(app):
-    """Apply the chosen class to the currently-selected object. Also updates
-    pose_edges to the schema default if they were empty."""
+    """Apply the chosen class to the currently-selected object."""
     if getattr(app, '_suppress_pose_class_trace', False):
         return
     if not app.view:
@@ -217,9 +189,7 @@ def on_pose_class_selected(app):
 # ---- Pose point CRUD -------------------------------------------------------
 
 def add_pose_point_at(app, img_x, img_y):
-    """Add a pose keypoint at image coords to the currently selected
-    tracked_object. If no object is selected, create a new pose-only object.
-    If Chain mode is ON and a previous point exists, auto-connect."""
+    """Add a pose keypoint at image coords to the currently selected tracked_object."""
     target_oid = app.selected_object_sam_id
     if target_oid is None or target_oid not in app.tracked_objects:
         target_oid = app.next_obj_id_to_propose
@@ -242,12 +212,7 @@ def add_pose_point_at(app, img_x, img_y):
     obj.setdefault('pose_class', default_pose_class_name(app))
 
     new_kpt_idx = len(obj['pose_points'])
-    # `cur_slider` is the frame the user is VISUALLY looking at right now
-    # (relative to current propagation session). We anchor the pose to that
-    # frame unconditionally — whether app_state is REVIEWING (post-propagate
-    # review), IDLE (before propagate), or anything else. Storing frame_idx=0
-    # regardless of actual view frame was the root cause of "labelled at
-    # frame 0 but user was at frame N" bug.
+    # `cur_slider` is the frame the user is VISUALLY looking at right now (relative to current propagation session).
     cur_slider = int(getattr(app, 'review_current_frame', 0) or 0)
     in_propagated = cur_slider in app.propagated_results
     new_point = {
@@ -263,8 +228,7 @@ def add_pose_point_at(app, img_x, img_y):
         if edge not in obj['pose_edges']:
             obj['pose_edges'].append(edge)
 
-    # Mirror into per-frame propagated_results so TAPNext can pick it up as a
-    # query at this specific frame (mid-video prompt).
+    # Mirror into per-frame propagated_results so TAPNext can pick it up as a query at this specific frame (mid-video prompt).
     if in_propagated:
         frame_slot = app.propagated_results[cur_slider].setdefault('masks', {}).setdefault(target_oid, {})
         frame_pts = frame_slot.setdefault('pose_points', [])
@@ -289,8 +253,7 @@ def add_pose_point_at(app, img_x, img_y):
 
 
 def new_pose_object(app):
-    """Create a new empty pose-only tracked_object and make it the current
-    target for subsequent Add Pose clicks."""
+    """Create a new empty pose-only tracked_object and make it the current target for subsequent Add Pose clicks."""
     new_oid = app.next_obj_id_to_propose
     app.next_obj_id_to_propose += 1
     label_base = (app.default_object_label_var.get() or "Pose").strip() or "Pose"
@@ -382,8 +345,7 @@ def delete_selected_object_pose(app):
 
 
 def select_pose_chain_at(app, img_x, img_y):
-    """Shift+right-click handler: BFS the connected component of the pose
-    point nearest (img_x, img_y) and select all reachable keypoints."""
+    """Shift+right-click: select the whole connected pose component nearest the click."""
     if app._pose_ui is None:
         return
     hit = app._pose_ui.hit_test_pose_point(app, img_x, img_y)
@@ -416,8 +378,7 @@ def select_pose_chain_at(app, img_x, img_y):
 
 
 def toggle_selected_pose_visibility(app):
-    """Cycle visibility of every selected pose point between 2 (visible) and
-    1 (occluded). v=0 (not labeled) is reserved; use delete instead."""
+    """Cycle visibility of every selected pose point between 2 (visible) and 1 (occluded)."""
     if not app.selected_pose_points:
         return
     changed = 0
@@ -542,10 +503,7 @@ def delete_selected_pose_points(app):
 # ---- Seeds snapshot (pre-propagation) --------------------------------------
 
 def snapshot_pose_queries_and_hide(app):
-    """Capture the current per-object pose_points/pose_edges as the initial
-    TAPNext++ query seeds, then remove them from `tracked_objects` so they
-    are not rendered during SAM3 propagation. They are restored frame-by-frame
-    after TAPNext post-process populates `propagated_results`."""
+    """Capture pose points/edges as TAPNext++ seeds and hide them during SAM3 propagation; restored after post-process."""
     seeds = {}
     for oid, obj in list(app.tracked_objects.items()):
         pts = obj.get('pose_points')
@@ -569,8 +527,7 @@ def snapshot_pose_queries_and_hide(app):
 # ---- Auto-match ------------------------------------------------------------
 
 def automatch_classify_pose_object(app, oid, force=False):
-    """Assign a pose_class to object `oid` by matching against
-    pose_config.schema. Runs exactly once per object unless force=True."""
+    """Assign a pose_class to object `oid` by matching against pose_config.schema."""
     obj = app.tracked_objects.get(oid)
     if not obj:
         return False
@@ -654,8 +611,7 @@ def automatch_classify_pose_object(app, oid, force=False):
 
 
 def automatch_all_new_pose_objects(app):
-    """Walk tracked_objects and classify any pose-bearing object that has not
-    yet been auto-matched. Called when the user exits Add Pose mode."""
+    """Walk tracked_objects and classify any pose-bearing object that has not yet been auto-matched."""
     if not getattr(app, 'pose_automatch_var', None) or not app.pose_automatch_var.get():
         return 0
     schema = (app.pose_config or {}).get('schema') or {}
@@ -673,9 +629,7 @@ def automatch_all_new_pose_objects(app):
 
 
 def try_automatch_pose_to_segments(app, min_ratio=0.7):
-    """When `pose_automatch_var` is ON, merge pose-only objects into segment
-    objects when ≥min_ratio of their visible points fall inside the segment
-    mask. Returns the number of merges."""
+    """Auto-match: merge pose-only objects into segments when >=min_ratio of visible points fall inside the mask; returns merge count."""
     if not getattr(app, 'pose_automatch_var', None) or not app.pose_automatch_var.get():
         return 0
     pose_only_oids = []
@@ -758,9 +712,7 @@ def default_pose_models_dir(app):
 
 
 def ensure_tapnext_ckpt(app, interactive=True):
-    """Resolve a usable TAPNext++ checkpoint path. If the config path is empty
-    or missing, download the default checkpoint into util/pose_models/
-    and persist the path to pose_config.json."""
+    """Resolve a usable TAPNext++ checkpoint path."""
     cfg = app.pose_config or {}
     ckpt = (cfg.get("tapnext_ckpt") or "").strip()
     if ckpt and os.path.exists(ckpt):
@@ -986,9 +938,7 @@ def run_yolo_pose_detect(app):
 
 
 def run_tapnext_post_process(app):
-    """Propagate pose_points across all propagated_results frames using
-    TAPNext++. Uses `app._pose_query_seeds` (captured at propagation start) if
-    present, else reads live pose_points from tracked_objects as query seeds."""
+    """Propagate pose_points across all propagated_results frames using TAPNext++."""
     if not app.propagated_results:
         messagebox.showwarning("Info", "No propagated frames to process. Run 'Start Propagate' first.", parent=app.root)
         return
@@ -1003,19 +953,14 @@ def run_tapnext_post_process(app):
     frame_to_t = {fi: ti for ti, fi in enumerate(frame_idx_sorted)}
 
     query_entries = []  # (oid, kpt_idx, t_rel, x, y)
-    # `seen_pose_key` is per-point: a user-labelled pose at (oid, kpt_idx)
-    # exists EXACTLY ONCE in the query list. We look at mid-frame prompts
-    # FIRST (since they are the user's most-recent input; a scrolled-to-N
-    # click at the same point wins over the original frame-0 seed). Only
-    # pose keys not covered by a mid-frame prompt fall back to the seed.
+    # `seen_pose_key` is per-point: a user-labelled pose at (oid, kpt_idx) exists EXACTLY ONCE in the query list.
     seen_pose_key = set()  # (oid, kpt_idx) that already have a query
     user_vis_map = {}
     edge_map = {}
     label_map = {}
     class_map = {}
 
-    # 1) Mid-frame user prompts first — any (oid, kpt_idx) anchored at a
-    #    non-zero frame wins over the stale seed at frame 0.
+    # 1) Mid-frame user prompts first — any (oid, kpt_idx) anchored at a non-zero frame wins over the stale seed at frame 0.
     mid_frame_count = 0
     for fi in frame_idx_sorted:
         frame_data = app.propagated_results[fi].get('masks', {})
@@ -1042,11 +987,7 @@ def run_tapnext_post_process(app):
             if obj_data.get('custom_label'):
                 label_map.setdefault(int(oid), obj_data['custom_label'])
 
-    # 2) Pre-propagate seeds for any pose keys not already covered. Each seed
-    #    point carries its own `frame_idx` (set by add_pose_point_at from the
-    #    user's current slider frame at click time); use that as the TAPNext
-    #    anchor so mid-video seeds anchor correctly. Fall back to 0 if missing
-    #    or out-of-range.
+    # 2) Pre-propagate seeds for any pose keys not already covered.
     T_max = max(frame_idx_sorted) if frame_idx_sorted else 0
     seeds = getattr(app, '_pose_query_seeds', None)
     if seeds:
@@ -1077,8 +1018,7 @@ def run_tapnext_post_process(app):
             + ", ".join(f"({q[0]},{q[1]},{q[2]},{q[3]:.0f},{q[4]:.0f})" for q in query_entries)
         )
 
-    # 3) Fallback: live tracked_objects (legacy behaviour) anchored at the
-    #    currently viewed slider frame.
+    # 3) Fallback: live tracked_objects (legacy behaviour) anchored at the currently viewed slider frame.
     if not query_entries:
         for oid, obj in app.tracked_objects.items():
             pts = obj.get('pose_points')

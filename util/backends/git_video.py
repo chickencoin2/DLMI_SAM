@@ -1,17 +1,4 @@
-"""HF-API-compatible wrappers around the official sam3 low-level video tracker.
-
-These mimic the small slice of the HuggingFace `Sam3TrackerVideoProcessor` /
-`Sam3TrackerVideoModel` / inference-session API that the app's PVS call-sites use
-(sam_interaction.py, app._perform_sam_tracking_for_frame, propagation_controller),
-so GitBackend can set `app.tracker_processor` / `app.tracker_model` to these and
-the existing streaming call-sites work unchanged.
-
-Streaming is reproduced via official single-frame stepping:
-  * prompt frame  -> tracker.add_new_points_or_box / add_new_mask (returns mask)
-  * tracking frame-> propagate_in_video_preflight (once) then _run_single_frame_inference
-The official model uses normalised [0,1] point/box coords (rel_coordinates=True);
-the app supplies pixel coords, so we normalise by the original (H, W).
-"""
+"""HF-API-compatible wrappers around the official sam3 low-level video tracker."""
 
 from __future__ import annotations
 
@@ -70,10 +57,7 @@ class GitTrackerSession:
         self._total_frames = int(total_frames) if total_frames else 100000
         self._preflight_done = False
         self._last_pred = None              # last video-res pred_masks [N,1,H,W]
-        # Accumulated per-object prompts (insertion-ordered) + the cached conditioning
-        # frame features, used to REBUILD the multiplex (SAM3.1) state on each prompt
-        # so that re-prompting an existing object works (its per-object refine path is
-        # broken — mux asserts num_valid_entries==total). SAM3 uses incremental adds.
+        # Accumulated per-object prompts + cached cond-frame features, used to rebuild the multiplex (3.1) state on each prompt (its refine path is broken).
         self._obj_prompts = OrderedDict()
         self._frame0_feat = None            # (img, backbone_out) for the cond frame
         self._frame0_idx = 0
@@ -94,8 +78,7 @@ class GitTrackerSession:
 
     @property
     def processed_frames(self):
-        """HF-session compat: code reads len(session.processed_frames) as the
-        next streaming frame index."""
+        """HF-session compat: code reads len(session.processed_frames) as the next streaming frame index."""
         return list(range(self.num_frames))
 
 
@@ -127,8 +110,7 @@ class GitTrackerProcessor:
         if total is None:
             total = self.backend._num_frames_hint()
         sess = GitTrackerSession(self.backend._tracker, self.backend._device_str, total)
-        # Capture the compute precision now so this whole session stays consistent
-        # even if the user toggles the fp32 option mid-track.
+        # Capture the compute precision now so this whole session stays consistent even if the user toggles the fp32 option mid-track.
         sess._fp32 = self.backend._fp32_mode()
         return sess
 
@@ -140,10 +122,7 @@ class GitTrackerProcessor:
         if original_size is not None:
             os_ = list(original_size)
             sess.video_height, sess.video_width = int(os_[0]), int(os_[1])
-        # obj_ids may be a single id (point/box prompt) or a LIST with a matching
-        # list of input_masks (the batch mask prompt used by DLMI injection and
-        # polygon multi-object). Expand a batch into one pending entry per object so
-        # every object is actually registered (not just the first).
+        # Expand a batched mask prompt into one pending entry per object so every object gets registered.
         oid_list = [int(o) for o in obj_ids] if isinstance(obj_ids, (list, tuple)) \
             else [int(obj_ids)]
         entries = []
@@ -162,10 +141,7 @@ class GitTrackerProcessor:
                 "boxes": input_boxes, "masks": input_masks})
         for e in entries:
             sess._pending.append(e)
-            # Accumulate the latest prompt per object (insertion-ordered) so the
-            # multiplex path can rebuild the full conditioning frame. The app already
-            # sends the full accumulated point list on re-prompts, so REPLACE rather
-            # than append; a new prompt kind supersedes the previous one.
+            # Accumulate the latest prompt per object (insertion-ordered) so the multiplex path can rebuild the full conditioning frame.
             oid = e["obj_id"]
             acc = sess._obj_prompts.get(oid)
             if acc is None:
@@ -214,11 +190,7 @@ class GitTrackerModel:
 
     @_encode_new_memory.setter
     def _encode_new_memory(self, fn):
-        # Track whether a DLMI injection hook (vs the original method) is currently
-        # active, so the prompt-frame path knows to run the memory encoder WITH the
-        # injection (matching HF). Bound methods create a new object on every access
-        # and so cannot be compared with `is`; instead compare the assigned callable's
-        # underlying function against the tracker class's own _encode_new_memory.
+        # Track whether a DLMI hook is active; bound methods can't be compared with `is`, so compare __func__ against the class method.
         tracker = self.backend._tracker
         try:
             orig_func = type(tracker)._encode_new_memory
@@ -239,21 +211,16 @@ class GitTrackerModel:
         return sess._state
 
     def _compute_frame_features(self, frame_tensor):
-        """Run the backbone on one frame -> (img, backbone_out), reusable across
-        multiplex state rebuilds (no need to re-run the backbone per re-prompt)."""
+        """Run the backbone on one frame -> (img, backbone_out), reusable across multiplex state rebuilds."""
         tracker = self.backend._tracker
         img = frame_tensor
         if img.dim() == 3:
             img = img.unsqueeze(0)
         img = img.float().to(self.backend._device_str)
-        # NOTE: the whole forward (incl. this backbone call) runs inside the backend's
-        # autocast context (see GitTrackerModel.__call__) so weights/activations share
-        # one compute dtype; no per-op autocast needed here.
+        # The whole forward already runs inside the backend autocast context (see __call__), so no per-op autocast here.
         if self.backend._is_multiplex:
             from sam3.model.data_misc import NestedTensor
-            # Tracking/prompts only need the SAM2-style propagation + interactive
-            # features; need_sam3_out (detection) adds a non-fpn key that breaks
-            # the demo's feature-clone loop.
+            # Only propagation+interactive features are needed; need_sam3_out breaks the demo's feature-clone loop.
             backbone_out = tracker.forward_image(
                 NestedTensor(tensors=img, mask=None),
                 need_sam3_out=False, need_interactive_out=True,
@@ -267,11 +234,7 @@ class GitTrackerModel:
 
     @torch.inference_mode()
     def __call__(self, inference_session, frame=None, frame_idx=None):
-        # Run the entire forward at ONE consistent compute dtype (bf16 default / fp32
-        # option). The official package is bf16-native (it wraps inference in an
-        # autocast(bf16) context); mixing fp32 weights with that bf16 autocast in only
-        # some call paths is what produced the "BFloat16 vs Float" crashes. Wrapping
-        # here makes every git/3.1 path self-consistent regardless of the app context.
+        # Run the entire forward at ONE consistent compute dtype (bf16 default / fp32 option).
         with self.backend._autocast_ctx(getattr(inference_session, "_fp32", None)):
             return self._run(inference_session, frame, frame_idx)
 
@@ -283,9 +246,7 @@ class GitTrackerModel:
         if sess._pending:
             # ---- prompt frame: apply queued prompts, return their masks ----
             if self.backend._is_multiplex:
-                # SAM3.1 multiplex: rebuild the whole conditioning frame from the
-                # accumulated per-object prompts (re-prompting an existing object via
-                # the demo's refine path is broken). SAM3 stays on the incremental path.
+                # SAM3.1 multiplex: rebuild the conditioning frame from accumulated prompts (refine path is broken); SAM3 stays incremental.
                 return self._multiplex_prompt(sess, frame)
             fidx = sess._pending[0]["frame_idx"]
             if frame is not None:
@@ -306,8 +267,7 @@ class GitTrackerModel:
                 else:
                     pts, lbls, box = self._extract_points_box(p, W, H)
                     if mux:
-                        # multiplex demo has add_new_points (no box arg); convert a
-                        # box to its centre point (the app already does this upstream).
+                        # multiplex demo has add_new_points (no box arg); convert a box to its centre point (the app already does this upstream).
                         if pts is None and box is not None:
                             cx = float((box[0] + box[2]) / 2.0)
                             cy = float((box[1] + box[3]) / 2.0)
@@ -325,9 +285,7 @@ class GitTrackerModel:
             sess.num_frames = max(sess.num_frames, fidx + 1)
             sess._preflight_done = False
             hooked = bool(getattr(self.backend, "_dlmi_injection_active", False))
-            # Run preflight when (a) a DLMI hook is installed (so it fires WITH the
-            # injected logits, matching the HF prompt-frame flow), or (b) multiplex
-            # (its add_new_* returns only the last object, so consolidate ALL).
+            # Preflight when a DLMI hook is installed (fires with the injected logits) or on multiplex (consolidates all objects).
             if mux or hooked:
                 tracker.propagate_in_video_preflight(state)
                 sess._preflight_done = True
@@ -337,10 +295,7 @@ class GitTrackerModel:
             sess._last_pred = video_res
             return _ModelOutput(video_res)
 
-        # ---- tracking frame: single-frame stepping ----
-        # Run preflight (consolidate prompts + encode their memory) BEFORE caching
-        # the new frame's features, since the LRU feature cache holds only one frame
-        # and preflight still needs the prompt frame's cached features.
+        # Tracking frame: preflight BEFORE caching the new frame (the LRU feature cache holds only one frame).
         if not sess._preflight_done:
             tracker.propagate_in_video_preflight(state)
             sess._preflight_done = True
@@ -368,15 +323,7 @@ class GitTrackerModel:
         return _ModelOutput(video_res)
 
     def _multiplex_prompt(self, sess, frame):
-        """SAM3.1 multiplex prompt-frame handler.
-
-        Rebuilds a fresh multiplex state from ALL accumulated per-object prompts and
-        adds every object as NEW (the demo's per-object refine path asserts
-        num_valid_entries==total and breaks when re-prompting an existing object in a
-        multi-object session). The conditioning-frame backbone features are computed
-        once and reused, so a rebuild only re-runs the cheap SAM/mask heads. Finally
-        preflight + consolidate so every object's video-res mask is returned (the
-        add_new_* calls return only the last object)."""
+        """SAM3.1 multiplex prompt-frame handler."""
         tracker = self.backend._tracker
         fidx = sess._pending[0]["frame_idx"]
         sess._frame0_idx = fidx

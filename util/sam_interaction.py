@@ -6,7 +6,18 @@ import tkinter as tk
 import cv2
 from PIL import Image
 
-from .customutil import process_sam_mask, get_bbox_from_mask, get_hashable_obj_id, is_bbox_on_edge
+from .customutil import (process_sam_mask, get_bbox_from_mask, get_hashable_obj_id,
+                         is_bbox_on_edge, resize_confidence_map)
+
+
+def _store_confidence_map(app, obj_id, mask_np, pil_size_wh):
+    """Keep the raw logit map so the Object-conf-threshold slider can re-binarise this object's mask live (app.reapply_mask_threshold)."""
+    conf = resize_confidence_map(mask_np, pil_size_wh)
+    if conf is None:
+        return
+    if not hasattr(app, 'current_confidence_masks'):
+        app.current_confidence_masks = {}
+    app.current_confidence_masks[obj_id] = conf
 
 logger = logging.getLogger("DLMI_SAM_LABELER.SAMInteraction")
 
@@ -103,9 +114,11 @@ def prepare_and_conditionally_reset_sam3(app, target_existing_obj_id, proposed_o
                         mask_tensor = masks[idx]
                         mask_np = mask_tensor.float().cpu().numpy()
                         pil_size = app.current_frame_pil_rgb_original.size if app.current_frame_pil_rgb_original else (app.current_cv_frame.shape[1], app.current_cv_frame.shape[0])
-                        proc_mask = process_sam_mask(mask_np, pil_size)
+                        proc_mask = process_sam_mask(mask_np, pil_size,
+                                                     logit_threshold=app._mask_logit_threshold())
                         if proc_mask is not None:
                             data["last_mask"] = proc_mask
+                            _store_confidence_map(app, obj_id, mask_np, pil_size)
                             temp_reprompted_objects[obj_id] = data
                             logger.info(f"ObjID {obj_id} SAM3 re-prompt success.")
                         else:
@@ -338,12 +351,14 @@ def call_sam3_and_update_state(app, final_obj_id, prompt_data, obj_data_to_updat
                     mask_np,
                     pil_size_for_mask,
                     apply_closing=apply_closing,
-                    closing_kernel_size=closing_kernel
+                    closing_kernel_size=closing_kernel,
+                    logit_threshold=app._mask_logit_threshold()
                 )
 
                 if proc_mask is not None:
                     processed_sam_id_actual = final_obj_id
                     obj_data_to_update_with_mask["last_mask"] = proc_mask
+                    _store_confidence_map(app, final_obj_id, mask_np, pil_size_for_mask)
 
                     if ("initial_bbox_prompt" not in obj_data_to_update_with_mask or obj_data_to_update_with_mask["initial_bbox_prompt"] is None) and \
                        prompt_type == 'point' and target_existing_obj_id is None:
@@ -481,7 +496,8 @@ def _handle_incremental_add(app, prompt_type, coords, label, proposed_obj_id_for
                     mask_np,
                     pil_size,
                     apply_closing=app.sam_apply_closing_var.get(),
-                    closing_kernel_size=app.sam_closing_kernel_size_var.get()
+                    closing_kernel_size=app.sam_closing_kernel_size_var.get(),
+                    logit_threshold=app._mask_logit_threshold()
                 )
 
                 if proc_mask is not None:
@@ -492,6 +508,7 @@ def _handle_incremental_add(app, prompt_type, coords, label, proposed_obj_id_for
                         "custom_label": custom_label if custom_label else app.default_object_label_var.get(),
                     }
                     app.tracked_objects[final_obj_id] = new_obj_data
+                    _store_confidence_map(app, final_obj_id, mask_np, pil_size)
 
                     if final_obj_id not in app.object_colors:
                         app._get_object_color(final_obj_id)

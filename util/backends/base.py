@@ -1,25 +1,4 @@
-"""Abstract backend interface + normalized data contracts.
-
-A `SamBackend` exposes every model operation the app needs as high-level methods
-that take/return framework-agnostic data:
-
-  * frames        : PIL.Image (RGB) or HxWx3 uint8 numpy (RGB)
-  * masks         : numpy (H, W) bool at ORIGINAL frame resolution
-                    (+ optional float32 confidence map, same shape)
-  * object ids    : plain python int (insertion order is significant)
-  * points        : numpy (N, 2) float pixel coords (x, y)
-  * point labels  : numpy (N,) int  (1 = positive, 0 = negative)
-  * box           : (x1, y1, x2, y2) float pixel coords
-
-The backend fully encapsulates dtype/device/preprocessing/postprocessing and any
-session/inference-state objects. This keeps the model call-sites in the app
-backend-agnostic.
-
-Only `load`/`unload` are abstract so backends can be built incrementally; every
-operation has a default that raises NotImplementedError until implemented.
-Callers branch on the capability flags (supports_streaming, supports_dlmi, ...)
-rather than relying on exceptions.
-"""
+"""Abstract backend interface + normalized data contracts."""
 
 from __future__ import annotations
 
@@ -35,43 +14,30 @@ logger = logging.getLogger("DLMI_SAM_LABELER.Backends")
 
 
 def to_pil_rgb(frame):
-    """Coerce a frame (PIL.Image or HxWx3 RGB numpy) to a PIL RGB image.
-    The app's call-sites already convert BGR->RGB before handing frames here."""
+    """Coerce a frame (PIL.Image or HxWx3 RGB numpy) to a PIL RGB image."""
     if isinstance(frame, Image.Image):
         return frame.convert("RGB")
     arr = np.asarray(frame)
     return Image.fromarray(arr).convert("RGB")
 
 
-# --------------------------------------------------------------------------- #
 # Exceptions
-# --------------------------------------------------------------------------- #
 class BackendError(Exception):
     """Base class for backend errors."""
 
 
 class BackendLoadError(BackendError):
-    """Raised when a backend cannot be loaded (package missing, checkpoint
-    download/auth failure, OOM, ...). The manager catches this and rolls back."""
+    """Raised when a backend cannot be loaded (package missing, checkpoint download/auth failure, OOM, ...)."""
 
 
 class BackendCapabilityError(BackendError):
-    """Raised when a method is called on a backend that does not support that
-    code path (e.g. per-frame streaming on a generator-only backend). Callers
-    should branch on the capability flags instead of relying on this."""
+    """Raised when a backend doesn't support a code path; callers should branch on the capability flags instead."""
 
 
-# --------------------------------------------------------------------------- #
 # Normalized result containers
-# --------------------------------------------------------------------------- #
 @dataclass
 class TrackResult:
-    """Per-object segmentation result for a single frame.
-
-    masks/scores/confidence are keyed by object id. `masks` are bool arrays at
-    the original frame resolution; `confidence` (optional) holds the continuous
-    pre-threshold map for the same object, used by the app's confidence overlay.
-    """
+    """Per-object segmentation result for a single frame."""
 
     obj_ids: List[int] = field(default_factory=list)
     masks: Dict[int, np.ndarray] = field(default_factory=dict)
@@ -82,11 +48,7 @@ class TrackResult:
 
 @dataclass
 class DetectResult:
-    """Open-vocabulary / exemplar detection result for a single image.
-
-    Parallel lists, one entry per detected instance. Masks are bool arrays at the
-    original image resolution; boxes are (x1, y1, x2, y2) pixel coords.
-    """
+    """Open-vocabulary / exemplar detection result for a single image."""
 
     masks: List[np.ndarray] = field(default_factory=list)
     scores: List[float] = field(default_factory=list)
@@ -95,30 +57,15 @@ class DetectResult:
 
 @dataclass
 class FramePack:
-    """Opaque, backend-specific result of preprocessing one frame.
-
-    `original_size` is (width, height) in pixels (matches the app's PIL size
-    convention). `payload` is whatever the backend needs downstream (e.g. an HF
-    `pixel_values` tensor + original_sizes, or an official normalized tensor /
-    cached image features). Callers must treat `payload` as opaque.
-    """
+    """Opaque, backend-specific result of preprocessing one frame."""
 
     original_size: Tuple[int, int]
     payload: Any = None
 
 
-# --------------------------------------------------------------------------- #
 # Backend interface
-# --------------------------------------------------------------------------- #
 class SamBackend(abc.ABC):
-    """Abstract base for all model backends.
-
-    Capability flags let the app pick the right control flow without try/except:
-      * supports_streaming      : True  -> use tracker_forward_frame() per frame
-                                  False -> use tracker_propagate() generator
-      * requires_preloaded_video: backend needs all frames before propagation
-      * supports_dlmi           : DLMI latent injection is available
-    """
+    """Abstract base for all model backends."""
 
     # Identity / capabilities (override in subclasses)
     key: str = "base"
@@ -136,8 +83,7 @@ class SamBackend(abc.ABC):
     # ----- lifecycle (abstract) ------------------------------------------- #
     @abc.abstractmethod
     def load(self) -> None:
-        """Load all models/processors onto `self.device`. Raise BackendLoadError
-        on failure. Must be idempotent-safe (no-op if already loaded)."""
+        """Load all models/processors onto `self.device`."""
 
     @abc.abstractmethod
     def unload(self) -> None:
@@ -173,16 +119,14 @@ class SamBackend(abc.ABC):
                            labels: Optional[np.ndarray] = None,
                            box: Optional[Tuple[float, float, float, float]] = None,
                            mask: Optional[np.ndarray] = None) -> TrackResult:
-        """Add a point/box/mask prompt for `obj_id` on `frame_idx` and return the
-        resulting masks for that frame."""
+        """Add a point/box/mask prompt for `obj_id` on `frame_idx` and return the resulting masks for that frame."""
         self._todo("tracker_add_prompt")
 
     def tracker_add_prompts_batch(self, frame_pack: FramePack, frame_idx: int,
                                   obj_ids: List[int], *,
                                   masks_by_oid: Optional[Dict[int, np.ndarray]] = None,
                                   run_forward: bool = True) -> Optional[TrackResult]:
-        """Register multiple mask prompts at once (polygon / DLMI seeding).
-        Default: loop tracker_add_prompt. Backends may override for batch APIs."""
+        """Register multiple mask prompts at once (polygon / DLMI seeding)."""
         last = None
         for oid in obj_ids:
             m = None if masks_by_oid is None else masks_by_oid.get(oid)
@@ -242,10 +186,10 @@ class SamBackend(abc.ABC):
 
     def dlmi_install_injection(self, obj_ids: List[int],
                                masks_by_oid: Dict[int, np.ndarray], *,
-                               intensity: float, mode: str, falloff: int,
-                               state: Optional[dict] = None) -> Any:
-        """Install a one-shot latent-memory injection hook for the next forward.
-        Returns an opaque handle to pass to dlmi_cleanup_injection()."""
+                               intensity: float,
+                               state: Optional[dict] = None,
+                               **logit_kwargs) -> Any:
+        """Install a one-shot latent-memory injection hook for the next forward."""
         self._todo("dlmi_install_injection")
 
     def dlmi_cleanup_injection(self, handle: Any) -> None:
@@ -253,18 +197,16 @@ class SamBackend(abc.ABC):
         self._todo("dlmi_cleanup_injection")
 
     def dlmi_install_persistent(self, *, preserve: bool, boost: bool) -> None:
-        """Install persistent memory hooks: Preserve (keep all conditioning
-        frames) and/or Boost (over-weight conditioning memory)."""
+        """Install persistent memory hooks: Preserve (keep all conditioning frames) and/or Boost (over-weight conditioning memory)."""
         self._todo("dlmi_install_persistent")
 
     def dlmi_remove_persistent(self) -> None:
         self._todo("dlmi_remove_persistent")
 
     def dlmi_mini_propagate(self, frame_n, frame_n1, obj_id_to_mask_label: dict, *,
-                            dlmi_enabled: bool, intensity: float, mode: str,
-                            falloff: int) -> Dict[int, np.ndarray]:
-        """Two-frame mini session (Cut workflow): seed obj masks on frame_n and
-        DLMI-propagate to frame_n+1; return resulting masks per obj id."""
+                            dlmi_enabled: bool, intensity: float,
+                            **logit_kwargs) -> Dict[int, np.ndarray]:
+        """Two-frame mini session (Cut workflow): seed masks on frame_n, DLMI-propagate to frame_n+1."""
         self._todo("dlmi_mini_propagate")
 
     # ----- misc ------------------------------------------------------------ #
