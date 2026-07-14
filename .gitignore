@@ -55,3 +55,11 @@ sam3_env/
 _clean_repo/
 readme2.md
 README_BACKEND.md
+
+# dataset (selected subset uploaded; see 20260429 range rules below)
+!dataset/*.jpg
+!dataset/test.mp4
+dataset/20260429/*
+!dataset/20260429/20260429_153259_frame_000[0-9][0-9].*
+!dataset/20260429/20260429_153259_frame_001[0-4][0-9].*
+!dataset/20260429/20260429_153259_frame_00150.*
