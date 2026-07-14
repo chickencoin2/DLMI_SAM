@@ -194,7 +194,7 @@ def viz_overlay(frame_bgr, items, out_path):
 
 # Modes
 def run_detect(backend, frames, prompts, threshold, base_name, out_dir,
-               fmt, viz, class_to_id):
+               fmt, viz, class_to_id, mask_threshold=0.5):
     """Per-frame open-vocabulary detection."""
     viz_dir = os.path.join(out_dir, "viz")
     labels_dir = os.path.join(out_dir, "labels")
@@ -208,7 +208,8 @@ def run_detect(backend, frames, prompts, threshold, base_name, out_dir,
         frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
         shapes, items = [], []
         for prompt in prompts:
-            det = backend.image_detect(frame_pil, text=prompt, threshold=threshold)
+            det = backend.image_detect(frame_pil, text=prompt, threshold=threshold,
+                                       mask_threshold=mask_threshold)
             for mask in det.masks:
                 poly = mask_to_polygon(mask)
                 if poly is None:
@@ -265,14 +266,14 @@ def print_dlmi_confidence_summary(kw):
 
 def run_track(backend, frames, prompts, threshold, base_name, out_dir,
               fmt, viz, class_to_id, seed="point", dlmi_kw=None,
-              mask_conf=50.0):
+              mask_conf=50.0, mask_threshold=0.5):
     """Detect objects on frame 0, then propagate with consistent ids (git only)."""
     mask_logit_thr = confidence_to_logit(min(max(float(mask_conf), 1.0), 99.0))
     if not getattr(backend, "supports_streaming", False) or backend.key not in ("git", "3.1"):
         print(f"[warn] track mode requires the 'git' or '3.1' backend; "
               f"got '{backend.key}'. Falling back to detect mode.")
         return run_detect(backend, frames, prompts, threshold, base_name, out_dir,
-                          fmt, viz, class_to_id)
+                          fmt, viz, class_to_id, mask_threshold=mask_threshold)
 
     viz_dir = os.path.join(out_dir, "viz")
     labels_dir = os.path.join(out_dir, "labels")
@@ -297,7 +298,8 @@ def run_track(backend, frames, prompts, threshold, base_name, out_dir,
     next_id = 1
     inp0 = proc(images=f0_pil, device=str(app.device), return_tensors="pt")
     for prompt in prompts:
-        det = backend.image_detect(f0_pil, text=prompt, threshold=threshold)
+        det = backend.image_detect(f0_pil, text=prompt, threshold=threshold,
+                                   mask_threshold=mask_threshold)
         for mask in det.masks:
             m = np.squeeze(np.asarray(mask)) > 0
             bb = mask_to_bbox(m)
@@ -426,6 +428,9 @@ def main():
     ap.add_argument("--mask-conf", type=float, default=50.0,
                     help="tracking mask binarisation threshold as confidence %% "
                          "(a pixel counts as object above this; default 50 = legacy)")
+    ap.add_argument("--mask-threshold", type=float, default=0.5,
+                    help="detection mask binarisation threshold passed to "
+                         "image_detect (same default as the GUI)")
     args = ap.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -457,10 +462,12 @@ def main():
         total = run_track(backend, frames, prompts, args.threshold, base_name,
                           out_dir, args.format, args.viz, class_to_id,
                           seed=args.seed, dlmi_kw=dlmi_kwargs_from_args(args),
-                          mask_conf=args.mask_conf)
+                          mask_conf=args.mask_conf,
+                          mask_threshold=args.mask_threshold)
     else:
         total = run_detect(backend, frames, prompts, args.threshold, base_name,
-                           out_dir, args.format, args.viz, class_to_id)
+                           out_dir, args.format, args.viz, class_to_id,
+                           mask_threshold=args.mask_threshold)
 
     if args.format in ("yolo", "both"):
         names = "\n".join(f"  {i}: {p}" for p, i in
