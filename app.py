@@ -73,7 +73,7 @@ class SAM3AutolabelApp:
 
     def __init__(self, root_window):
         self.root = root_window
-        self.root.title("DLMI-SAM labeler v1.31")
+        self.root.title("DLMI-SAM labeler v1.32")
 
         self.video_source_path = None
         self.cap = None
@@ -177,6 +177,12 @@ class SAM3AutolabelApp:
         self.polygon_mode_active = False
         self.polygon_points = []
         self.polygon_objects = []
+
+        self.paint_mode_active = False
+        self.paint_stroke_mask = None
+        self.paint_stroke_active = False
+        self.paint_last_image_pt = None
+        self.paint_undo_stack = []
 
         # Slider-relative index of the frame the user started pre-propagate labelling on.
         self.label_anchor_frame_idx = None
@@ -285,6 +291,8 @@ class SAM3AutolabelApp:
         self.label_font_size_percent_var = tk.DoubleVar(value=0.7)
         self.polygon_point_size_percent_var = tk.DoubleVar(value=0.4)
         self.polygon_vertex_size_percent_var = tk.DoubleVar(value=0.4)
+        # Paint-brush diameter in image pixels (persisted like every other tk.Variable).
+        self.paint_brush_size_var = tk.IntVar(value=30)
         self.show_object_border_var = tk.BooleanVar(value=False)
         self.tabs_visible_var = tk.BooleanVar(value=True)
         self.show_prompt_visualization_var = tk.BooleanVar(value=False)
@@ -454,6 +462,8 @@ class SAM3AutolabelApp:
         self.polygon_mode_active = False
         self.polygon_points = []
         self.polygon_objects.clear()
+        self.paint_mode_active = False
+        self._clear_paint_state()
         try:
             if hasattr(self, 'object_prompt_history'):
                 self.object_prompt_history.clear()
@@ -1097,13 +1107,38 @@ class SAM3AutolabelApp:
         self.polygon_points.clear()
         self.polygon_objects.clear()
 
+        self.paint_mode_active = False
+        self._clear_paint_state()
+
         if hasattr(self, 'view') and self.view is not None:
             try:
                 self.view.update_polygon_mode_ui()
             except Exception:
                 pass
+            try:
+                self.view.update_paint_mode_ui(False)
+            except Exception:
+                pass
 
         logger.debug("Group/polygon state initialized")
+
+    def _confirm_enable_low_level_api(self):
+        """Warn that injection needs the low-level API and offer to turn it on right here."""
+        proceed = messagebox.askyesno(
+            "Notice",
+            "Low-level API (DLMI) is not enabled.\n"
+            "Injection only works with the 'Use Low-level API' option (Advanced tab) turned ON.\n\n"
+            "Turn it on now?",
+            icon=messagebox.WARNING,
+            parent=self.root,
+        )
+        if not proceed:
+            return False
+        self.low_level_api_enabled_var.set(True)
+        if self.view and hasattr(self.view, '_on_low_level_api_toggle'):
+            self.view._on_low_level_api_toggle()
+        logger.info("Low-level API enabled via Inject Data confirmation dialog")
+        return True
 
     def prepare_dlmi_mid_propagation(self):
         """Prepare DLMI injection to apply on the next frame when propagation resumes."""
@@ -1112,8 +1147,8 @@ class SAM3AutolabelApp:
             return
 
         if not self.low_level_api_enabled_var.get():
-            messagebox.showwarning("Notice", "Low-level API (DLMI) is not enabled.\nEnable it in Advanced settings.", parent=self.root)
-            return
+            if not self._confirm_enable_low_level_api():
+                return
 
         if not self.tracked_objects:
             messagebox.showwarning("Notice", "No objects to inject.\nModify or add objects first.", parent=self.root)
@@ -1164,8 +1199,8 @@ class SAM3AutolabelApp:
             return
 
         if not force and not self.low_level_api_enabled_var.get():
-            messagebox.showwarning("Notice", "Low-level API is not enabled.\nEnable it in advanced settings.", parent=self.root)
-            return
+            if not self._confirm_enable_low_level_api():
+                return
 
         if not self.tracked_objects:
             messagebox.showwarning("Notice", "No masks to inject.\nDetect objects first.", parent=self.root)
@@ -1534,6 +1569,7 @@ class SAM3AutolabelApp:
         if self.polygon_mode_active:
             self._deactivate_negative_area_mode()
             self._deactivate_multi_choose_mode()
+            self._deactivate_paint_mode()
             self.polygon_points = []
             self.update_status("Polygon mode: Left click to add points. Click 'Complete Object' when done.")
             logger.info("Polygon add mode activated")
@@ -1721,6 +1757,208 @@ class SAM3AutolabelApp:
         self.polygon_mode_active = False
         self.polygon_points = []
         self.update_status("Polygon mode cancelled")
+
+    # --- Paint mode: brush-drawn masks that complete into objects exactly like polygons ---
+
+    def _clear_paint_state(self):
+        self.paint_stroke_mask = None
+        self.paint_stroke_active = False
+        self.paint_last_image_pt = None
+        self.paint_undo_stack = []
+
+    def _deactivate_paint_mode(self):
+        if not getattr(self, 'paint_mode_active', False):
+            return
+        self.paint_mode_active = False
+        self._clear_paint_state()
+        if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(False)
+
+    def toggle_paint_mode(self):
+        self.paint_mode_active = not self.paint_mode_active
+        self._clear_paint_state()
+        if self.paint_mode_active:
+            self._deactivate_polygon_mode()
+            self._deactivate_negative_area_mode()
+            self._deactivate_multi_choose_mode()
+            self.update_status("Paint mode: Left click/drag to paint the mask. Click 'Complete' when done.")
+            logger.info("Paint mode activated")
+        else:
+            self.update_status("Paint mode deactivated")
+            logger.info("Paint mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(self.paint_mode_active)
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def _paint_brush_radius_px(self):
+        try:
+            size = int(self.paint_brush_size_var.get())
+        except (tk.TclError, ValueError):
+            size = 30
+        return max(1, size // 2)
+
+    def get_paint_brush_canvas_diameter(self):
+        """Brush diameter converted from image pixels to canvas pixels for previews."""
+        diameter = max(1, self._paint_brush_radius_px() * 2)
+        try:
+            if self.scale_x and self.scale_x > 0:
+                return max(1.0, diameter / self.scale_x)
+        except (AttributeError, TypeError):
+            pass
+        return float(diameter)
+
+    def paint_stroke_begin(self, canvas_x, canvas_y):
+        if not self.paint_mode_active:
+            return False
+        if self.current_cv_frame is None:
+            return False
+
+        # Same anchor guard as the first polygon point, on the first stroke of a fresh mask.
+        fresh = self.paint_stroke_mask is None or not self.paint_stroke_mask.any()
+        if fresh and not self._ensure_label_anchor_or_confirm_switch():
+            return False
+
+        h, w = self.current_cv_frame.shape[:2]
+        if self.paint_stroke_mask is None or self.paint_stroke_mask.shape != (h, w):
+            self.paint_stroke_mask = np.zeros((h, w), dtype=np.uint8)
+            self.paint_undo_stack = []
+
+        self.paint_undo_stack.append(self.paint_stroke_mask.copy())
+        if len(self.paint_undo_stack) > 10:
+            self.paint_undo_stack.pop(0)
+
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        radius = self._paint_brush_radius_px()
+        cv2.circle(self.paint_stroke_mask, (int(img_x), int(img_y)), radius, 255, thickness=-1)
+        self.paint_last_image_pt = (int(img_x), int(img_y))
+        self.paint_stroke_active = True
+
+        if self.view and hasattr(self.view, 'begin_paint_preview'):
+            self.view.begin_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter())
+        return True
+
+    def paint_stroke_update(self, canvas_x, canvas_y):
+        if not self.paint_mode_active or not self.paint_stroke_active:
+            return False
+        if self.paint_stroke_mask is None:
+            return False
+
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        cur = (int(img_x), int(img_y))
+        radius = self._paint_brush_radius_px()
+        if self.paint_last_image_pt is not None and self.paint_last_image_pt != cur:
+            cv2.line(self.paint_stroke_mask, self.paint_last_image_pt, cur, 255,
+                     thickness=max(1, radius * 2))
+        cv2.circle(self.paint_stroke_mask, cur, radius, 255, thickness=-1)
+        self.paint_last_image_pt = cur
+
+        if self.view and hasattr(self.view, 'extend_paint_preview'):
+            self.view.extend_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter())
+        return True
+
+    def paint_stroke_finish(self, canvas_x, canvas_y):
+        if not self.paint_mode_active or not self.paint_stroke_active:
+            return False
+
+        self.paint_stroke_update(canvas_x, canvas_y)
+        self.paint_stroke_active = False
+        self.paint_last_image_pt = None
+
+        if self.view and hasattr(self.view, 'clear_paint_preview'):
+            self.view.clear_paint_preview()
+
+        painted_px = int(np.count_nonzero(self.paint_stroke_mask)) if self.paint_stroke_mask is not None else 0
+        self.update_status(f"Painted area: {painted_px} px. Paint more, 'Undo Stroke', or click 'Complete'.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        return True
+
+    def undo_last_paint_stroke(self):
+        if not self.paint_mode_active or not self.paint_undo_stack:
+            return
+
+        self.paint_stroke_mask = self.paint_undo_stack.pop()
+        painted_px = int(np.count_nonzero(self.paint_stroke_mask))
+        logger.debug(f"Paint stroke undone, painted px: {painted_px}")
+        self.update_status(f"Stroke removed. Painted area: {painted_px} px.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def complete_paint_object(self):
+        if not self.paint_mode_active:
+            messagebox.showwarning("Notice", "Paint mode is not active.", parent=self.root)
+            return
+
+        if self.paint_stroke_mask is None or not self.paint_stroke_mask.any():
+            messagebox.showwarning("Notice", "Nothing painted yet. Click/drag on the image first.", parent=self.root)
+            return
+
+        if self.current_cv_frame is None:
+            messagebox.showwarning("Notice", "No current frame.", parent=self.root)
+            return
+
+        try:
+            mask_bool = self.paint_stroke_mask > 0
+
+            # Contour outline of the painted mask, kept in the same shape polygon
+            # objects store so downstream bookkeeping and overlays are identical.
+            points = []
+            contours, _ = cv2.findContours(mask_bool.astype(np.uint8) * 255,
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest = max(contours, key=cv2.contourArea)
+                epsilon = 0.002 * cv2.arcLength(largest, True)
+                approx = cv2.approxPolyDP(largest, epsilon, True).reshape(-1, 2)
+                points = [(int(px), int(py)) for px, py in approx]
+
+            new_obj_id = self.next_obj_id_to_propose
+            self.next_obj_id_to_propose += 1
+
+            label = self.default_object_label_var.get()
+            self.tracked_objects[new_obj_id] = {
+                'custom_label': label,
+                'last_mask': mask_bool,
+                'is_polygon_object': True,
+                'polygon_points': points
+            }
+
+            self.polygon_objects.append({
+                'obj_id': new_obj_id,
+                'points': points,
+                'mask': mask_bool,
+                'label': label
+            })
+
+            logger.info(f"Paint object created: ID={new_obj_id}, painted px={int(np.count_nonzero(mask_bool))}, label={label}")
+            self.update_status(f"Paint object {new_obj_id} created. Input to SAM3 or continue painting.")
+
+            self._clear_paint_state()
+
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+            self._update_obj_id_info_label()
+
+            if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+                self.view.update_paint_mode_ui(True)
+
+        except Exception as e:
+            logger.exception(f"Paint object creation failed: {e}")
+            messagebox.showerror("Error", f"Error creating paint object:\n{e}", parent=self.root)
+
+    def cancel_paint_mode(self):
+        self.paint_mode_active = False
+        self._clear_paint_state()
+        self.update_status("Paint mode cancelled")
+        if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(False)
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
         logger.info("Polygon mode cancelled")
 
         if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
@@ -1736,6 +1974,7 @@ class SAM3AutolabelApp:
         if self.negative_area_mode_active:
             self._deactivate_multi_choose_mode()
             self._deactivate_polygon_mode()
+            self._deactivate_paint_mode()
 
         if self.negative_area_mode_active:
             self.update_status(
@@ -1909,6 +2148,7 @@ class SAM3AutolabelApp:
         if self.multi_choose_mode_active:
             self._deactivate_negative_area_mode()
             self._deactivate_polygon_mode()
+            self._deactivate_paint_mode()
 
         if self.multi_choose_mode_active:
             self.update_status(
@@ -2681,6 +2921,17 @@ class SAM3AutolabelApp:
                         img_arr[mask_array_bool, :3] * inv_alpha + color_arr * alpha_ratio
                     ).astype(np.uint8)
 
+            if (getattr(self, 'paint_mode_active', False)
+                    and self.paint_stroke_mask is not None
+                    and self.paint_stroke_mask.shape[:2] == (h, w)):
+                stroke_bool = self.paint_stroke_mask > 0
+                if stroke_bool.any():
+                    paint_alpha = 0.45
+                    paint_color = np.array((0, 255, 255), dtype=np.float32)
+                    img_arr[stroke_bool, :3] = (
+                        img_arr[stroke_bool, :3] * (1.0 - paint_alpha) + paint_color * paint_alpha
+                    ).astype(np.uint8)
+
             pil_image_to_draw_on = Image.fromarray(img_arr, "RGBA")
             draw_final = ImageDraw.Draw(pil_image_to_draw_on)
 
@@ -2753,7 +3004,7 @@ class SAM3AutolabelApp:
                             marker_size = marker_base_size * 0.7 if marker_color == "orange" else marker_base_size
                             draw_star_marker(draw_final, center_x, center_y, marker_size, color=marker_color)
 
-            if getattr(self, 'polygon_mode_active', False):
+            if getattr(self, 'polygon_mode_active', False) or getattr(self, 'paint_mode_active', False):
                 polygon_color = (0, 255, 255)
                 if frame_diagonal is None:
                     frame_diagonal = math.sqrt(w * w + h * h)
@@ -3425,13 +3676,19 @@ class SAM3AutolabelApp:
         return pcs_controller.execute_pcs_detection(self)
 
     def _auto_disable_polygon_mode(self):
-        """Auto-disable polygon mode if active. Called before propagation start/resume."""
+        """Auto-disable polygon/paint mode if active. Called before propagation start/resume."""
         if self.polygon_mode_active:
             self.polygon_mode_active = False
             self.polygon_points = []
             if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
                 self.view.update_polygon_mode_ui(False)
             logger.info("Polygon mode auto-disabled before propagation")
+        if self.paint_mode_active:
+            self.paint_mode_active = False
+            self._clear_paint_state()
+            if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+                self.view.update_paint_mode_ui(False)
+            logger.info("Paint mode auto-disabled before propagation")
 
     def start_propagation(self):
         # Auto-disable polygon mode before starting/resuming

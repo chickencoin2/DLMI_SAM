@@ -93,6 +93,10 @@ def is_multi_choose_mode(app):
     return bool(getattr(app, 'multi_choose_mode_active', False))
 
 
+def is_paint_mode(app):
+    return bool(getattr(app, 'paint_mode_active', False))
+
+
 def get_object_id_at_coords(app, img_x, img_y):
     if not app.tracked_objects or app.current_cv_frame is None:
         return None
@@ -125,18 +129,25 @@ def on_left_mouse_press(app, event):
             pass  # Always allow Ctrl+click (selection) and Ctrl+Shift+click (delete)
         elif getattr(app, 'polygon_mode_active', False):
             pass  # Allow polygon point placement during pause
+        elif is_paint_mode(app):
+            pass  # Allow paint strokes during pause (same role as polygon mode)
         elif is_negative_area_mode(app):
             pass  # Allow negative-area drag-erase during pause (frame-local edit)
         elif is_multi_choose_mode(app):
             pass
         else:
-            app.update_status("Paused: Use polygon mode for mask creation, or Ctrl+click for selection.")
+            app.update_status("Paused: Use polygon/paint mode for mask creation, or Ctrl+click for selection.")
             return
 
     if getattr(app, 'polygon_mode_active', False):
         img_x, img_y = app._canvas_to_image_coords(event.x, event.y)
         if app.add_polygon_point(img_x, img_y):
             return
+
+    if is_paint_mode(app) and not app.is_ctrl_pressed and not app.is_shift_pressed and not app.is_alt_pressed:
+        app.paint_stroke_begin(event.x, event.y)
+        app.bbox_start_canvas_coords = None
+        return
 
     if is_negative_area_mode(app) and not app.is_ctrl_pressed and not app.is_shift_pressed and not app.is_alt_pressed:
         app.negative_drag_begin(event.x, event.y)
@@ -234,13 +245,16 @@ def on_left_mouse_press(app, event):
 def on_left_mouse_drag(app, event):
     if is_any_special_mode_active(app) and app.reassign_bbox_mode_active_sam_id is None and app.interaction_correction_pending is None:
         return
+    if is_paint_mode(app) and getattr(app, 'paint_stroke_active', False):
+        app.paint_stroke_update(event.x, event.y)
+        return
     if is_negative_area_mode(app) and getattr(app, 'negative_drag_start_canvas', None) is not None:
         app.negative_drag_update(event.x, event.y)
         return
     if is_multi_choose_mode(app) and getattr(app, 'multi_choose_drag_start_canvas', None) is not None:
         app.multi_choose_drag_update(event.x, event.y)
         return
-    if (is_negative_area_mode(app) or is_multi_choose_mode(app)) \
+    if (is_negative_area_mode(app) or is_multi_choose_mode(app) or is_paint_mode(app)) \
             and not app.is_ctrl_pressed and not app.is_shift_pressed and not app.is_alt_pressed:
         return
     if app.is_ctrl_pressed and not (app.reassign_bbox_mode_active_sam_id or app.interaction_correction_pending):
@@ -258,6 +272,11 @@ def on_left_mouse_release(app, event):
     if is_any_special_mode_active(app) and app.reassign_bbox_mode_active_sam_id is None and app.interaction_correction_pending is None:
         return
 
+    if is_paint_mode(app) and getattr(app, 'paint_stroke_active', False):
+        app.paint_stroke_finish(event.x, event.y)
+        app.bbox_start_canvas_coords = None
+        return
+
     if is_negative_area_mode(app) and getattr(app, 'negative_drag_start_canvas', None) is not None:
         app.negative_drag_finish(event.x, event.y)
         app.bbox_start_canvas_coords = None
@@ -268,7 +287,7 @@ def on_left_mouse_release(app, event):
         app.bbox_start_canvas_coords = None
         return
 
-    if (is_negative_area_mode(app) or is_multi_choose_mode(app)) \
+    if (is_negative_area_mode(app) or is_multi_choose_mode(app) or is_paint_mode(app)) \
             and not app.is_ctrl_pressed and not app.is_shift_pressed and not app.is_alt_pressed \
             and app.reassign_bbox_mode_active_sam_id is None and app.interaction_correction_pending is None:
         if app.view:

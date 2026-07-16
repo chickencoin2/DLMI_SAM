@@ -14,6 +14,10 @@ class AppView:
         self.canvas_image_item = None
         self.temp_bbox_on_canvas_id = None
 
+        self.paint_preview_ids = []
+        self.paint_preview_last_pt = None
+        self.paint_brush_indicator_id = None
+
         self.original_frame_tab = None
         self.original_canvas = None
         self.original_tk_image = None
@@ -145,7 +149,7 @@ class AppView:
         self.btn_reassign_bbox_selected = tk.Button(self.button_frame, text="Reset Box", command=self.app.toggle_reassign_bbox_mode, state=tk.DISABLED)
         self.btn_delete_selected = tk.Button(self.button_frame, text="Delete", command=self.app.delete_selected_object, state=tk.DISABLED)
 
-        self.polygon_frame = tk.LabelFrame(self.obj_control_tab, text="Add Polygon")
+        self.polygon_frame = tk.LabelFrame(self.obj_control_tab, text="Add Polygon / Paint")
         self.polygon_btn_frame = tk.Frame(self.polygon_frame)
         self.btn_polygon_mode = tk.Button(
             self.polygon_btn_frame, text="Add Polygon",
@@ -179,6 +183,36 @@ class AppView:
         self.polygon_point_size_entry.bind("<Return>", self._on_point_size_change)
         self.polygon_point_size_entry.bind("<FocusOut>", self._on_point_size_change)
         self.polygon_status_label = tk.Label(self.polygon_point_size_frame, text="Left-click to add points", fg="gray50", font=("TkDefaultFont", 8))
+
+        self.paint_btn_frame = tk.Frame(self.polygon_frame)
+        self.btn_paint_mode = tk.Button(
+            self.paint_btn_frame, text="Paint Mode",
+            command=self.app.toggle_paint_mode if hasattr(self.app, 'toggle_paint_mode') else None,
+            bg="#ffe0b2"
+        )
+        self.btn_paint_complete = tk.Button(
+            self.paint_btn_frame, text="Complete",
+            command=self.app.complete_paint_object if hasattr(self.app, 'complete_paint_object') else None,
+            state=tk.DISABLED
+        )
+        self.btn_paint_undo = tk.Button(
+            self.paint_btn_frame, text="Undo Stroke",
+            command=self.app.undo_last_paint_stroke if hasattr(self.app, 'undo_last_paint_stroke') else None,
+            state=tk.DISABLED
+        )
+        self.btn_paint_cancel = tk.Button(
+            self.paint_btn_frame, text="Cancel",
+            command=self.app.cancel_paint_mode if hasattr(self.app, 'cancel_paint_mode') else None,
+            state=tk.DISABLED
+        )
+        self.paint_size_frame = tk.Frame(self.polygon_frame)
+        self.paint_size_label = tk.Label(self.paint_size_frame, text="Brush Size(px):", font=("TkDefaultFont", 8))
+        self.paint_size_scale = tk.Scale(
+            self.paint_size_frame, from_=1, to=200, orient=tk.HORIZONTAL,
+            showvalue=True, length=140,
+            variable=self.app.paint_brush_size_var if hasattr(self.app, 'paint_brush_size_var') else None
+        )
+        self.paint_status_label = tk.Label(self.paint_size_frame, text="Click/drag paints the mask.", fg="gray50", font=("TkDefaultFont", 8))
 
         self.pose_control_frame = tk.LabelFrame(self.obj_control_tab, text="Pose Points")
         self.pose_btn_row1 = tk.Frame(self.pose_control_frame)
@@ -805,7 +839,10 @@ class AppView:
         self.pcs_prompt_entry.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
         self.btn_pcs_detect.pack(side=tk.LEFT, padx=2)
 
-        self.selected_obj_action_frame.grid(row=1, column=0, padx=5, pady=5, sticky='ew')
+        self.skip_video_frame.grid(row=1, column=0, padx=5, pady=5, sticky='ew')
+        self.btn_skip_batch.pack(expand=True, fill=tk.BOTH)
+
+        self.selected_obj_action_frame.grid(row=2, column=0, padx=5, pady=5, sticky='ew')
         self.guide_toggle_frame.pack(side=tk.TOP, anchor='w', padx=5, pady=2)
         self.btn_guide_toggle.pack(side=tk.LEFT)
         self.btn_negative_area.pack(side=tk.LEFT, padx=(8, 0))
@@ -819,7 +856,7 @@ class AppView:
         self.btn_reassign_bbox_selected.pack(side=tk.LEFT, padx=3)
         self.btn_delete_selected.pack(side=tk.LEFT, padx=3)
 
-        self.polygon_frame.grid(row=2, column=0, padx=5, pady=5, sticky='ew')
+        self.polygon_frame.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
         self.polygon_btn_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
         self.btn_polygon_mode.pack(side=tk.LEFT, padx=2)
         self.btn_polygon_complete.pack(side=tk.LEFT, padx=2)
@@ -830,8 +867,17 @@ class AppView:
         self.polygon_point_size_label.pack(side=tk.LEFT)
         self.polygon_point_size_entry.pack(side=tk.LEFT, padx=5)
         self.polygon_status_label.pack(side=tk.LEFT, padx=(10, 0))
+        self.paint_btn_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.btn_paint_mode.pack(side=tk.LEFT, padx=2)
+        self.btn_paint_complete.pack(side=tk.LEFT, padx=2)
+        self.btn_paint_undo.pack(side=tk.LEFT, padx=2)
+        self.btn_paint_cancel.pack(side=tk.LEFT, padx=2)
+        self.paint_size_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
+        self.paint_size_label.pack(side=tk.LEFT)
+        self.paint_size_scale.pack(side=tk.LEFT, padx=5)
+        self.paint_status_label.pack(side=tk.LEFT, padx=(10, 0))
 
-        self.pose_control_frame.grid(row=3, column=0, padx=5, pady=5, sticky='ew')
+        self.pose_control_frame.grid(row=4, column=0, padx=5, pady=5, sticky='ew')
         self.pose_btn_row1.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
         self.btn_pose_add.pack(side=tk.LEFT, padx=2)
         self.btn_pose_chain.pack(side=tk.LEFT, padx=2)
@@ -849,7 +895,7 @@ class AppView:
         self.btn_pose_delete_obj.pack(side=tk.LEFT, padx=(10, 2))
         self.pose_status_label.pack(side=tk.TOP, anchor='w', padx=5, pady=(0, 3))
 
-        self.ui_display_frame.grid(row=4, column=0, padx=5, pady=5, sticky='ew')
+        self.ui_display_frame.grid(row=5, column=0, padx=5, pady=5, sticky='ew')
         self.label_font_size_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=2)
         self.label_font_size_label.pack(side=tk.LEFT)
         self.label_font_size_entry.pack(side=tk.LEFT, padx=(2, 8))
@@ -860,7 +906,7 @@ class AppView:
         self.polygon_vertex_size_label.pack(side=tk.LEFT)
         self.polygon_vertex_size_entry.pack(side=tk.LEFT, padx=(2, 8))
 
-        self.batch_control_frame.grid(row=5, column=0, padx=5, pady=5, sticky='ew')
+        self.batch_control_frame.grid(row=6, column=0, padx=5, pady=5, sticky='ew')
         self.small_obj_filter_frame.pack(pady=2, padx=5, fill=tk.X)
         self.check_filter_small_obj.pack(side=tk.LEFT)
         self.small_obj_threshold_label.pack(side=tk.LEFT, padx=(5, 2))
@@ -872,9 +918,6 @@ class AppView:
         self.small_contour_base_frame.pack(side=tk.LEFT, padx=(5, 0))
         self.rb_contour_base_image.pack(side=tk.LEFT)
         self.rb_contour_base_object.pack(side=tk.LEFT)
-
-        self.skip_video_frame.grid(row=6, column=0, padx=5, pady=5, sticky='ew')
-        self.btn_skip_batch.pack(expand=True, fill=tk.BOTH)
 
         self.sam2_control_frame.grid(row=7, column=0, padx=5, pady=5, sticky='ew')
         self.sam2_toggle_frame.pack(side=tk.LEFT, padx=5, pady=2)
@@ -1165,8 +1208,9 @@ class AppView:
             self.btn_pause_propagate.config(state=tk.DISABLED)
             self.btn_stop_propagate.config(state=tk.NORMAL)
 
-            # During pause: allow polygon creation, object deletion, clear all
+            # During pause: allow polygon/paint creation, object deletion, clear all
             self.btn_polygon_mode.config(state=tk.NORMAL)
+            self.btn_paint_mode.config(state=tk.NORMAL)
             self.btn_delete_selected.config(state=tk.NORMAL)
             self.btn_clear_tracked.config(state=tk.NORMAL)
 
@@ -1411,7 +1455,9 @@ class AppView:
         self.canvas.bind("<Control-Button-3>", self.app._on_ctrl_right_click_for_point)
         self.canvas.bind("<ButtonPress-3>", self.app._on_right_mouse_press)
         self.canvas.bind("<B3-Motion>", self.app._on_right_mouse_drag)
-        self.canvas.bind("<ButtonRelease-3>", self.app._on_right_mouse_release) 
+        self.canvas.bind("<ButtonRelease-3>", self.app._on_right_mouse_release)
+        self.canvas.bind("<Motion>", self._on_canvas_motion_paint)
+        self.canvas.bind("<Leave>", self._on_canvas_leave_paint)
         self.root.bind("<KeyPress-Control_L>", self.app._on_ctrl_press)
         self.root.bind("<KeyPress-Control_R>", self.app._on_ctrl_press)
         self.root.bind("<KeyRelease-Control_L>", self.app._on_ctrl_release)
@@ -1438,10 +1484,18 @@ class AppView:
         logger.debug("Event binding complete.")
 
     def _on_polygon_enter_key(self, event=None):
-        # same as clicking Complete, but only in polygon mode and not while typing
-        if not getattr(self.app, 'polygon_mode_active', False):
-            return None
+        # same as clicking Complete, but only in polygon/paint mode and not while typing
         if event is not None and isinstance(event.widget, (tk.Entry, tk.Text)):
+            return None
+        if getattr(self.app, 'paint_mode_active', False):
+            try:
+                if str(self.btn_paint_complete['state']) == 'disabled':
+                    return None
+            except tk.TclError:
+                return None
+            self.app.complete_paint_object()
+            return "break"
+        if not getattr(self.app, 'polygon_mode_active', False):
             return None
         try:
             if str(self.btn_polygon_complete['state']) == 'disabled':
@@ -1452,10 +1506,18 @@ class AppView:
         return "break"
 
     def _on_polygon_undo_key(self, event=None):
-        # same as clicking Undo Point, but only in polygon mode and not while typing
-        if not getattr(self.app, 'polygon_mode_active', False):
-            return None
+        # same as clicking Undo Point, but only in polygon/paint mode and not while typing
         if event is not None and isinstance(event.widget, (tk.Entry, tk.Text)):
+            return None
+        if getattr(self.app, 'paint_mode_active', False):
+            try:
+                if str(self.btn_paint_undo['state']) == 'disabled':
+                    return None
+            except tk.TclError:
+                return None
+            self.app.undo_last_paint_stroke()
+            return "break"
+        if not getattr(self.app, 'polygon_mode_active', False):
             return None
         try:
             if str(self.btn_polygon_undo['state']) == 'disabled':
@@ -1513,6 +1575,8 @@ class AppView:
         self.canvas_image_item = self.canvas.create_image(
             self.app.offset_x, self.app.offset_y, anchor=tk.NW, image=self.tk_image
         )
+        # Keep the frame image below overlay items (paint preview, temp bbox, pose overlay).
+        self.canvas.tag_lower(self.canvas_image_item)
 
     def draw_temp_bbox(self, x1, y1, x2, y2):
         if self.temp_bbox_on_canvas_id:
@@ -1531,6 +1595,68 @@ class AppView:
         if self.temp_bbox_on_canvas_id:
             return self.canvas.coords(self.temp_bbox_on_canvas_id)
         return None
+
+    def begin_paint_preview(self, canvas_x, canvas_y, width_px):
+        self.clear_paint_preview()
+        r = max(1.0, width_px / 2.0)
+        oid = self.canvas.create_oval(canvas_x - r, canvas_y - r, canvas_x + r, canvas_y + r,
+                                      fill="cyan", outline="")
+        self.paint_preview_ids.append(oid)
+        self.paint_preview_last_pt = (canvas_x, canvas_y)
+        self.update_paint_brush_indicator(canvas_x, canvas_y, width_px)
+
+    def extend_paint_preview(self, canvas_x, canvas_y, width_px):
+        if self.paint_preview_last_pt is None:
+            self.begin_paint_preview(canvas_x, canvas_y, width_px)
+            return
+        lx, ly = self.paint_preview_last_pt
+        lid = self.canvas.create_line(lx, ly, canvas_x, canvas_y,
+                                      width=max(1, int(round(width_px))), fill="cyan",
+                                      capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        self.paint_preview_ids.append(lid)
+        self.paint_preview_last_pt = (canvas_x, canvas_y)
+        self.update_paint_brush_indicator(canvas_x, canvas_y, width_px)
+
+    def clear_paint_preview(self):
+        for oid in self.paint_preview_ids:
+            try:
+                self.canvas.delete(oid)
+            except tk.TclError:
+                pass
+        self.paint_preview_ids = []
+        self.paint_preview_last_pt = None
+
+    def update_paint_brush_indicator(self, canvas_x, canvas_y, width_px):
+        self.hide_paint_brush_indicator()
+        r = max(1.0, width_px / 2.0)
+        self.paint_brush_indicator_id = self.canvas.create_oval(
+            canvas_x - r, canvas_y - r, canvas_x + r, canvas_y + r,
+            outline="white", dash=(3, 3)
+        )
+
+    def hide_paint_brush_indicator(self):
+        if self.paint_brush_indicator_id is not None:
+            try:
+                self.canvas.delete(self.paint_brush_indicator_id)
+            except tk.TclError:
+                pass
+            self.paint_brush_indicator_id = None
+
+    def _on_canvas_motion_paint(self, event):
+        if not getattr(self.app, 'paint_mode_active', False):
+            if self.paint_brush_indicator_id is not None:
+                self.hide_paint_brush_indicator()
+            return
+        if getattr(self.app, 'paint_stroke_active', False):
+            return  # stroke preview already tracks the pointer
+        try:
+            diameter = self.app.get_paint_brush_canvas_diameter()
+        except Exception:
+            return
+        self.update_paint_brush_indicator(event.x, event.y, diameter)
+
+    def _on_canvas_leave_paint(self, event=None):
+        self.hide_paint_brush_indicator()
 
     def clear_canvas_image(self):
         if self.canvas_image_item:
@@ -2057,3 +2183,39 @@ class AppView:
             ) if hasattr(self.app, 'tracked_objects') else False
             # During pause, disable SAM Input (use DLMI injection instead)
             self.btn_polygon_to_sam3.config(state='disabled' if is_paused else ('normal' if has_polygon_obj else 'disabled'))
+
+    def update_paint_mode_ui(self, is_active):
+        is_paused = getattr(self.app, 'app_state', '') == "PAUSED"
+
+        if is_active:
+            self.btn_paint_mode.config(text="Paint Mode ON", bg="#ffb74d")
+            self.btn_paint_complete.config(state='normal')
+            self.btn_paint_undo.config(state='normal')
+            self.btn_paint_cancel.config(state='normal')
+            if is_paused:
+                self.paint_status_label.config(text="DLMI: Click/drag to paint | Complete → DLMI Inject", fg="blue")
+            else:
+                self.paint_status_label.config(text="Click/drag to paint | Complete to create object", fg="blue")
+            try:
+                self.canvas.config(cursor="crosshair")
+            except tk.TclError:
+                pass
+        else:
+            self.btn_paint_mode.config(text="Paint Mode", bg="#ffe0b2")
+            self.btn_paint_complete.config(state='disabled')
+            self.btn_paint_undo.config(state='disabled')
+            self.btn_paint_cancel.config(state='disabled')
+            self.paint_status_label.config(text="Click/drag paints the mask.", fg="gray50")
+            try:
+                self.canvas.config(cursor="")
+            except tk.TclError:
+                pass
+            self.clear_paint_preview()
+            self.hide_paint_brush_indicator()
+
+        has_polygon_obj = any(
+            data.get('is_polygon_object', False)
+            for data in self.app.tracked_objects.values()
+        ) if hasattr(self.app, 'tracked_objects') else False
+        # During pause, disable SAM Input (use DLMI injection instead)
+        self.btn_polygon_to_sam3.config(state='disabled' if is_paused else ('normal' if has_polygon_obj else 'disabled'))
