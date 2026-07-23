@@ -17,6 +17,7 @@ class AppView:
         self.paint_preview_ids = []
         self.paint_preview_last_pt = None
         self.paint_brush_indicator_id = None
+        self.paint_line_preview_id = None
 
         self.original_frame_tab = None
         self.original_canvas = None
@@ -1458,6 +1459,9 @@ class AppView:
         self.canvas.bind("<ButtonRelease-3>", self.app._on_right_mouse_release)
         self.canvas.bind("<Motion>", self._on_canvas_motion_paint)
         self.canvas.bind("<Leave>", self._on_canvas_leave_paint)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_wheel_paint)
+        self.canvas.bind("<Button-4>", self._on_canvas_wheel_paint)
+        self.canvas.bind("<Button-5>", self._on_canvas_wheel_paint)
         self.root.bind("<KeyPress-Control_L>", self.app._on_ctrl_press)
         self.root.bind("<KeyPress-Control_R>", self.app._on_ctrl_press)
         self.root.bind("<KeyRelease-Control_L>", self.app._on_ctrl_release)
@@ -1596,26 +1600,49 @@ class AppView:
             return self.canvas.coords(self.temp_bbox_on_canvas_id)
         return None
 
-    def begin_paint_preview(self, canvas_x, canvas_y, width_px):
+    def begin_paint_preview(self, canvas_x, canvas_y, width_px, color="cyan"):
         self.clear_paint_preview()
         r = max(1.0, width_px / 2.0)
         oid = self.canvas.create_oval(canvas_x - r, canvas_y - r, canvas_x + r, canvas_y + r,
-                                      fill="cyan", outline="")
+                                      fill=color, outline="")
         self.paint_preview_ids.append(oid)
         self.paint_preview_last_pt = (canvas_x, canvas_y)
         self.update_paint_brush_indicator(canvas_x, canvas_y, width_px)
 
-    def extend_paint_preview(self, canvas_x, canvas_y, width_px):
+    def extend_paint_preview(self, canvas_x, canvas_y, width_px, color="cyan"):
+        if self.paint_line_preview_id is not None:
+            # Leaving straight-line mode: keep the drawn line as part of the trail.
+            self.paint_preview_ids.append(self.paint_line_preview_id)
+            self.paint_line_preview_id = None
         if self.paint_preview_last_pt is None:
-            self.begin_paint_preview(canvas_x, canvas_y, width_px)
+            self.begin_paint_preview(canvas_x, canvas_y, width_px, color=color)
             return
         lx, ly = self.paint_preview_last_pt
         lid = self.canvas.create_line(lx, ly, canvas_x, canvas_y,
-                                      width=max(1, int(round(width_px))), fill="cyan",
+                                      width=max(1, int(round(width_px))), fill=color,
                                       capstyle=tk.ROUND, joinstyle=tk.ROUND)
         self.paint_preview_ids.append(lid)
         self.paint_preview_last_pt = (canvas_x, canvas_y)
         self.update_paint_brush_indicator(canvas_x, canvas_y, width_px)
+
+    def update_paint_line_preview(self, x0, y0, x1, y1, width_px, color="cyan"):
+        """Live straight-line preview while Shift constrains the stroke."""
+        width = max(1, int(round(width_px)))
+        if self.paint_line_preview_id is None:
+            # The line supersedes this drag's freehand trail, exactly like the mask does.
+            self.clear_paint_preview()
+            self.paint_line_preview_id = self.canvas.create_line(
+                x0, y0, x1, y1, width=width, fill=color,
+                capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        else:
+            try:
+                self.canvas.coords(self.paint_line_preview_id, x0, y0, x1, y1)
+                self.canvas.itemconfig(self.paint_line_preview_id, width=width, fill=color)
+            except tk.TclError:
+                self.paint_line_preview_id = None
+                return self.update_paint_line_preview(x0, y0, x1, y1, width_px, color=color)
+        self.paint_preview_last_pt = (x1, y1)
+        self.update_paint_brush_indicator(x1, y1, width_px)
 
     def clear_paint_preview(self):
         for oid in self.paint_preview_ids:
@@ -1625,6 +1652,12 @@ class AppView:
                 pass
         self.paint_preview_ids = []
         self.paint_preview_last_pt = None
+        if self.paint_line_preview_id is not None:
+            try:
+                self.canvas.delete(self.paint_line_preview_id)
+            except tk.TclError:
+                pass
+            self.paint_line_preview_id = None
 
     def update_paint_brush_indicator(self, canvas_x, canvas_y, width_px):
         self.hide_paint_brush_indicator()
@@ -1657,6 +1690,21 @@ class AppView:
 
     def _on_canvas_leave_paint(self, event=None):
         self.hide_paint_brush_indicator()
+
+    def _on_canvas_wheel_paint(self, event):
+        if not getattr(self.app, 'paint_mode_active', False):
+            return None
+        step = 5 if (getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0) else -5
+        if not self.app.adjust_paint_brush_size(step):
+            return None
+        # Resize the hover indicator in place for instant feedback.
+        if not getattr(self.app, 'paint_stroke_active', False):
+            try:
+                self.update_paint_brush_indicator(event.x, event.y,
+                                                  self.app.get_paint_brush_canvas_diameter())
+            except Exception:
+                pass
+        return "break"
 
     def clear_canvas_image(self):
         if self.canvas_image_item:
@@ -2192,10 +2240,12 @@ class AppView:
             self.btn_paint_complete.config(state='normal')
             self.btn_paint_undo.config(state='normal')
             self.btn_paint_cancel.config(state='normal')
-            if is_paused:
-                self.paint_status_label.config(text="DLMI: Click/drag to paint | Complete → DLMI Inject", fg="blue")
+            if getattr(self.app, 'negative_area_mode_active', False):
+                self.paint_status_label.config(text="NEG brush: refines pending paint, else erases masks | Wheel: size", fg="red")
+            elif is_paused:
+                self.paint_status_label.config(text="DLMI: Click/drag to paint | Complete → DLMI Inject | Wheel: size", fg="blue")
             else:
-                self.paint_status_label.config(text="Click/drag to paint | Complete to create object", fg="blue")
+                self.paint_status_label.config(text="Click/drag to paint | Complete to create object | Wheel: size", fg="blue")
             try:
                 self.canvas.config(cursor="crosshair")
             except tk.TclError:

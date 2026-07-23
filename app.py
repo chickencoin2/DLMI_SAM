@@ -73,7 +73,7 @@ class SAM3AutolabelApp:
 
     def __init__(self, root_window):
         self.root = root_window
-        self.root.title("DLMI-SAM labeler v1.32")
+        self.root.title("DLMI-SAM labeler v1.33")
 
         self.video_source_path = None
         self.cap = None
@@ -180,9 +180,13 @@ class SAM3AutolabelApp:
 
         self.paint_mode_active = False
         self.paint_stroke_mask = None
+        self.paint_negative_stroke_mask = None
         self.paint_stroke_active = False
         self.paint_last_image_pt = None
         self.paint_undo_stack = []
+        self.paint_stroke_start_image_pt = None
+        self.paint_stroke_start_canvas_pt = None
+        self.paint_line_base_mask = None
 
         # Slider-relative index of the frame the user started pre-propagate labelling on.
         self.label_anchor_frame_idx = None
@@ -1140,6 +1144,21 @@ class SAM3AutolabelApp:
         logger.info("Low-level API enabled via Inject Data confirmation dialog")
         return True
 
+    def _auto_complete_pending_manual_input(self):
+        """Fold an in-progress paint stroke / polygon into an object so injection includes it instead of wiping it."""
+        completed = False
+        if (self.paint_mode_active
+                and self.paint_stroke_mask is not None and self.paint_stroke_mask.any()):
+            self.complete_paint_object()
+            completed = True
+        if (self.polygon_mode_active and not self.negative_area_mode_active
+                and len(self.polygon_points) >= 3):
+            self.complete_polygon_object()
+            completed = True
+        if completed:
+            logger.info("Pending manual input auto-completed before DLMI injection")
+        return completed
+
     def prepare_dlmi_mid_propagation(self):
         """Prepare DLMI injection to apply on the next frame when propagation resumes."""
         if not self.propagation_paused:
@@ -1149,6 +1168,8 @@ class SAM3AutolabelApp:
         if not self.low_level_api_enabled_var.get():
             if not self._confirm_enable_low_level_api():
                 return
+
+        self._auto_complete_pending_manual_input()
 
         if not self.tracked_objects:
             messagebox.showwarning("Notice", "No objects to inject.\nModify or add objects first.", parent=self.root)
@@ -1202,6 +1223,8 @@ class SAM3AutolabelApp:
             if not self._confirm_enable_low_level_api():
                 return
 
+        self._auto_complete_pending_manual_input()
+
         if not self.tracked_objects:
             messagebox.showwarning("Notice", "No masks to inject.\nDetect objects first.", parent=self.root)
             return
@@ -1216,6 +1239,7 @@ class SAM3AutolabelApp:
             return
 
         original_encode = None
+        restore_after_failure = None
         try:
             logger.info("Low-level API: Starting mask injection...")
 
@@ -1264,6 +1288,21 @@ class SAM3AutolabelApp:
                 return
 
             old_tracked_objects = self.tracked_objects.copy()
+            old_object_groups = {gid: set(members) for gid, members in self.object_groups.items()}
+            old_sam_id_to_group = self.sam_id_to_group.copy()
+            old_next_group_id = self.next_group_id
+
+            def _restore_annotations_after_failure():
+                # Injection consumed the annotations but never re-registered them — give the user's work back.
+                self.tracked_objects = old_tracked_objects
+                self.object_groups = old_object_groups
+                self.sam_id_to_group = old_sam_id_to_group
+                self.next_group_id = old_next_group_id
+                logger.warning("Injection failed mid-way: restored previous annotations")
+                if self.current_cv_frame is not None:
+                    self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+            restore_after_failure = _restore_annotations_after_failure
             self.tracked_objects.clear()
             self.object_groups.clear()
             self.sam_id_to_group.clear()
@@ -1280,6 +1319,7 @@ class SAM3AutolabelApp:
 
             if self.current_cv_frame is None:
                 messagebox.showerror("Error", "No current frame.", parent=self.root)
+                _restore_annotations_after_failure()
                 return
 
             frame_rgb = cv2.cvtColor(self.current_cv_frame, cv2.COLOR_BGR2RGB)
@@ -1334,6 +1374,7 @@ class SAM3AutolabelApp:
                     logger.exception(f"Forward pass error: {e}")
                     self.tracker_model._encode_new_memory = original_encode
                     messagebox.showerror("Error", f"Forward pass failed: {e}", parent=self.root)
+                    _restore_annotations_after_failure()
                     return
 
             self.tracker_model._encode_new_memory = original_encode
@@ -1343,6 +1384,7 @@ class SAM3AutolabelApp:
 
             if injection_state["idx"] == 0:
                 messagebox.showwarning("Notice", "No masks injected. Hook was not called.", parent=self.root)
+                _restore_annotations_after_failure()
                 return
 
             injected_count = injection_state["idx"]
@@ -1350,11 +1392,17 @@ class SAM3AutolabelApp:
             for obj_id, obj_info in masks_to_inject.items():
                 mask = obj_info['mask']
                 label = obj_info['label']
-                self.tracked_objects[obj_id] = {
+                entry = {
                     'custom_label': label,
                     'last_mask': mask.astype(bool),
                     'is_injected_group': obj_info.get('is_group', False)
                 }
+                # Keep hand-made pose data through the re-registration.
+                old_data = old_tracked_objects.get(obj_id, {})
+                for pose_key in ('pose_points', 'pose_edges'):
+                    if old_data.get(pose_key):
+                        entry[pose_key] = old_data[pose_key]
+                self.tracked_objects[obj_id] = entry
 
             if injected_count > 0:
                 self.is_tracking_ever_started = True
@@ -1377,6 +1425,8 @@ class SAM3AutolabelApp:
                     self.tracker_model._encode_new_memory = original_encode
                 except:
                     pass
+            if restore_after_failure is not None and not self.tracked_objects:
+                restore_after_failure()
 
     def _record_pcs_results_for_transfer(self):
         """Temp-record everything PCS produced (mask + label + score per object) into `pcs_dlmi_transfer_record`."""
@@ -1762,9 +1812,16 @@ class SAM3AutolabelApp:
 
     def _clear_paint_state(self):
         self.paint_stroke_mask = None
+        self.paint_negative_stroke_mask = None
         self.paint_stroke_active = False
         self.paint_last_image_pt = None
         self.paint_undo_stack = []
+        self._reset_paint_line_state()
+
+    def _reset_paint_line_state(self):
+        self.paint_stroke_start_image_pt = None
+        self.paint_stroke_start_canvas_pt = None
+        self.paint_line_base_mask = None
 
     def _deactivate_paint_mode(self):
         if not getattr(self, 'paint_mode_active', False):
@@ -1778,10 +1835,13 @@ class SAM3AutolabelApp:
         self.paint_mode_active = not self.paint_mode_active
         self._clear_paint_state()
         if self.paint_mode_active:
+            # Negative-area mode stays on: paint + negative area = brush eraser.
             self._deactivate_polygon_mode()
-            self._deactivate_negative_area_mode()
             self._deactivate_multi_choose_mode()
-            self.update_status("Paint mode: Left click/drag to paint the mask. Click 'Complete' when done.")
+            if self.negative_area_mode_active:
+                self.update_status("Paint NEGATIVE brush: release refines the pending paint, or erases object masks if none is pending.")
+            else:
+                self.update_status("Paint mode: Left click/drag to paint the mask. Click 'Complete' when done.")
             logger.info("Paint mode activated")
         else:
             self.update_status("Paint mode deactivated")
@@ -1810,65 +1870,144 @@ class SAM3AutolabelApp:
             pass
         return float(diameter)
 
+    def get_paint_preview_color(self):
+        """Stroke preview color: red while erasing (negative area on), cyan while painting."""
+        return "red" if self.negative_area_mode_active else "cyan"
+
+    def adjust_paint_brush_size(self, delta):
+        """Mouse-wheel brush sizing; clamped to the Brush Size slider range."""
+        if not self.paint_mode_active:
+            return False
+        try:
+            current = int(self.paint_brush_size_var.get())
+        except (tk.TclError, ValueError):
+            current = 30
+        self.paint_brush_size_var.set(min(200, max(1, current + delta)))
+        return True
+
     def paint_stroke_begin(self, canvas_x, canvas_y):
         if not self.paint_mode_active:
             return False
         if self.current_cv_frame is None:
             return False
 
-        # Same anchor guard as the first polygon point, on the first stroke of a fresh mask.
-        fresh = self.paint_stroke_mask is None or not self.paint_stroke_mask.any()
-        if fresh and not self._ensure_label_anchor_or_confirm_switch():
-            return False
-
         h, w = self.current_cv_frame.shape[:2]
-        if self.paint_stroke_mask is None or self.paint_stroke_mask.shape != (h, w):
-            self.paint_stroke_mask = np.zeros((h, w), dtype=np.uint8)
-            self.paint_undo_stack = []
 
-        self.paint_undo_stack.append(self.paint_stroke_mask.copy())
-        if len(self.paint_undo_stack) > 10:
-            self.paint_undo_stack.pop(0)
+        if self.negative_area_mode_active:
+            # Negative stroke goes to its own buffer so the pending positive paint is untouched.
+            self.paint_negative_stroke_mask = np.zeros((h, w), dtype=np.uint8)
+        else:
+            # Same anchor guard as the first polygon point, on the first stroke of a fresh mask.
+            fresh = self.paint_stroke_mask is None or not self.paint_stroke_mask.any()
+            if fresh and not self._ensure_label_anchor_or_confirm_switch():
+                return False
+
+            if self.paint_stroke_mask is None or self.paint_stroke_mask.shape != (h, w):
+                self.paint_stroke_mask = np.zeros((h, w), dtype=np.uint8)
+                self.paint_undo_stack = []
+
+            self.paint_undo_stack.append(self.paint_stroke_mask.copy())
+            if len(self.paint_undo_stack) > 10:
+                self.paint_undo_stack.pop(0)
 
         img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
         radius = self._paint_brush_radius_px()
-        cv2.circle(self.paint_stroke_mask, (int(img_x), int(img_y)), radius, 255, thickness=-1)
+        target = self.paint_negative_stroke_mask if self.negative_area_mode_active else self.paint_stroke_mask
+        cv2.circle(target, (int(img_x), int(img_y)), radius, 255, thickness=-1)
         self.paint_last_image_pt = (int(img_x), int(img_y))
         self.paint_stroke_active = True
 
+        # Anchors for the Shift straight-line constraint: line runs from the drag
+        # start, and the base snapshot lets the provisional line re-render live.
+        self.paint_stroke_start_image_pt = (int(img_x), int(img_y))
+        self.paint_stroke_start_canvas_pt = (canvas_x, canvas_y)
+        self.paint_line_base_mask = target.copy()
+
         if self.view and hasattr(self.view, 'begin_paint_preview'):
-            self.view.begin_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter())
+            self.view.begin_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter(),
+                                          color=self.get_paint_preview_color())
         return True
 
-    def paint_stroke_update(self, canvas_x, canvas_y):
+    def paint_stroke_update(self, canvas_x, canvas_y, straight=False):
         if not self.paint_mode_active or not self.paint_stroke_active:
             return False
-        if self.paint_stroke_mask is None:
+        target = self.paint_negative_stroke_mask if self.negative_area_mode_active else self.paint_stroke_mask
+        if target is None:
             return False
 
         img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
         cur = (int(img_x), int(img_y))
         radius = self._paint_brush_radius_px()
+
+        if (straight and self.paint_line_base_mask is not None
+                and self.paint_stroke_start_image_pt is not None):
+            # Shift held: the whole drag renders as one straight line from the drag
+            # start to the pointer, re-derived from the base snapshot every event.
+            np.copyto(target, self.paint_line_base_mask)
+            start = self.paint_stroke_start_image_pt
+            if start != cur:
+                cv2.line(target, start, cur, 255, thickness=max(1, radius * 2))
+            cv2.circle(target, cur, radius, 255, thickness=-1)
+            self.paint_last_image_pt = cur
+            if (self.view and hasattr(self.view, 'update_paint_line_preview')
+                    and self.paint_stroke_start_canvas_pt is not None):
+                sx, sy = self.paint_stroke_start_canvas_pt
+                self.view.update_paint_line_preview(sx, sy, canvas_x, canvas_y,
+                                                    self.get_paint_brush_canvas_diameter(),
+                                                    color=self.get_paint_preview_color())
+            return True
+
         if self.paint_last_image_pt is not None and self.paint_last_image_pt != cur:
-            cv2.line(self.paint_stroke_mask, self.paint_last_image_pt, cur, 255,
+            cv2.line(target, self.paint_last_image_pt, cur, 255,
                      thickness=max(1, radius * 2))
-        cv2.circle(self.paint_stroke_mask, cur, radius, 255, thickness=-1)
+        cv2.circle(target, cur, radius, 255, thickness=-1)
         self.paint_last_image_pt = cur
 
         if self.view and hasattr(self.view, 'extend_paint_preview'):
-            self.view.extend_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter())
+            self.view.extend_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter(),
+                                           color=self.get_paint_preview_color())
         return True
 
-    def paint_stroke_finish(self, canvas_x, canvas_y):
+    def paint_stroke_finish(self, canvas_x, canvas_y, straight=False):
         if not self.paint_mode_active or not self.paint_stroke_active:
             return False
 
-        self.paint_stroke_update(canvas_x, canvas_y)
+        self.paint_stroke_update(canvas_x, canvas_y, straight=straight)
         self.paint_stroke_active = False
         self.paint_last_image_pt = None
+        self._reset_paint_line_state()
 
         if self.view and hasattr(self.view, 'clear_paint_preview'):
             self.view.clear_paint_preview()
+
+        if self.negative_area_mode_active:
+            # Applied on release, like the negative-area drag box. The negative stroke
+            # refines the pending positive paint when there is one, else erases objects.
+            neg = self.paint_negative_stroke_mask
+            self.paint_negative_stroke_mask = None
+            neg_bool = neg > 0 if neg is not None else None
+
+            if neg_bool is None or not neg_bool.any():
+                return True
+
+            if self.paint_stroke_mask is not None and self.paint_stroke_mask.any():
+                self.paint_undo_stack.append(self.paint_stroke_mask.copy())
+                if len(self.paint_undo_stack) > 10:
+                    self.paint_undo_stack.pop(0)
+                self.paint_stroke_mask[neg_bool] = 0
+                remaining = int(np.count_nonzero(self.paint_stroke_mask))
+                self.update_status(f"Painted area refined: {remaining} px remain. Paint more or click 'Complete'.")
+            else:
+                modified = self._erase_region_from_all_masks(neg_bool)
+                if modified:
+                    self.update_status(f"Negative Area (paint): erased region from {len(modified)} object(s).")
+                else:
+                    self.update_status("Negative Area (paint): no overlap with any object.")
+                self._update_obj_id_info_label()
+
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            return True
 
         painted_px = int(np.count_nonzero(self.paint_stroke_mask)) if self.paint_stroke_mask is not None else 0
         self.update_status(f"Painted area: {painted_px} px. Paint more, 'Undo Stroke', or click 'Complete'.")
@@ -1972,9 +2111,9 @@ class SAM3AutolabelApp:
         self.negative_drag_path_image = []
 
         if self.negative_area_mode_active:
+            # Paint mode stays on: paint + negative area = brush eraser.
             self._deactivate_multi_choose_mode()
             self._deactivate_polygon_mode()
-            self._deactivate_paint_mode()
 
         if self.negative_area_mode_active:
             self.update_status(
@@ -1987,6 +2126,10 @@ class SAM3AutolabelApp:
 
         if self.view and hasattr(self.view, 'update_negative_area_mode_ui'):
             self.view.update_negative_area_mode_ui(self.negative_area_mode_active)
+
+        # Paint mode doubles as the eraser brush while negative area is on — refresh its hint text.
+        if self.paint_mode_active and self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(True)
 
         if self.view:
             self.view.delete_temp_bbox()
@@ -2649,6 +2792,11 @@ class SAM3AutolabelApp:
                 self._display_cv_frame_on_view(frame_bgr)
                 self.update_status(f"Image loaded. Detect objects then click 'Confirm Labeling'.")
                 self._update_interaction_status_and_label()
+                # Image sources save directly from current annotations, so the save button is usable right away.
+                try:
+                    self.view.btn_confirm_labels.config(state=tk.NORMAL)
+                except (tk.TclError, AttributeError):
+                    pass
             else:
                 messagebox.showerror("Error", "Failed to read image frame.", parent=self.root)
                 self._release_video_capture()
@@ -2926,6 +3074,7 @@ class SAM3AutolabelApp:
                     and self.paint_stroke_mask.shape[:2] == (h, w)):
                 stroke_bool = self.paint_stroke_mask > 0
                 if stroke_bool.any():
+                    # Pending positive paint is always cyan; negative strokes only preview in red.
                     paint_alpha = 0.45
                     paint_color = np.array((0, 255, 255), dtype=np.float32)
                     img_arr[stroke_bool, :3] = (

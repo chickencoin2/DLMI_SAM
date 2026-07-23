@@ -97,6 +97,23 @@ def is_paint_mode(app):
     return bool(getattr(app, 'paint_mode_active', False))
 
 
+def get_actual_modifiers(app, event):
+    """Modifier state read from the event itself; resyncs app flags that went stale
+    (e.g. Alt stuck True after a focus change), which otherwise blocks paint routing."""
+    state = getattr(event, 'state', 0) or 0
+    shift = bool(state & 0x0001)
+    ctrl = bool(state & 0x0004)
+    alt = bool(state & 0x0008) or bool(state & 0x20000)
+    if app.is_alt_pressed and not alt:
+        logger.info("Alt key state mismatch detected in paint routing. Resetting state.")
+        app.is_alt_pressed = False
+    if app.is_shift_pressed and not shift:
+        app.is_shift_pressed = False
+    if app.is_ctrl_pressed and not ctrl:
+        app.is_ctrl_pressed = False
+    return ctrl, shift, alt
+
+
 def get_object_id_at_coords(app, img_x, img_y):
     if not app.tracked_objects or app.current_cv_frame is None:
         return None
@@ -144,10 +161,13 @@ def on_left_mouse_press(app, event):
         if app.add_polygon_point(img_x, img_y):
             return
 
-    if is_paint_mode(app) and not app.is_ctrl_pressed and not app.is_shift_pressed and not app.is_alt_pressed:
-        app.paint_stroke_begin(event.x, event.y)
-        app.bbox_start_canvas_coords = None
-        return
+    if is_paint_mode(app):
+        p_ctrl, p_shift, p_alt = get_actual_modifiers(app, event)
+        # Shift is allowed: it constrains the stroke to a straight line during the drag.
+        if not p_ctrl and not p_alt:
+            app.paint_stroke_begin(event.x, event.y)
+            app.bbox_start_canvas_coords = None
+            return
 
     if is_negative_area_mode(app) and not app.is_ctrl_pressed and not app.is_shift_pressed and not app.is_alt_pressed:
         app.negative_drag_begin(event.x, event.y)
@@ -246,7 +266,8 @@ def on_left_mouse_drag(app, event):
     if is_any_special_mode_active(app) and app.reassign_bbox_mode_active_sam_id is None and app.interaction_correction_pending is None:
         return
     if is_paint_mode(app) and getattr(app, 'paint_stroke_active', False):
-        app.paint_stroke_update(event.x, event.y)
+        _, p_shift, _ = get_actual_modifiers(app, event)
+        app.paint_stroke_update(event.x, event.y, straight=p_shift)
         return
     if is_negative_area_mode(app) and getattr(app, 'negative_drag_start_canvas', None) is not None:
         app.negative_drag_update(event.x, event.y)
@@ -273,7 +294,8 @@ def on_left_mouse_release(app, event):
         return
 
     if is_paint_mode(app) and getattr(app, 'paint_stroke_active', False):
-        app.paint_stroke_finish(event.x, event.y)
+        _, p_shift, _ = get_actual_modifiers(app, event)
+        app.paint_stroke_finish(event.x, event.y, straight=p_shift)
         app.bbox_start_canvas_coords = None
         return
 

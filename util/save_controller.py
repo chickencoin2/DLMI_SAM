@@ -13,7 +13,117 @@ from .autolabel_workflow import save_frame_dispatch
 logger = logging.getLogger("DLMI_SAM_LABELER.SaveController")
 
 
+def _ensure_yolo_dataset_ready(app, fmt, has_any_pose):
+    """Create/verify the YOLO dataset structure when the requested formats need it. Returns False to abort."""
+    needs_yolo_dataset = fmt in ["yolo", "both"] or has_any_pose
+    if not needs_yolo_dataset:
+        return True
+
+    # Dataset root: dedicated pose root when configured with labelme-only seg, else the regular save dir.
+    use_pose_root = bool(getattr(app, 'use_custom_pose_save_path_var', None) and
+                         app.use_custom_pose_save_path_var.get())
+    if use_pose_root and fmt == "labelme":
+        save_dir = app.custom_pose_save_dir_var.get()
+    else:
+        save_dir = app._get_save_directory()
+
+    check_result = app._check_existing_yolo_dataset(save_dir)
+    if check_result is None:
+        return False
+    elif check_result == "new_setup":
+        if not app._prompt_yolo_class_info():
+            return False
+
+        if os.path.exists(save_dir):
+            yaml_path = os.path.join(save_dir, "data.yaml")
+            images_dir = os.path.join(save_dir, "images")
+            labels_dir = os.path.join(save_dir, "labels")
+            if not (os.path.exists(yaml_path) and os.path.exists(images_dir) and os.path.exists(labels_dir)):
+                folder_response = messagebox.askyesnocancel(
+                    "Existing Folder Found",
+                    f"Folder '{save_dir}' already exists.\n\n"
+                    f"Yes: Delete folder contents and create YOLO structure\n"
+                    f"No: Keep existing contents and add YOLO structure\n"
+                    f"Cancel: Abort operation",
+                    parent=app.root
+                )
+                if folder_response is None:
+                    return False
+                elif folder_response:
+                    try:
+                        shutil.rmtree(save_dir)
+                        logger.info(f"Existing folder deleted: {save_dir}")
+                    except Exception as e:
+                        logger.error(f"Folder deletion failed: {e}")
+                        messagebox.showerror("Error", f"Folder deletion failed:\n{e}", parent=app.root)
+                        return False
+
+        if not app._init_yolo_dataset_structure(save_dir):
+            messagebox.showerror("Error", "Failed to create YOLO dataset structure.", parent=app.root)
+            return False
+
+    return True
+
+
+def _confirm_and_save_image_labels(app):
+    """Image source: save the current frame's annotations directly — no propagation required."""
+    if app.current_cv_frame is None:
+        messagebox.showwarning("Notice", "No image loaded.", parent=app.root)
+        return
+
+    masks_data = {
+        obj_id: data for obj_id, data in app.tracked_objects.items()
+        if data and data.get('last_mask') is not None and data['last_mask'].any()
+    }
+    if not masks_data:
+        messagebox.showwarning(
+            "Notice",
+            "No annotations to save.\nDetect objects or create polygon/paint masks first.",
+            parent=app.root
+        )
+        return
+
+    image_name = os.path.basename(app.video_source_path) if isinstance(app.video_source_path, str) else "image"
+    response = messagebox.askyesno(
+        "Confirm Labeling",
+        f"Do you want to save labels for this image?\n\n"
+        f"{image_name} — {len(masks_data)} object(s)",
+        parent=app.root
+    )
+    if not response:
+        return
+
+    fmt = app.save_format_var.get()
+    has_pose = any(isinstance(d, dict) and d.get('pose_points') for d in masks_data.values())
+    if not _ensure_yolo_dataset_ready(app, fmt, has_pose):
+        return
+
+    app.app_state = "LABELING"
+    app.update_status("Saving labels...")
+
+    frame_bgr = app.current_cv_frame.copy()
+
+    def _save_image_thread():
+        try:
+            pose_subdir = app._pose_labels_subdir()
+            base_name = "frame"
+            if app.video_source_path and isinstance(app.video_source_path, str):
+                base_name = os.path.splitext(os.path.basename(app.video_source_path))[0]
+            frame_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            save_frame_dispatch(app, frame_pil, 0, masks_data, base_name, pose_subdir=pose_subdir)
+            app.root.after(0, lambda: on_save_finished(app, 1))
+        except Exception as e:
+            logger.exception("Error during image label saving:")
+            app.root.after(0, app.update_status, f"Error during saving: {e}")
+
+    threading.Thread(target=_save_image_thread, daemon=True).start()
+
+
 def confirm_and_save_labels(app):
+    if getattr(app, 'is_image_source', False):
+        _confirm_and_save_image_labels(app)
+        return
+
     if not app.propagated_results:
         messagebox.showwarning("Notice", "No propagation results to save.", parent=app.root)
         return
@@ -52,51 +162,8 @@ def confirm_and_save_labels(app):
     except Exception:
         has_any_pose_overall = False
 
-    needs_yolo_dataset = fmt in ["yolo", "both"] or has_any_pose_overall
-
-    if needs_yolo_dataset:
-        # Dataset root: dedicated pose root when configured with labelme-only seg, else the regular save dir.
-        use_pose_root = bool(getattr(app, 'use_custom_pose_save_path_var', None) and
-                             app.use_custom_pose_save_path_var.get())
-        if use_pose_root and fmt == "labelme":
-            save_dir = app.custom_pose_save_dir_var.get()
-        else:
-            save_dir = app._get_save_directory()
-
-        check_result = app._check_existing_yolo_dataset(save_dir)
-        if check_result is None:
-            return
-        elif check_result == "new_setup":
-            if not app._prompt_yolo_class_info():
-                return
-
-            if os.path.exists(save_dir):
-                yaml_path = os.path.join(save_dir, "data.yaml")
-                images_dir = os.path.join(save_dir, "images")
-                labels_dir = os.path.join(save_dir, "labels")
-                if not (os.path.exists(yaml_path) and os.path.exists(images_dir) and os.path.exists(labels_dir)):
-                    folder_response = messagebox.askyesnocancel(
-                        "Existing Folder Found",
-                        f"Folder '{save_dir}' already exists.\n\n"
-                        f"Yes: Delete folder contents and create YOLO structure\n"
-                        f"No: Keep existing contents and add YOLO structure\n"
-                        f"Cancel: Abort operation",
-                        parent=app.root
-                    )
-                    if folder_response is None:
-                        return
-                    elif folder_response:
-                        try:
-                            shutil.rmtree(save_dir)
-                            logger.info(f"Existing folder deleted: {save_dir}")
-                        except Exception as e:
-                            logger.error(f"Folder deletion failed: {e}")
-                            messagebox.showerror("Error", f"Folder deletion failed:\n{e}", parent=app.root)
-                            return
-
-            if not app._init_yolo_dataset_structure(save_dir):
-                messagebox.showerror("Error", "Failed to create YOLO dataset structure.", parent=app.root)
-                return
+    if not _ensure_yolo_dataset_ready(app, fmt, has_any_pose_overall):
+        return
 
     app.app_state = "LABELING"
     app.update_status("Saving labels...")
