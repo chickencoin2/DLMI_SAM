@@ -1,0 +1,4590 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+import math
+import os
+import threading
+import numpy as np
+
+import torch
+from PIL import Image, ImageTk, ImageDraw, ImageFont
+import cv2
+import logging
+import contextlib
+import sys
+project_root = os.path.dirname(os.path.abspath(__file__))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+from util.gui_view import AppView
+from util.customutil import (
+    rgb_to_tkinter_hex, get_bbox_from_mask,
+    calculate_iou, get_stabilized_bbox, process_sam_mask, draw_star_marker,
+    get_hashable_obj_id, is_bbox_on_edge, mask_point_spacing_ratio,
+    build_mask_polygon, extract_polygon_contours
+)
+from util import sam_interaction
+from util import autolabel_workflow
+from util import propagation_controller
+from util import input_handlers
+from util import batch_controller
+from util.backends import get_backend_manager
+
+try:
+    from transformers import (
+        Sam3VideoModel, Sam3VideoProcessor,
+        Sam3TrackerVideoModel, Sam3TrackerVideoProcessor,
+        Sam3Model, Sam3Processor
+    )
+    SAM3_AVAILABLE = True
+except ImportError as e:
+    print(f"ImportError: {e}")
+    print("SAM3 library (transformers) not found.")
+    print("Run: pip install transformers accelerate")
+    SAM3_AVAILABLE = False
+
+try:
+    from transformers import Sam2Model, Sam2Processor
+    SAM2_AVAILABLE = True
+except ImportError as e:
+    print(f"SAM2 ImportError: {e}")
+    print("SAM2 library unavailable - option disabled")
+    SAM2_AVAILABLE = False
+
+SAM3_MODEL_ID = "facebook/sam3"
+DEFAULT_MIN_BBOX_AREA_FOR_REPROMPT = 50
+DEFAULT_EROSION_KERNEL_SIZE = 3
+DEFAULT_EROSION_ITERATIONS = 1
+AUTOLABEL_FOLDER = "autolabel_sam"
+LABELME_VERSION = "5.10.1"
+ALPHA_NORMAL = 153; ALPHA_SELECTED = 220
+ALPHA_PROBLEM_HIGHLIGHT = 100; ALPHA_CORRECTION_MODE = 70
+DEFAULT_SAM_CLOSING_KERNEL_SIZE = 5
+DEFAULT_EDGE_MARGIN = 10
+
+logger = logging.getLogger("DLMI_SAM_LABELER")
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+class SAM3AutolabelApp:
+
+    def __init__(self, root_window):
+        self.root = root_window
+        self.root.title("DLMI-SAM labeler v1.34")
+
+        self.video_source_path = None
+        self.cap = None
+        self.video_frames_cache = []
+
+        self.pcs_model = None
+        self.pcs_processor = None
+        self.pcs_inference_session = None
+        self.pcs_streaming_session = None
+        # Multi-class PCS: one streaming session per comma-separated phrase ([{'text', 'session', 'offset'}], empty = single-prompt mode).
+        self.pcs_multi_streaming = []
+        self.tracker_model = None
+        self.tracker_processor = None
+        self.inference_session = None
+        self.model_dtype = torch.float32
+        self.image_model = None
+        self.image_processor = None
+
+        self.app_state = "IDLE"
+        self.prompt_mode_var = tk.StringVar(value="PVS")
+        self._previous_prompt_mode = "PVS"  
+
+        self.propagated_results = {}
+        self.propagation_segments = []
+        self.propagation_progress = 0
+        self.propagation_stop_requested = False
+        self.propagation_paused = False
+        self.propagation_pause_event = threading.Event()
+        self.propagation_pause_event.set()  # Not paused initially
+        self.propagation_current_frame_idx = 0
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.dlmi_hook_active = False
+        self.cut_point_frame = None
+        self.cut_start_frame = 0
+
+        self.review_current_frame = 0
+        self.is_reviewing = False
+        self.discarded_frames = set()
+
+        self.chunk_error_threshold_var = tk.DoubleVar(value=0.15)
+        self.chunk_temp_save_dir = None
+        self.chunk_processing = False
+
+        self.tracked_objects = {}
+        # Raw (pre-threshold) logit maps per object for the CURRENT frame.
+        self.current_confidence_masks = {}
+        self.next_obj_id_to_propose = 1
+        self.playback_paused = True
+        self.autolabel_active = False
+        self.current_cv_frame = None
+        self.displayed_frame_bgr = None
+        self.displayed_overlay_masks = {}
+        self.displayed_frame_idx = 0
+        self.displayed_pose_visible = True
+        self.current_frame_save_in_progress = False
+        self.current_frame_pil_rgb_original = None
+        self.current_frame_idx_conceptual = 0
+        self.processing_thread = None
+        self.object_colors = {}
+        self.is_tracking_ever_started = False
+        self.last_active_tracked_sam_ids = set()
+        self.selected_object_sam_id = None
+        self.selected_objects_sam_ids = set()  
+        self.object_groups = {} 
+        self.sam_id_to_group = {}  
+        self.next_group_id = 1  
+        self.is_ctrl_pressed = False
+        self.is_shift_pressed = False
+        self.is_alt_pressed = False  
+        self.bbox_start_canvas_coords = None
+        self.scale_x = 1.0
+        self.scale_y = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        self.just_reset_sam = False
+        self.sam_operation_in_progress = False
+        self._tracking_fatal_error = None
+        self._resize_job_id = None
+
+        self.AUTOLABEL_FOLDER_val = AUTOLABEL_FOLDER
+        self.LABELME_VERSION_val = LABELME_VERSION
+
+        self.suppressed_sam_ids = set()
+
+        self.pcs_text_prompt_var = tk.StringVar(value="")
+        self.pcs_detection_threshold_var = tk.DoubleVar(value=0.5)
+        self.pcs_mask_threshold_var = tk.DoubleVar(value=0.5)
+        self.pcs_exemplar_boxes = []
+        self.pcs_exemplar_labels = []
+
+        self.erosion_kernel_size = tk.IntVar(value=DEFAULT_EROSION_KERNEL_SIZE)
+        self.erosion_iterations = tk.IntVar(value=DEFAULT_EROSION_ITERATIONS)
+        self.min_bbox_area_for_reprompt = tk.IntVar(value=DEFAULT_MIN_BBOX_AREA_FOR_REPROMPT)
+        self.default_object_label_var = tk.StringVar(value="object")
+        self.labeling_mode_var = tk.StringVar(value="Instance")
+        self.overwrite_policy = "rename"
+        self.sam_apply_closing_var = tk.BooleanVar(value=False)
+        self.sam_closing_kernel_size_var = tk.IntVar(value=DEFAULT_SAM_CLOSING_KERNEL_SIZE)
+
+        self.problematic_objects_flagged = {}
+        self.interaction_correction_pending = None
+        self.problematic_highlight_active_sam_id = None
+        self.reassign_bbox_mode_active_sam_id = None
+
+        self.polygon_mode_active = False
+        self.polygon_points = []
+        self.polygon_objects = []
+
+        self.paint_mode_active = False
+        self.paint_stroke_mask = None
+        self.paint_negative_stroke_mask = None
+        self.paint_stroke_active = False
+        self.paint_last_image_pt = None
+        self.paint_undo_stack = []
+        self.paint_stroke_start_image_pt = None
+        self.paint_stroke_start_canvas_pt = None
+        self.paint_line_base_mask = None
+
+        # Slider-relative index of the frame the user started pre-propagate labelling on.
+        self.label_anchor_frame_idx = None
+
+        self.negative_area_mode_active = False
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+
+        self.multi_choose_mode_active = False
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+
+        self.ignore_edge_labels_var = tk.BooleanVar(value=False)
+        self.edge_margin_var = tk.IntVar(value=DEFAULT_EDGE_MARGIN)
+
+        self.new_object_method_var = tk.StringVar(value="reset")
+
+        self.mid_new_object_method_var = tk.StringVar(value="off")
+        self._suppress_mid_session_guard = False
+
+        self.use_custom_save_path_var = tk.BooleanVar(value=False)
+        self.custom_save_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), AUTOLABEL_FOLDER, "custom_output"))
+        self.custom_folder_name_var = tk.StringVar(value="{video_name}_dataset")
+        self.custom_file_name_var = tk.StringVar(value="{video_name}_frame")
+
+        # Optional: route YOLO-pose labels to a separate root that's fully decoupled from the seg-label save dir.
+        self.use_custom_pose_save_path_var = tk.BooleanVar(value=False)
+        self.custom_pose_save_dir_var = tk.StringVar(
+            value=os.path.join(os.getcwd(), AUTOLABEL_FOLDER, "custom_pose_output")
+        )
+
+        self.batch_processing_mode_var = tk.BooleanVar(value=False)
+        self.batch_source_dir_var = tk.StringVar()
+        self.batch_video_files = []
+        self.batch_current_index = -1
+        self.batch_save_option_var = tk.StringVar(value="subfolder")
+        self.batch_filename_option_var = tk.StringVar(value="video_name")
+        self.is_batch_running = False
+        self.is_batch_video_finished = False
+
+        self.video_display_name = ""
+        self.video_total_frames = 0
+        self.video_fps = 0
+        self.video_resolution = ""
+        self.info_video_name_var = tk.StringVar(value="N/A")
+        self.info_video_resolution_var = tk.StringVar(value="N/A")
+        self.info_video_total_frames_var = tk.StringVar(value="N/A")
+        self.info_video_fps_var = tk.StringVar(value="N/A")
+        self.info_batch_progress_var = tk.StringVar(value="N/A")
+
+        self.save_format_var = tk.StringVar(value="labelme")
+        self.yolo_class_names_for_save = []
+        self.yolo_nc = 0
+        self.yolo_dataset_initialized = False
+
+        self.batch_move_completed_var = tk.BooleanVar(value=False)
+        self.batch_completed_dir_var = tk.StringVar(value=os.path.join(os.getcwd(), "completed_videos"))
+
+        self.allow_image_source_var = tk.BooleanVar(value=False)
+        self.is_image_source = False
+
+        self.mask_alpha_var = tk.IntVar(value=153)
+
+        self.filter_small_objects_var = tk.BooleanVar(value=False)
+        self.small_object_threshold_var = tk.DoubleVar(value=0.001)
+
+        self.filter_small_contours_var = tk.BooleanVar(value=False)
+        self.small_contour_threshold_var = tk.DoubleVar(value=0.0001)
+        self.mask_point_spacing_var = tk.DoubleVar(value=0.005)
+        self.small_contour_base_var = tk.StringVar(value="image")
+
+
+        self.low_level_api_enabled_var = tk.BooleanVar(value=False)
+        # git / 3.1 backend compute precision PREFERENCE.
+        self.git_fp32_var = tk.BooleanVar(value=False)
+        # Mirrors the ACTIVE backend's precision in the toolbar fp32 checkbox without clobbering the git/3.1 preference.
+        self.backend_fp32_display_var = tk.BooleanVar(value=False)
+        self.dlmi_alpha_var = tk.DoubleVar(value=10.0)
+        self.dlmi_preserve_memory_var = tk.BooleanVar(value=False)
+        self.dlmi_boost_cond_var = tk.BooleanVar(value=False)
+        # Background confidence (%): keep some foreground belief on the background to absorb labelling misses.
+        self.dlmi_bg_conf_enabled_var = tk.BooleanVar(value=False)
+        self.dlmi_bg_conf_value_var = tk.DoubleVar(value=5.0)
+        # Boundary softening: hold a band around the mask edge at a user-picked confidence (in/out selectable, optional gradient, width in % of image width).
+        self.dlmi_boundary_soft_enabled_var = tk.BooleanVar(value=False)
+        self.dlmi_boundary_soft_inside_var = tk.BooleanVar(value=True)
+        self.dlmi_boundary_soft_outside_var = tk.BooleanVar(value=True)
+        self.dlmi_boundary_soft_gradient_var = tk.BooleanVar(value=False)
+        self.dlmi_boundary_soft_width_var = tk.DoubleVar(value=1.0)
+        self.dlmi_boundary_soft_conf_var = tk.DoubleVar(value=50.0)
+        # Mask binarisation threshold as a confidence %, applied wherever a tracker logit map is turned into an object mask.
+        self.mask_conf_threshold_var = tk.DoubleVar(value=50.0)
+        # PCS results recorded for the automatic PCS→PVS DLMI hand-off.
+        self.pcs_dlmi_transfer_record = {}
+
+        self.sam2_enabled_var = tk.BooleanVar(value=False)
+        self.sam2_tracking_enabled_var = tk.BooleanVar(value=False)
+        self.sam2_model = None
+        self.sam2_processor = None
+        self.sam2_model_id = "facebook/sam2.1-hiera-large"
+        self.sam2_masks = {}
+        self.sam2_prompt_points = {}
+        self.sam2_image_embeddings = {}
+        self.sam2_loading_in_progress = False
+
+        self.label_font_size_percent_var = tk.DoubleVar(value=0.7)
+        self.polygon_point_size_percent_var = tk.DoubleVar(value=0.4)
+        self.polygon_vertex_size_percent_var = tk.DoubleVar(value=0.4)
+        # Paint-brush diameter in image pixels (persisted like every other tk.Variable).
+        self.paint_brush_size_var = tk.IntVar(value=30)
+        self.show_object_border_var = tk.BooleanVar(value=False)
+        self.tabs_visible_var = tk.BooleanVar(value=True)
+        self.show_prompt_visualization_var = tk.BooleanVar(value=False)
+        self.show_prompt_per_object_var = tk.BooleanVar(value=False)
+        self.object_prompt_history = {}
+
+        try:
+            from util import pose_ui as _pose_ui
+            self._pose_ui = _pose_ui
+        except Exception as _pose_ui_err:
+            logger.warning(f"pose_ui module load failed: {_pose_ui_err}")
+            self._pose_ui = None
+
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.pose_config_path = os.path.join(app_dir, "pose_config.json")
+        if self._pose_ui is not None:
+            self.pose_config = self._pose_ui.load_pose_config(self.pose_config_path)
+        else:
+            self.pose_config = {}
+        self.pose_tapnext_enabled_var = tk.BooleanVar(value=False)
+        self.pose_add_mode_var = tk.BooleanVar(value=False)
+        self.pose_chain_mode_var = tk.BooleanVar(value=False)
+        self.pose_automatch_var = tk.BooleanVar(value=False)
+        self.selected_pose_points = set()
+        self.pose_tracker = None
+        self.yolo_pose_detector = None
+
+        try: self.label_font = ImageFont.truetype("arial.ttf", 15)
+        except IOError: self.label_font = ImageFont.load_default()
+
+        # Cache for dynamic-sized labels in _display_cv_frame_on_view.
+        self._dynamic_font_cache = {}
+        self._dynamic_font_paths = (
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "arial.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+        )
+
+        if torch.cuda.is_available(): self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available(): self.device = torch.device("mps"); logger.info("Using MPS.")
+        else: self.device = torch.device("cpu")
+        logger.info(f"Device: {self.device}")
+
+        self.autocast_context = torch.autocast("cuda", dtype=torch.float32) if self.device.type == "cuda" else contextlib.nullcontext()
+
+        self.sam_interaction_module = sam_interaction
+        self.autolabel_workflow_module = autolabel_workflow
+
+        # Active model backend selector ("hug" | "git" | "3.1").
+        self.active_backend_var = tk.StringVar(value="hug")
+        self.backend_manager = get_backend_manager(self)
+
+        # Load persisted settings before AppView so bound widgets show them on first paint.
+        self._user_settings_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "user_settings.json"
+        )
+        try:
+            self._load_user_settings()
+        except Exception as _settings_err:
+            logger.warning(f"User settings auto-load skipped: {_settings_err}")
+
+        self.view = AppView(self.root, self)
+
+        self._suppress_pose_class_trace = False
+        self.root.after(200, self._refresh_pose_class_menu)
+
+        self.root.after(100, self._init_models)
+        logger.info("SAM3AutolabelApp initialized.")
+
+    def _canvas_to_image_coords(self, canvas_x, canvas_y):
+        if not self.current_frame_pil_rgb_original:
+            logger.warning("_canvas_to_image_coords: current_frame_pil_rgb_original is None")
+            return canvas_x, canvas_y
+
+        if self.scale_x == 0 or self.scale_y == 0:
+            logger.warning("_canvas_to_image_coords: scale_x/y not set or zero")
+            return canvas_x, canvas_y
+
+        # Recompute canvas size drift between last display_image call and now.
+        try:
+            canvas_w = self.view.canvas.winfo_width()
+            canvas_h = self.view.canvas.winfo_height()
+            orig_w, orig_h = self.current_frame_pil_rgb_original.size
+            expected_display_w = orig_w / self.scale_x
+            expected_display_h = orig_h / self.scale_y
+            expected_offset_x = (canvas_w - expected_display_w) // 2
+            expected_offset_y = (canvas_h - expected_display_h) // 2
+            drift = (abs(expected_offset_x - self.offset_x) > 2 or
+                     abs(expected_offset_y - self.offset_y) > 2)
+            if drift and self.current_cv_frame is not None:
+                logger.info(
+                    f"_canvas_to_image_coords drift detected: "
+                    f"canvas={canvas_w}x{canvas_h} cached offset=({self.offset_x},{self.offset_y}) "
+                    f"expected=({expected_offset_x},{expected_offset_y}); refreshing display."
+                )
+                self._display_cv_frame_on_view(
+                    self.current_cv_frame, self._get_current_masks_for_display()
+                )
+        except (tk.TclError, AttributeError, ZeroDivisionError):
+            pass
+
+        orig_w, orig_h = self.current_frame_pil_rgb_original.size
+        img_x = (canvas_x - self.offset_x) * self.scale_x
+        img_y = (canvas_y - self.offset_y) * self.scale_y
+        result = (int(max(0, min(img_x, orig_w - 1))),
+                  int(max(0, min(img_y, orig_h - 1))))
+        logger.debug(
+            f"click canvas=({canvas_x},{canvas_y}) "
+            f"scale=({self.scale_x:.3f},{self.scale_y:.3f}) "
+            f"offset=({self.offset_x},{self.offset_y}) -> img={result}"
+        )
+        return result
+
+    def _is_pre_propagate_phase(self):
+        """True when no propagation has run yet for the current source/cut."""
+        if self.app_state in ("PROPAGATING", "PAUSED", "REVIEWING", "LABELING"):
+            return False
+        if self.propagated_results:
+            return False
+        return True
+
+    def _ensure_label_anchor_or_confirm_switch(self):
+        """Guard for any pre-propagate labeling action."""
+        if not self._is_pre_propagate_phase():
+            return True
+
+        cur = getattr(self, 'review_current_frame', 0)
+
+        if self.label_anchor_frame_idx is None:
+            if self.tracked_objects or self.polygon_objects:
+                self.label_anchor_frame_idx = cur
+            else:
+                self.label_anchor_frame_idx = cur
+            return True
+
+        if cur == self.label_anchor_frame_idx:
+            return True
+
+        if not self.tracked_objects and not self.polygon_objects:
+            # Nothing to lose — silently move the anchor to the new frame.
+            self.label_anchor_frame_idx = cur
+            return True
+
+        cut_offset = getattr(self, 'cut_start_frame', 0)
+        anchor_abs = self.label_anchor_frame_idx + cut_offset
+        cur_abs = cur + cut_offset
+        proceed = messagebox.askyesno(
+            "Switch labeling frame?",
+            f"You started labeling at frame {anchor_abs}.\n\n"
+            f"Discard those labels and start over at frame {cur_abs}?\n\n"
+            f"Yes: Clear current labels and restart here\n"
+            f"No: Cancel — go back to frame {anchor_abs} to continue",
+            parent=self.root,
+        )
+        if not proceed:
+            try:
+                if hasattr(self, 'view') and hasattr(self.view, 'review_frame_slider'):
+                    self.view.review_frame_slider.set(self.label_anchor_frame_idx)
+            except Exception:
+                pass
+            return False
+
+        # User chose to discard and re-anchor here.
+        self.tracked_objects.clear()
+        self.next_obj_id_to_propose = 1
+        self.polygon_mode_active = False
+        self.polygon_points = []
+        self.polygon_objects.clear()
+        self.paint_mode_active = False
+        self._clear_paint_state()
+        try:
+            if hasattr(self, 'object_prompt_history'):
+                self.object_prompt_history.clear()
+        except Exception:
+            pass
+        self.selected_object_sam_id = None
+        self.selected_objects_sam_ids.clear()
+        try:
+            self._reset_inference_session()
+        except Exception as _e:
+            logger.debug(f"_reset_inference_session in anchor switch: {_e}")
+        self.label_anchor_frame_idx = cur
+        self._update_obj_id_info_label()
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, {})
+        return True
+
+    def _handle_sam_prompt_wrapper(self, prompt_type, coords, label=None,
+                                  proposed_obj_id_for_new=None, target_existing_obj_id=None,
+                                  custom_label=None):
+        if self.app_state == "PAUSED":
+            self.update_status("Paused: BBox/Point prompts blocked (session protection). Use polygon mode + DLMI injection instead.")
+            return
+
+        # Prompts only make sense on the anchor frame; on another frame ask whether to re-anchor there.
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return
+
+        is_new_object = (proposed_obj_id_for_new is not None) and (target_existing_obj_id is None)
+        has_existing_state = bool(self.tracked_objects) or bool(self.propagated_results)
+        is_mid_session = (self.app_state == "REVIEWING") or bool(self.is_tracking_ever_started)
+        if is_new_object and has_existing_state and is_mid_session and not self._suppress_mid_session_guard:
+            method = self.mid_new_object_method_var.get() if hasattr(self, 'mid_new_object_method_var') else "off"
+            if method == "off":
+                messagebox.showwarning(
+                    "New Object Blocked",
+                    "Existing tracked/propagated labels remain.\n\n"
+                    "Adding a new object now would reset the session and lose anchor on the current frame.\n\n"
+                    "In the Propagate tab, set 'Mid-session new object' to 'DLMI inject' or 'Load labels' to preserve existing labels and continue from this frame.",
+                    parent=self.root
+                )
+                self.update_status("New object blocked: mid-session option is Off.")
+                return
+            elif method in ("dlmi", "load"):
+                self._mid_session_macro_add(
+                    prompt_type, coords, label,
+                    proposed_obj_id_for_new, custom_label,
+                    use_load=(method == "load"),
+                )
+                return
+
+        if self.sam2_enabled_var.get() and self.sam2_model is not None:
+            self._handle_sam2_prompt(prompt_type, coords, label,
+                                    proposed_obj_id_for_new, target_existing_obj_id,
+                                    custom_label)
+        else:
+            self.sam_interaction_module.handle_sam_prompt(
+                self, prompt_type, coords, label,
+                proposed_obj_id_for_new, target_existing_obj_id,
+                custom_label
+            )
+
+    def _mid_session_snapshot_precise_masks(self):
+        """Snapshot exact masks of existing objects so the standard new-object flow can't degrade them."""
+        snap = {}
+        for oid, data in self.tracked_objects.items():
+            mask = data.get('last_mask')
+            if mask is None or not mask.any():
+                continue
+            snap[oid] = {
+                'last_mask': mask.copy(),
+                'custom_label': data.get('custom_label'),
+            }
+        return snap
+
+    def _mid_session_polygon_roundtrip(self, snapshot):
+        """Emulate 'save labels then reload' by converting each preserved mask into a polygon and back into a filled mask."""
+        converted = {}
+        for oid, data in snapshot.items():
+            mask = data['last_mask']
+            poly = build_mask_polygon(
+                mask, spacing_ratio=mask_point_spacing_ratio(self))
+            if poly is None or len(poly) < 3:
+                continue
+            h, w = mask.shape[:2]
+            rebuilt = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(rebuilt, [poly.astype(np.int32).reshape(-1, 1, 2)], 255)
+            rebuilt_bool = rebuilt > 0
+            if not rebuilt_bool.any():
+                continue
+            converted[oid] = {
+                'last_mask': rebuilt_bool,
+                'custom_label': data.get('custom_label'),
+            }
+        return converted
+
+    def _mid_session_macro_add(self, prompt_type, coords, label,
+                               proposed_obj_id_for_new, custom_label,
+                               use_load=False):
+        """One-click macro for mid-session new-object addition."""
+        if self.current_cv_frame is None:
+            messagebox.showerror("Error", "No current frame.", parent=self.root)
+            return
+        snapshot = self._mid_session_snapshot_precise_masks()
+        if not snapshot:
+            messagebox.showwarning("Notice", "No valid existing masks to preserve.", parent=self.root)
+            return
+
+        if use_load:
+            snapshot = self._mid_session_polygon_roundtrip(snapshot)
+            if not snapshot:
+                messagebox.showwarning("Notice", "Polygon roundtrip lost all masks.", parent=self.root)
+                return
+
+        new_id = proposed_obj_id_for_new
+        if new_id is None or new_id in snapshot:
+            new_id = max(snapshot.keys()) + 1
+        self.next_obj_id_to_propose = max(self.next_obj_id_to_propose, new_id + 1)
+
+        preserved_groups = {gid: set(members) for gid, members in self.object_groups.items()}
+        preserved_next_group_id = self.next_group_id
+
+        self.tracked_objects.clear()
+        self.object_groups.clear()
+        self.sam_id_to_group.clear()
+        self.next_group_id = 1
+        self.suppressed_sam_ids.clear()
+        self.current_confidence_masks = {}
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
+        self.is_tracking_ever_started = False
+        self.inference_session = None
+
+        self._suppress_mid_session_guard = True
+        try:
+            if self.sam2_enabled_var.get() and self.sam2_model is not None:
+                self._handle_sam2_prompt(
+                    prompt_type, coords, label,
+                    new_id, None, custom_label
+                )
+            else:
+                self.sam_interaction_module.handle_sam_prompt(
+                    self, prompt_type, coords, label,
+                    new_id, None, custom_label
+                )
+        finally:
+            self._suppress_mid_session_guard = False
+
+        new_obj_mask = None
+        if new_id in self.tracked_objects:
+            new_obj_mask = self.tracked_objects[new_id].get('last_mask')
+
+        for oid, data in snapshot.items():
+            if oid == new_id:
+                continue
+            self.tracked_objects[oid] = {
+                'custom_label': data.get('custom_label'),
+                'last_mask': data['last_mask'],
+                'mid_session_added': False,
+            }
+
+        if new_id in self.tracked_objects:
+            self.tracked_objects[new_id]['mid_session_added'] = True
+
+        self.object_groups.clear()
+        self.sam_id_to_group.clear()
+        for gid, members in preserved_groups.items():
+            surviving = {m for m in members if m in self.tracked_objects and m != new_id}
+            if len(surviving) >= 2:
+                self.object_groups[gid] = surviving
+                for m in surviving:
+                    self.sam_id_to_group[m] = gid
+        self.next_group_id = max(
+            preserved_next_group_id,
+            (max(self.object_groups) + 1) if self.object_groups else 1,
+        )
+
+        if new_obj_mask is None or not new_obj_mask.any():
+            logger.warning(
+                f"Mid-session add: new object {new_id} produced an empty mask from the SAM3 prompt. "
+                f"Existing labels preserved."
+            )
+
+        try:
+            self.inject_low_level_mask_prompt(force=True)
+            if new_id in self.tracked_objects:
+                self.tracked_objects[new_id]['mid_session_added'] = True
+        except Exception as e:
+            logger.exception(f"Mid-session DLMI re-seed failed: {e}")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+        valid_count = sum(
+            1 for data in self.tracked_objects.values()
+            if data.get('last_mask') is not None and data['last_mask'].any()
+        )
+        mode_name = "Load" if use_load else "DLMI"
+        logger.info(
+            f"Mid-session {mode_name} macro complete. "
+            f"tracked_objects={sorted(self.tracked_objects.keys())} "
+            f"({valid_count} with valid mask). new_id={new_id}."
+        )
+        self.update_status(
+            f"Mid-session {mode_name}: added object {new_id}, {len(snapshot)} existing preserved."
+        )
+    
+    def update_status(self, message):
+        if self.view: self.view.update_status(message)
+
+    def _mask_logit_threshold(self):
+        """Mask binarisation threshold in logit space, derived from the user's object-confidence threshold (%)."""
+        from util.backends.dlmi_core import confidence_to_logit
+        try:
+            pct = float(self.mask_conf_threshold_var.get())
+        except Exception:
+            pct = 50.0
+        return confidence_to_logit(min(max(pct, 1.0), 99.0))
+
+    def reapply_mask_threshold(self):
+        """Re-binarise current masks from their stored logit maps so the threshold slider takes effect immediately; returns #updated."""
+        if self.app_state in ("PROPAGATING", "REVIEWING"):
+            return 0
+        conf_maps = getattr(self, 'current_confidence_masks', None)
+        if not conf_maps or not self.tracked_objects or self.current_cv_frame is None:
+            return 0
+
+        thr = self._mask_logit_threshold()
+        h, w = self.current_cv_frame.shape[:2]
+        apply_closing = self.sam_apply_closing_var.get()
+        closing_kernel = self.sam_closing_kernel_size_var.get()
+
+        updated = 0
+        for obj_id, data in self.tracked_objects.items():
+            if not data or data.get('last_mask') is None:
+                continue
+            conf = conf_maps.get(obj_id)
+            if conf is None:
+                continue
+            proc = process_sam_mask(conf, (w, h), apply_closing=apply_closing,
+                                    closing_kernel_size=closing_kernel,
+                                    logit_threshold=thr)
+            if proc is None:
+                continue
+            data['last_mask'] = proc
+            updated += 1
+            # Keep the synthetic frame-0 snapshot (cut+DLMI / cut+load) in sync so slider-triggered redraws don't show the stale mask.
+            rf = getattr(self, 'review_current_frame', 0)
+            entry = self.propagated_results.get(rf)
+            if entry and obj_id in entry.get('masks', {}):
+                entry['masks'][obj_id]['last_mask'] = proc
+
+        if updated:
+            self._display_cv_frame_on_view(
+                self.current_cv_frame, self._get_current_masks_for_display())
+            logger.info(f"Object conf threshold re-applied to {updated} mask(s) "
+                        f"(logit thr {thr:+.3f}).")
+        return updated
+
+    def _update_obj_id_info_label(self): 
+        if self.view: self.view.update_obj_id_info_label()
+
+    def _init_models(self):
+        # Resolve the desired backend (persisted selection), falling back to an available one.
+        avail = self.backend_manager.availability(refresh=True)
+        key = self.active_backend_var.get()
+        if not avail.get(key, False):
+            if key != "hug":
+                self.update_status(f"Backend '{key}' unavailable; falling back to HuggingFace.")
+            key = "hug"
+            self.active_backend_var.set("hug")
+        if not any(avail.values()):
+            self.update_status("No SAM3 backend installed (transformers / official sam3).")
+            return
+
+        ok = self.backend_manager.switch(key, on_status=self.update_status)
+        # Reflect availability/active state on the backend buttons if UI is ready.
+        if hasattr(self.view, "refresh_backend_buttons"):
+            try:
+                self.view.refresh_backend_buttons(avail, self.active_backend_var.get())
+            except Exception as _e:
+                logger.debug(f"refresh_backend_buttons skipped: {_e}")
+        if ok and self.backend is not None and self.backend.is_loaded():
+            self.update_status("SAM3 model loaded. Source selection available.")
+            self.view.set_ui_element_state("btn_select_source", tk.NORMAL)
+        else:
+            self.update_status("SAM3 model load failed.")
+
+    def _teardown_for_backend_switch(self):
+        """Invalidate all model-bound session/hook state before switching the active backend (sessions/hooks belong to the outgoing model)."""
+        try:
+            self._remove_dlmi_persistent_hooks()
+        except Exception as e:
+            logger.debug(f"teardown: remove DLMI persistent hooks failed: {e}")
+        for attr in ("inference_session", "pcs_inference_session", "pcs_streaming_session"):
+            if hasattr(self, attr):
+                setattr(self, attr, None)
+        self.pcs_multi_streaming = []
+        self.current_confidence_masks = {}
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.dlmi_hook_active = False
+
+    def on_backend_button(self, key):
+        """Backend radiobutton handler: confirm, then switch on a worker thread (model load can take seconds)."""
+        mgr = self.backend_manager
+        current = mgr.active.key if mgr.active else None
+        if key == current:
+            return
+        avail = mgr.availability()
+        if not avail.get(key, False):
+            self.update_status(f"Backend '{key}' is unavailable.")
+            self.active_backend_var.set(current or "hug")
+            return
+        if not messagebox.askyesno(
+            "Switch Backend",
+            f"Switch model backend to '{key}'?\n\n"
+            "This resets the current tracking session and DLMI state.",
+            parent=self.root,
+        ):
+            self.active_backend_var.set(current or "hug")
+            return
+        self.view.set_backend_buttons_enabled(False)
+        self.update_status(f"Switching to backend '{key}'... (loading model)")
+        self.view.show_loading_dialog(
+            f"Loading backend '{key}' ...\nLoading model weights, please wait.")
+
+        def _status(m):
+            def _upd():
+                self.update_status(m)
+                self.view.update_loading_message(m)
+            self.root.after(0, _upd)
+
+        def _worker():
+            ok = mgr.switch(key, on_status=_status)
+
+            def _done():
+                self.view.hide_loading_dialog()
+                new_active = mgr.active.key if mgr.active else (current or "hug")
+                self.view.refresh_backend_buttons(mgr.availability(), new_active)
+                self.view.set_backend_buttons_enabled(True)
+                if ok and self.backend is not None and self.backend.is_loaded():
+                    self.view.set_ui_element_state("btn_select_source", tk.NORMAL)
+            self.root.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _init_sam3_models(self):
+        self.update_status("Loading SAM3 models... (May be downloading from HuggingFace)")
+        try:
+            model_dtype = torch.float32
+            self.model_dtype = model_dtype
+
+            logger.info(f"Loading SAM3 PCS Video model: {SAM3_MODEL_ID}")
+            self.pcs_model = Sam3VideoModel.from_pretrained(
+                SAM3_MODEL_ID, torch_dtype=model_dtype
+            ).to(self.device).eval()
+            self.pcs_processor = Sam3VideoProcessor.from_pretrained(SAM3_MODEL_ID)
+            logger.info("SAM3 PCS Video model loaded")
+
+            logger.info(f"Loading SAM3 Tracker model: {SAM3_MODEL_ID}")
+            self.tracker_model = Sam3TrackerVideoModel.from_pretrained(
+                SAM3_MODEL_ID, torch_dtype=model_dtype
+            ).to(self.device).eval()
+            self.tracker_processor = Sam3TrackerVideoProcessor.from_pretrained(SAM3_MODEL_ID)
+            logger.info("SAM3 Tracker model loaded")
+
+            logger.info(f"Loading SAM3 Image model: {SAM3_MODEL_ID}")
+            self.image_model = Sam3Model.from_pretrained(
+                SAM3_MODEL_ID, torch_dtype=model_dtype
+            ).to(self.device).eval()
+            self.image_processor = Sam3Processor.from_pretrained(SAM3_MODEL_ID)
+            logger.info("SAM3 Image model loaded")
+
+            self.update_status("SAM3 models loaded.")
+            self.view.set_ui_element_state("btn_clear_tracked", tk.NORMAL)
+            self.view.set_ui_element_state("btn_set_custom_label", tk.NORMAL)
+
+        except Exception as e:
+            logger.exception("SAM3 model load failed:")
+            self.update_status(f"SAM3 load error: {e}")
+            self.pcs_model = None
+            self.pcs_processor = None
+            self.tracker_model = None
+            self.tracker_processor = None
+            self.view.set_ui_element_state("btn_set_custom_label", tk.DISABLED)
+
+    def _init_inference_session(self, for_pcs_mode=False, preserve_annotations=False):
+        if not preserve_annotations:
+            self._reset_group_and_polygon_state()
+
+        model_dtype = torch.float32
+
+        if for_pcs_mode:
+            if self.pcs_processor is None:
+                logger.error("PCS processor is not initialized.")
+                return False
+            try:
+                if not self.video_frames_cache:
+                    logger.error("Video frame cache required for PCS mode.")
+                    return False
+
+                self.pcs_inference_session = self.pcs_processor.init_video_session(
+                    video=self.video_frames_cache,
+                    inference_device=self.device,
+                    processing_device="cpu",
+                    video_storage_device="cpu",
+                    dtype=model_dtype,
+                )
+                logger.info("SAM3 PCS inference session initialized")
+                return True
+            except Exception as e:
+                logger.exception("SAM3 PCS inference session init failed:")
+                self.pcs_inference_session = None
+                self.pcs_streaming_session = None
+                return False
+        else:
+            if self.tracker_processor is None:
+                logger.error("Tracker processor is not initialized.")
+                return False
+            try:
+                self.inference_session = self.tracker_processor.init_video_session(
+                    inference_device=self.device,
+                    processing_device="cpu",
+                    video_storage_device="cpu",
+                    dtype=model_dtype,
+                )
+                logger.info("SAM3 Tracker inference session initialized (streaming mode)")
+                return True
+            except Exception as e:
+                logger.exception("SAM3 Tracker inference session init failed:")
+                self.inference_session = None
+                return False
+
+    def _reset_inference_session(self):
+        self._remove_dlmi_persistent_hooks()
+        if self.inference_session is not None:
+            try:
+                self.inference_session.reset_inference_session()
+                logger.info("SAM3 inference session reset complete")
+            except Exception as e:
+                logger.warning(f"SAM3 inference session reset error: {e}")
+        return self._init_inference_session()
+
+    @property
+    def predictor(self):
+        return self.tracker_model
+
+    @predictor.setter
+    def predictor(self, value):
+        self.tracker_model = value
+
+    @property
+    def is_predictor_loaded_first_frame(self):
+        return self.inference_session is not None
+
+    @is_predictor_loaded_first_frame.setter
+    def is_predictor_loaded_first_frame(self, value):
+        pass
+
+    @property
+    def backend(self):
+        """Currently active SamBackend instance (or None before load)."""
+        mgr = getattr(self, "backend_manager", None)
+        return mgr.active if mgr is not None else None
+
+    def _on_labeling_mode_change(self):
+        logger.info(f"Labeling mode changed: {self.labeling_mode_var.get()}")
+
+    def _set_custom_label_for_selected(self):
+        if self._is_any_special_mode_active():
+             messagebox.showwarning("Notice", "Auto-correction/reassignment interaction in progress. Label assignment only available when paused.", parent=self.root)
+             return
+        if not self.playback_paused: messagebox.showwarning("Notice", "Label assignment only available when paused.", parent=self.root); return
+        if self.selected_object_sam_id is None: messagebox.showinfo("Notice", "Select an object first (Ctrl+Left click).", parent=self.root); return
+
+        current_data = self.tracked_objects.get(self.selected_object_sam_id, {}); current_custom_label = current_data.get("custom_label", "")
+
+        if self.save_format_var.get() in ["yolo", "both"] and self.yolo_class_names_for_save:
+            from tkinter import ttk
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Select Object Class")
+            dialog.geometry("300x150")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            tk.Label(dialog, text=f"Select class for object ID {self.selected_object_sam_id}:").pack(pady=10)
+
+            class_var = tk.StringVar(value=current_custom_label if current_custom_label in self.yolo_class_names_for_save else self.yolo_class_names_for_save[0])
+            combo = ttk.Combobox(dialog, textvariable=class_var, values=self.yolo_class_names_for_save, state="readonly")
+            combo.pack(pady=5)
+
+            result = {"label": None}
+
+            def on_ok():
+                result["label"] = class_var.get()
+                dialog.destroy()
+
+            def on_cancel():
+                dialog.destroy()
+
+            tk.Button(dialog, text="OK", command=on_ok).pack(side=tk.LEFT, padx=20, pady=10)
+            tk.Button(dialog, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=20, pady=10)
+
+            dialog.wait_window()
+            new_label = result["label"]
+        else:
+            new_label = simpledialog.askstring("Set Object Label", f"Enter name for object ID {self.selected_object_sam_id}:", initialvalue=current_custom_label, parent=self.root)
+
+        if new_label is not None:
+            if self.save_format_var.get() in ["yolo", "both"] and self.yolo_class_names_for_save:
+                if new_label not in self.yolo_class_names_for_save:
+                    response = messagebox.askyesnocancel(
+                        "Class Mismatch",
+                        f"Label '{new_label}' is not in the registered class list.\n\n"
+                        f"Yes: Add as new class\n"
+                        f"No: Re-enter label\n"
+                        f"Cancel: Abort operation",
+                        parent=self.root
+                    )
+                    if response is None:
+                        return
+                    elif response:
+                        self.yolo_class_names_for_save.append(new_label)
+                        self.yolo_nc = len(self.yolo_class_names_for_save)
+                        self._update_yolo_yaml()
+                        logger.info(f"New class '{new_label}' added. Total {self.yolo_nc} classes")
+                    else:
+                        return self._set_custom_label_for_selected()
+
+            if self.selected_object_sam_id in self.tracked_objects:
+                self.tracked_objects[self.selected_object_sam_id]["custom_label"] = new_label
+                logger.info(f"Object {self.selected_object_sam_id} label set to '{new_label}'."); self.update_status(f"Object {self.selected_object_sam_id} label: '{new_label}'")
+                if self.current_cv_frame is not None: self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            else: logger.warning(f"Label set attempt: Selected ID {self.selected_object_sam_id} not in tracked_objects.")
+
+    def merge_selected_objects(self):
+        if len(self.selected_objects_sam_ids) < 2:
+            messagebox.showwarning("Notice", "Select 2 or more objects.\nUse Ctrl+Left click to multi-select.", parent=self.root)
+            return
+
+        existing_groups = set()
+        for sam_id in self.selected_objects_sam_ids:
+            if sam_id in self.sam_id_to_group:
+                existing_groups.add(self.sam_id_to_group[sam_id])
+
+        if existing_groups:
+            target_group_id = min(existing_groups)
+            for other_group_id in existing_groups:
+                if other_group_id != target_group_id:
+                    for member_id in self.object_groups.get(other_group_id, set()):
+                        self.object_groups[target_group_id].add(member_id)
+                        self.sam_id_to_group[member_id] = target_group_id
+                    if other_group_id in self.object_groups:
+                        del self.object_groups[other_group_id]
+            group_id = target_group_id
+        else:
+            group_id = self.next_group_id
+            self.next_group_id += 1
+            self.object_groups[group_id] = set()
+
+        for sam_id in self.selected_objects_sam_ids:
+            self.object_groups[group_id].add(sam_id)
+            self.sam_id_to_group[sam_id] = group_id
+
+        first_obj_id = min(self.selected_objects_sam_ids)
+        first_obj_data = self.tracked_objects.get(first_obj_id, {})
+        group_label = first_obj_data.get("custom_label", self.default_object_label_var.get())
+
+        logger.info(f"Object group created/merged: Group ID={group_id}, members={self.object_groups[group_id]}, label={group_label}")
+        self.update_status(f"Object group {group_id} created: {len(self.object_groups[group_id])} objects merged")
+
+        self.selected_objects_sam_ids.clear()
+        self.selected_object_sam_id = None
+
+        if self.view and hasattr(self.view, 'btn_merge_objects'):
+            self.view.btn_merge_objects.config(state='disabled')
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+        self._update_interaction_status_and_label()
+
+    def unmerge_object_group(self, group_id):
+        if group_id not in self.object_groups:
+            logger.warning(f"Group {group_id} to unmerge does not exist.")
+            return
+
+        for sam_id in self.object_groups[group_id]:
+            if sam_id in self.sam_id_to_group:
+                del self.sam_id_to_group[sam_id]
+
+        del self.object_groups[group_id]
+        logger.info(f"Object group {group_id} unmerged")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def get_group_merged_mask(self, group_id, frame_masks=None):
+        if group_id not in self.object_groups:
+            return None
+
+        merged_mask = None
+        for sam_id in self.object_groups[group_id]:
+            if frame_masks and sam_id in frame_masks:
+                mask_data = frame_masks[sam_id]
+                if isinstance(mask_data, dict):
+                    mask = mask_data.get('last_mask')
+                else:
+                    mask = mask_data
+            elif sam_id in self.tracked_objects and "last_mask" in self.tracked_objects[sam_id]:
+                mask = self.tracked_objects[sam_id]["last_mask"]
+            else:
+                continue
+
+            if mask is not None:
+                if merged_mask is None:
+                    merged_mask = mask.copy().astype(bool)
+                else:
+                    merged_mask = merged_mask | mask.astype(bool)
+
+        return merged_mask
+
+    def is_sam_id_in_group(self, sam_id):
+        return sam_id in self.sam_id_to_group
+
+    def get_group_id_for_sam_id(self, sam_id):
+        return self.sam_id_to_group.get(sam_id, None)
+
+    def _reset_group_and_polygon_state(self):
+        self.object_groups.clear()
+        self.sam_id_to_group.clear()
+        self.next_group_id = 1
+
+        self.polygon_mode_active = False
+        self.polygon_points.clear()
+        self.polygon_objects.clear()
+
+        self.paint_mode_active = False
+        self._clear_paint_state()
+
+        if hasattr(self, 'view') and self.view is not None:
+            try:
+                self.view.update_polygon_mode_ui()
+            except Exception:
+                pass
+            try:
+                self.view.update_paint_mode_ui(False)
+            except Exception:
+                pass
+
+        logger.debug("Group/polygon state initialized")
+
+    def _confirm_enable_low_level_api(self):
+        """Warn that injection needs the low-level API and offer to turn it on right here."""
+        proceed = messagebox.askyesno(
+            "Notice",
+            "Low-level API (DLMI) is not enabled.\n"
+            "Injection only works with the 'Use Low-level API' option (Advanced tab) turned ON.\n\n"
+            "Turn it on now?",
+            icon=messagebox.WARNING,
+            parent=self.root,
+        )
+        if not proceed:
+            return False
+        self.low_level_api_enabled_var.set(True)
+        if self.view and hasattr(self.view, '_on_low_level_api_toggle'):
+            self.view._on_low_level_api_toggle()
+        logger.info("Low-level API enabled via Inject Data confirmation dialog")
+        return True
+
+    def _auto_complete_pending_manual_input(self):
+        """Fold an in-progress paint stroke / polygon into an object so injection includes it instead of wiping it."""
+        completed = False
+        if (self.paint_mode_active
+                and self.paint_stroke_mask is not None and self.paint_stroke_mask.any()):
+            self.complete_paint_object()
+            completed = True
+        if (self.polygon_mode_active and not self.negative_area_mode_active
+                and len(self.polygon_points) >= 3):
+            self.complete_polygon_object()
+            completed = True
+        if completed:
+            logger.info("Pending manual input auto-completed before DLMI injection")
+        return completed
+
+    def prepare_dlmi_mid_propagation(self):
+        """Prepare DLMI injection to apply on the next frame when propagation resumes."""
+        if not self.propagation_paused:
+            messagebox.showwarning("Notice", "Propagation is not paused.\nPause propagation first, then inject.", parent=self.root)
+            return
+
+        if not self.low_level_api_enabled_var.get():
+            if not self._confirm_enable_low_level_api():
+                return
+
+        self._auto_complete_pending_manual_input()
+
+        if not self.tracked_objects:
+            messagebox.showwarning("Notice", "No objects to inject.\nModify or add objects first.", parent=self.root)
+            return
+
+        masks_to_inject = {}
+        processed_sam_ids = set()
+
+        for group_id, member_sam_ids in self.object_groups.items():
+            merged_mask = self.get_group_merged_mask(group_id)
+            if merged_mask is None:
+                continue
+            representative_id = min(member_sam_ids)
+            first_obj_data = self.tracked_objects.get(representative_id, {})
+            label = first_obj_data.get('custom_label', self.default_object_label_var.get())
+            masks_to_inject[representative_id] = {
+                'mask': merged_mask.astype(np.uint8),
+                'label': label,
+            }
+            processed_sam_ids.update(member_sam_ids)
+
+        for obj_id, obj_data in self.tracked_objects.items():
+            if obj_id in processed_sam_ids:
+                continue
+            mask = obj_data.get('last_mask')
+            if mask is None or not mask.any():
+                continue
+            masks_to_inject[obj_id] = {
+                'mask': mask.astype(np.uint8),
+                'label': obj_data.get('custom_label', self.default_object_label_var.get()),
+            }
+
+        if not masks_to_inject:
+            messagebox.showwarning("Notice", "No valid masks to inject.", parent=self.root)
+            return
+
+        self.dlmi_pending_masks = masks_to_inject
+        self.dlmi_pending_injection = True
+        self.update_status(f"DLMI injection prepared ({len(masks_to_inject)} objects). Click 'Resume' to apply.")
+        logger.info(f"DLMI mid-propagation injection prepared: {len(masks_to_inject)} objects at paused frame {self.propagation_current_frame_idx}")
+
+    def inject_low_level_mask_prompt(self, force=False):
+        import torch.nn.functional as F
+
+        # If paused during propagation, use mid-propagation injection
+        if self.propagation_paused:
+            self.prepare_dlmi_mid_propagation()
+            return
+
+        if not force and not self.low_level_api_enabled_var.get():
+            if not self._confirm_enable_low_level_api():
+                return
+
+        self._auto_complete_pending_manual_input()
+
+        if not self.tracked_objects:
+            messagebox.showwarning("Notice", "No masks to inject.\nDetect objects first.", parent=self.root)
+            return
+
+        if self.tracker_model is None:
+            messagebox.showerror("Error", "SAM3 Tracker model not loaded.", parent=self.root)
+            return
+
+        if not hasattr(self.tracker_model, '_encode_new_memory'):
+            logger.error("tracker_model does not have _encode_new_memory method.")
+            messagebox.showerror("Error", "SAM3 model does not support Low-level API.\n_encode_new_memory method not found.", parent=self.root)
+            return
+
+        original_encode = None
+        restore_after_failure = None
+        try:
+            logger.info("Low-level API: Starting mask injection...")
+
+            masks_to_inject = {}
+            processed_sam_ids = set()
+
+            for group_id, member_sam_ids in self.object_groups.items():
+                merged_mask = self.get_group_merged_mask(group_id)
+                if merged_mask is None:
+                    continue
+
+                representative_id = min(member_sam_ids)
+                first_obj_data = self.tracked_objects.get(representative_id, {})
+                label = first_obj_data.get('custom_label', self.default_object_label_var.get())
+
+                masks_to_inject[representative_id] = {
+                    'mask': merged_mask.astype(np.uint8),
+                    'label': label,
+                    'is_group': True,
+                    'group_id': group_id,
+                    'member_count': len(member_sam_ids)
+                }
+                processed_sam_ids.update(member_sam_ids)
+                logger.info(f"Group {group_id}: {len(member_sam_ids)} objects -> merged to object ID {representative_id}")
+
+            for obj_id, obj_data in self.tracked_objects.items():
+                if obj_id in processed_sam_ids:
+                    continue
+                mask = obj_data.get('last_mask')
+                if mask is None or not mask.any():
+                    continue
+                masks_to_inject[obj_id] = {
+                    'mask': mask.astype(np.uint8),
+                    'label': obj_data.get('custom_label', self.default_object_label_var.get()),
+                    'is_group': False
+                }
+
+            if not masks_to_inject:
+                messagebox.showwarning("Notice", "No valid masks to inject.", parent=self.root)
+                return
+
+            logger.info("Initializing SAM3 session...")
+            self.inference_session = None
+            if not self._init_inference_session():
+                messagebox.showerror("Error", "SAM3 session initialization failed.", parent=self.root)
+                return
+
+            old_tracked_objects = self.tracked_objects.copy()
+            old_object_groups = {gid: set(members) for gid, members in self.object_groups.items()}
+            old_sam_id_to_group = self.sam_id_to_group.copy()
+            old_next_group_id = self.next_group_id
+
+            def _restore_annotations_after_failure():
+                # Injection consumed the annotations but never re-registered them — give the user's work back.
+                self.tracked_objects = old_tracked_objects
+                self.object_groups = old_object_groups
+                self.sam_id_to_group = old_sam_id_to_group
+                self.next_group_id = old_next_group_id
+                logger.warning("Injection failed mid-way: restored previous annotations")
+                if self.current_cv_frame is not None:
+                    self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+            restore_after_failure = _restore_annotations_after_failure
+            self.tracked_objects.clear()
+            self.object_groups.clear()
+            self.sam_id_to_group.clear()
+            self.next_group_id = 1
+            self.suppressed_sam_ids.clear()
+            logger.info("Low data injection: suppressed_sam_ids cleared")
+            if hasattr(self, 'object_prompt_history'):
+                self.object_prompt_history.clear()
+                logger.info("Low data injection: object_prompt_history cleared")
+
+            frame_idx = 0
+            dtype = self.model_dtype
+            injected_count = 0
+
+            if self.current_cv_frame is None:
+                messagebox.showerror("Error", "No current frame.", parent=self.root)
+                _restore_annotations_after_failure()
+                return
+
+            frame_rgb = cv2.cvtColor(self.current_cv_frame, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+            inputs = self.tracker_processor(images=frame_pil, device=self.device, return_tensors="pt")
+
+            frame_tensor = inputs.pixel_values[0]
+            if hasattr(self, 'model_dtype') and self.model_dtype == torch.float32:
+                frame_tensor = frame_tensor.to(dtype=torch.float32)
+
+            obj_ids_list = list(masks_to_inject.keys())
+            input_masks_list = [masks_to_inject[oid]['mask'] for oid in obj_ids_list]
+
+            logger.info(f"Passing {len(obj_ids_list)} object prompts via input_masks...")
+            self.tracker_processor.add_inputs_to_inference_session(
+                inference_session=self.inference_session,
+                frame_idx=frame_idx,
+                obj_ids=list(obj_ids_list),
+                input_masks=input_masks_list,
+                original_size=inputs.original_sizes[0],
+            )
+
+            from util.backends import dlmi_inject as dlmi_hooks
+            dlmi_settings = dlmi_hooks.collect_dlmi_settings(self)
+
+            logger.info(f"Preparing DLMI logits: {len(obj_ids_list)} objects, "
+                        f"settings={dlmi_settings}")
+
+            injection_queue = dlmi_hooks.build_injection_queue(
+                obj_ids=obj_ids_list,
+                masks_by_oid={oid: masks_to_inject[oid]['mask'] for oid in obj_ids_list},
+                device=self.device,
+                **dlmi_settings,
+            )
+            logger.info(f"Injection queue ready: {len(injection_queue)} logit maps")
+
+            original_encode = self.tracker_model._encode_new_memory
+            injection_state = {"idx": 0}
+            self.tracker_model._encode_new_memory = dlmi_hooks.create_injection_hook(
+                injection_queue, original_encode, log_prefix="low-level", state=injection_state
+            )
+
+            logger.info("Forward pass starting (Hook replaces masks)")
+            with torch.no_grad():
+                try:
+                    outputs = self.tracker_model(
+                        inference_session=self.inference_session,
+                        frame=frame_tensor,
+                    )
+                    logger.info(f"Forward pass complete. Injected masks: {injection_state['idx']}")
+                except Exception as e:
+                    logger.exception(f"Forward pass error: {e}")
+                    self.tracker_model._encode_new_memory = original_encode
+                    messagebox.showerror("Error", f"Forward pass failed: {e}", parent=self.root)
+                    _restore_annotations_after_failure()
+                    return
+
+            self.tracker_model._encode_new_memory = original_encode
+
+            # Install persistent DLMI hooks (Preserve + Boost) after forward pass
+            self._install_dlmi_persistent_hooks()
+
+            if injection_state["idx"] == 0:
+                messagebox.showwarning("Notice", "No masks injected. Hook was not called.", parent=self.root)
+                _restore_annotations_after_failure()
+                return
+
+            injected_count = injection_state["idx"]
+
+            for obj_id, obj_info in masks_to_inject.items():
+                mask = obj_info['mask']
+                label = obj_info['label']
+                entry = {
+                    'custom_label': label,
+                    'last_mask': mask.astype(bool),
+                    'is_injected_group': obj_info.get('is_group', False)
+                }
+                # Keep hand-made pose data through the re-registration.
+                old_data = old_tracked_objects.get(obj_id, {})
+                for pose_key in ('pose_points', 'pose_edges'):
+                    if old_data.get(pose_key):
+                        entry[pose_key] = old_data[pose_key]
+                self.tracked_objects[obj_id] = entry
+
+            if injected_count > 0:
+                self.is_tracking_ever_started = True
+                self.update_status(f"Low-level API: {injected_count} objects injected to new SAM3 session. Start propagation.")
+                logger.info(f"Low-level API: {injected_count} objects injected (groups merged into single objects)")
+
+                if self.current_cv_frame is not None:
+                    self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            else:
+                messagebox.showwarning("Notice", "No masks injected.", parent=self.root)
+
+            if self.view and hasattr(self.view, 'update_low_data_inject_button_state'):
+                self.view.update_low_data_inject_button_state()
+
+        except Exception as e:
+            logger.exception(f"Low-level API mask injection failed: {e}")
+            messagebox.showerror("Error", f"Error during mask injection:\n{e}", parent=self.root)
+            if 'original_encode' in dir() and original_encode is not None:
+                try:
+                    self.tracker_model._encode_new_memory = original_encode
+                except:
+                    pass
+            if restore_after_failure is not None and not self.tracked_objects:
+                restore_after_failure()
+
+    def _record_pcs_results_for_transfer(self):
+        """Temp-record everything PCS produced (mask + label + score per object) into `pcs_dlmi_transfer_record`."""
+        record = {}
+        for oid, data in self.tracked_objects.items():
+            mask = data.get('last_mask')
+            if mask is None:
+                continue
+            mask_arr = np.asarray(mask)
+            if not mask_arr.any():
+                continue
+            record[int(oid)] = {
+                'mask': mask_arr.copy(),
+                'label': data.get('custom_label') or self.default_object_label_var.get(),
+                'pcs_score': data.get('pcs_score'),
+            }
+        self.pcs_dlmi_transfer_record = record
+        logger.info(f"PCS→PVS transfer record: {len(record)} objects captured "
+                    f"({sorted(record.keys())})")
+        return record
+
+    def _auto_pcs_to_pvs_dlmi(self):
+        """Automatic PCS→PVS DLMI pipeline (runs on mode switch when DLMI is on)."""
+        record = self._record_pcs_results_for_transfer()
+        if not record:
+            logger.warning("PCS→PVS auto DLMI: no PCS masks to transfer.")
+            return False
+        if self.current_cv_frame is None:
+            logger.warning("PCS→PVS auto DLMI: no current frame.")
+            return False
+
+        # PCS sessions belong to the outgoing mode; release them.
+        self.pcs_inference_session = None
+        self.pcs_streaming_session = None
+        self.pcs_multi_streaming = []
+
+        # Load the record back, then run the same DLMI injection the manual 'Inject Data' button uses.
+        self.tracked_objects.clear()
+        for oid, item in record.items():
+            self.tracked_objects[oid] = {
+                'last_mask': item['mask'] > 0,
+                'custom_label': item['label'],
+                'pcs_score': item.get('pcs_score'),
+            }
+        self.next_obj_id_to_propose = max(record.keys()) + 1
+        self.is_tracking_ever_started = False
+        self.inference_session = None
+        self._update_obj_id_info_label()
+
+        self.update_status(f"PCS→PVS: re-applying {len(record)} PCS objects via DLMI...")
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+        self.inject_low_level_mask_prompt(force=True)
+
+        applied = sum(
+            1 for d in self.tracked_objects.values()
+            if d.get('last_mask') is not None and np.asarray(d['last_mask']).any()
+        )
+        if applied == 0 or self.inference_session is None:
+            logger.error("PCS→PVS auto DLMI: injection produced no active objects.")
+            return False
+
+        # Record consumed; keep it until the next PCS run for inspection.
+        logger.info(f"PCS→PVS auto DLMI complete: {applied} objects injected.")
+        self.update_status(
+            f"PCS→PVS auto DLMI complete: {applied} objects re-applied via DLMI. "
+            f"Start Propagate to continue."
+        )
+        return True
+
+    def _dlmi_is_git_backend(self):
+        b = getattr(self, "backend", None)
+        return b is not None and getattr(b, "key", None) in ("git", "3.1")
+
+    def _install_dlmi_persistent_hooks(self):
+        """Install persistent DLMI hooks for Preserve Memory and Boost Conditioning."""
+        is_git = self._dlmi_is_git_backend()
+
+        # --- Preserve: keep ALL conditioning frames ---
+        if self.dlmi_preserve_memory_var.get():
+            if is_git:
+                try:
+                    real = self.backend.get_tracker_model()
+                    if not hasattr(self, '_dlmi_orig_maxcond_git'):
+                        self._dlmi_orig_maxcond_git = real.max_cond_frames_in_attn
+                    real.max_cond_frames_in_attn = -1
+                    logger.info(f"DLMI Preserve(git): max_cond_frames_in_attn=-1 "
+                                f"(was {self._dlmi_orig_maxcond_git})")
+                except Exception as e:
+                    logger.warning(f"DLMI Preserve(git) failed: {e}")
+            else:
+                if not hasattr(self, '_dlmi_original_max_cond_frame_num'):
+                    self._dlmi_original_max_cond_frame_num = self.tracker_model.config.max_cond_frame_num
+                self.tracker_model.config.max_cond_frame_num = -1
+                logger.info(f"DLMI Preserve: max_cond_frame_num set to -1 "
+                            f"(was {self._dlmi_original_max_cond_frame_num})")
+
+        # --- Boost: hook _gather_memory_frame_outputs to triple conditioning entries ---
+        if self.dlmi_boost_cond_var.get() and is_git:
+            logger.warning("DLMI Boost is not available on the official (git/3.1) backend "
+                           "(no _gather_memory_frame_outputs); core injection + Preserve active.")
+        elif self.dlmi_boost_cond_var.get():
+            if not hasattr(self, '_dlmi_original_gather'):
+                original_gather = self.tracker_model._gather_memory_frame_outputs
+                self._dlmi_original_gather = original_gather
+                app_ref = self
+
+                def boosted_gather(inference_session, obj_idx, frame_idx,
+                                   track_in_reverse_time=False):
+                    result = original_gather(
+                        inference_session, obj_idx, frame_idx,
+                        track_in_reverse_time=track_in_reverse_time
+                    )
+                    # Check at runtime so user can toggle on/off
+                    if not app_ref.dlmi_boost_cond_var.get():
+                        return result
+
+                    # Conditioning entries have offset=0; duplicate them 3x
+                    cond_entries = [(off, data) for off, data in result if off == 0 and data is not None]
+                    non_cond_entries = [(off, data) for off, data in result if off != 0]
+                    # Triple the conditioning entries
+                    boosted = cond_entries * 3 + non_cond_entries
+                    logger.debug(f"DLMI Boost: {len(cond_entries)} cond entries -> "
+                                 f"{len(cond_entries)*3} (total {len(boosted)} memories)")
+                    return boosted
+
+                self.tracker_model._gather_memory_frame_outputs = boosted_gather
+                logger.info("DLMI Boost: _gather_memory_frame_outputs hooked (3x conditioning)")
+
+    def _remove_dlmi_persistent_hooks(self):
+        """Remove persistent DLMI hooks (called on session reset/cleanup)."""
+        # Restore official (git/3.1) Preserve attribute if it was changed.
+        if hasattr(self, '_dlmi_orig_maxcond_git'):
+            try:
+                b = getattr(self, "backend", None)
+                if b is not None and hasattr(b, "get_tracker_model"):
+                    b.get_tracker_model().max_cond_frames_in_attn = self._dlmi_orig_maxcond_git
+            except Exception as e:
+                logger.debug(f"DLMI Preserve(git) restore skipped: {e}")
+            del self._dlmi_orig_maxcond_git
+
+        if not hasattr(self, 'tracker_model') or self.tracker_model is None:
+            return
+
+        # Restore max_cond_frame_num
+        if hasattr(self, '_dlmi_original_max_cond_frame_num'):
+            self.tracker_model.config.max_cond_frame_num = self._dlmi_original_max_cond_frame_num
+            logger.info(f"DLMI Preserve: max_cond_frame_num restored to "
+                        f"{self._dlmi_original_max_cond_frame_num}")
+            del self._dlmi_original_max_cond_frame_num
+
+        # Restore _gather_memory_frame_outputs
+        if hasattr(self, '_dlmi_original_gather'):
+            self.tracker_model._gather_memory_frame_outputs = self._dlmi_original_gather
+            logger.info("DLMI Boost: _gather_memory_frame_outputs restored to original")
+            del self._dlmi_original_gather
+
+    def _deactivate_negative_area_mode(self):
+        if not getattr(self, 'negative_area_mode_active', False):
+            return
+        self.negative_area_mode_active = False
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+        if self.view and hasattr(self.view, 'update_negative_area_mode_ui'):
+            self.view.update_negative_area_mode_ui(False)
+
+    def _deactivate_multi_choose_mode(self):
+        if not getattr(self, 'multi_choose_mode_active', False):
+            return
+        self.multi_choose_mode_active = False
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+        if self.view and hasattr(self.view, 'update_multi_choose_mode_ui'):
+            self.view.update_multi_choose_mode_ui(False)
+
+    def _pending_manual_input_modes(self):
+        pending = []
+        if self.polygon_mode_active and self.polygon_points:
+            pending.append("polygon")
+        has_positive_paint = (
+            self.paint_stroke_mask is not None and self.paint_stroke_mask.any()
+        )
+        has_active_negative_paint = (
+            self.paint_stroke_active
+            and self.paint_negative_stroke_mask is not None
+            and self.paint_negative_stroke_mask.any()
+        )
+        if self.paint_mode_active and (has_positive_paint or has_active_negative_paint):
+            pending.append("paint")
+        return tuple(pending)
+
+    def _confirm_discard_pending_manual_input(self, action, modes=None):
+        pending = self._pending_manual_input_modes()
+        if modes is not None:
+            allowed = set(modes)
+            pending = tuple(mode for mode in pending if mode in allowed)
+        if not pending:
+            return True
+
+        names = " and ".join(mode.capitalize() for mode in pending)
+        return messagebox.askyesno(
+            "Unfinished Input",
+            f"{names} input has not been completed.\n\n"
+            f"{action} will discard it. Continue?",
+            icon=messagebox.WARNING,
+            parent=self.root,
+        )
+
+    def _deactivate_polygon_mode(self):
+        if not getattr(self, 'polygon_mode_active', False):
+            return
+        self.polygon_mode_active = False
+        self.polygon_points = []
+        if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
+            self.view.update_polygon_mode_ui(False)
+
+    def toggle_polygon_mode(self):
+        activating = not self.polygon_mode_active
+        modes_to_discard = ("paint",) if activating else ("polygon",)
+        if not self._confirm_discard_pending_manual_input(
+                "Changing polygon mode", modes=modes_to_discard):
+            return
+
+        self.polygon_mode_active = activating
+        if activating:
+            self._deactivate_negative_area_mode()
+            self._deactivate_multi_choose_mode()
+            self._deactivate_paint_mode()
+            self.polygon_points = []
+            self.update_status("Polygon mode: Left click to add points. Click 'Complete Object' when done.")
+            logger.info("Polygon add mode activated")
+        else:
+            self.polygon_points = []
+            self.update_status("Polygon mode deactivated")
+            logger.info("Polygon add mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
+            self.view.update_polygon_mode_ui(self.polygon_mode_active)
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def add_polygon_point(self, x, y):
+        if not self.polygon_mode_active:
+            return False
+
+        # Check the anchor only on the first point of a fresh polygon.
+        if not self.polygon_points and not self._ensure_label_anchor_or_confirm_switch():
+            return False
+
+        self.polygon_points.append((int(x), int(y)))
+        logger.debug(f"Polygon point added: ({x}, {y}), total {len(self.polygon_points)}")
+        self.update_status(f"{len(self.polygon_points)} polygon points entered. Add more or click 'Complete Object'.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+        return True
+
+    def undo_last_polygon_point(self):
+        if not self.polygon_mode_active or not self.polygon_points:
+            return
+
+        removed = self.polygon_points.pop()
+        logger.debug(f"Polygon point removed: {removed}, remaining {len(self.polygon_points)}")
+        self.update_status(f"Point removed. Remaining: {len(self.polygon_points)}")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def complete_polygon_object(self):
+        if not self.polygon_mode_active:
+            messagebox.showwarning("Notice", "Polygon mode is not active.", parent=self.root)
+            return
+
+        if len(self.polygon_points) < 3:
+            messagebox.showwarning("Notice", "Polygon requires at least 3 points.", parent=self.root)
+            return
+
+        if self.current_cv_frame is None:
+            messagebox.showwarning("Notice", "No current frame.", parent=self.root)
+            return
+
+        try:
+            h, w = self.current_cv_frame.shape[:2]
+
+            mask = np.zeros((h, w), dtype=np.uint8)
+            pts = np.array(self.polygon_points, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [pts], 255)
+            mask_bool = mask > 0
+
+            if not mask_bool.any():
+                messagebox.showwarning("Notice", "Generated mask is empty.", parent=self.root)
+                return
+
+            if self.negative_area_mode_active:
+                modified = self._erase_region_from_all_masks(mask_bool)
+                self.polygon_points = []
+                if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
+                    self.polygon_mode_active = False
+                    self.view.update_polygon_mode_ui(False)
+                if modified:
+                    self.update_status(
+                        f"Negative Area (polygon): erased region from {len(modified)} object(s)."
+                    )
+                else:
+                    self.update_status("Negative Area (polygon): no overlap with any object.")
+                if self.current_cv_frame is not None:
+                    self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+                self._update_obj_id_info_label()
+                return
+
+            new_obj_id = self.next_obj_id_to_propose
+            self.next_obj_id_to_propose += 1
+
+            label = self.default_object_label_var.get()
+            self.tracked_objects[new_obj_id] = {
+                'custom_label': label,
+                'last_mask': mask_bool,
+                'is_polygon_object': True,
+                'polygon_points': self.polygon_points.copy()
+            }
+
+            self.polygon_objects.append({
+                'obj_id': new_obj_id,
+                'points': self.polygon_points.copy(),
+                'mask': mask_bool,
+                'label': label
+            })
+
+            logger.info(f"Polygon object created: ID={new_obj_id}, points={len(self.polygon_points)}, label={label}")
+            self.update_status(f"Polygon object {new_obj_id} created. Inject Data, Mask prompt Input, or continue adding polygons.")
+
+            self.polygon_points = []
+
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+            self._update_obj_id_info_label()
+
+        except Exception as e:
+            logger.exception(f"Polygon object creation failed: {e}")
+            messagebox.showerror("Error", f"Error creating polygon object:\n{e}", parent=self.root)
+
+    def cancel_polygon_mode(self):
+        if not self._confirm_discard_pending_manual_input(
+                "Cancelling polygon mode", modes=("polygon",)):
+            return
+        self._deactivate_polygon_mode()
+        self.update_status("Polygon mode cancelled")
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    # --- Paint mode: brush-drawn masks that complete into objects exactly like polygons ---
+
+    def _clear_paint_state(self):
+        self.paint_stroke_mask = None
+        self.paint_negative_stroke_mask = None
+        self.paint_stroke_active = False
+        self.paint_last_image_pt = None
+        self.paint_undo_stack = []
+        self._reset_paint_line_state()
+
+    def _reset_paint_line_state(self):
+        self.paint_stroke_start_image_pt = None
+        self.paint_stroke_start_canvas_pt = None
+        self.paint_line_base_mask = None
+
+    def _deactivate_paint_mode(self):
+        if not getattr(self, 'paint_mode_active', False):
+            return
+        self.paint_mode_active = False
+        self._clear_paint_state()
+        if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(False)
+
+    def toggle_paint_mode(self):
+        activating = not self.paint_mode_active
+        modes_to_discard = ("polygon",) if activating else ("paint",)
+        if not self._confirm_discard_pending_manual_input(
+                "Changing paint mode", modes=modes_to_discard):
+            return
+
+        self.paint_mode_active = activating
+        self._clear_paint_state()
+        if activating:
+            # Negative-area mode stays on: paint + negative area = brush eraser.
+            self._deactivate_polygon_mode()
+            self._deactivate_multi_choose_mode()
+            if self.negative_area_mode_active:
+                self.update_status("Paint NEGATIVE brush: release refines the pending paint, or erases object masks if none is pending.")
+            else:
+                self.update_status("Paint mode: Left click/drag to paint the mask. Click 'Complete' when done.")
+            logger.info("Paint mode activated")
+        else:
+            self.update_status("Paint mode deactivated")
+            logger.info("Paint mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(self.paint_mode_active)
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def _paint_brush_radius_px(self):
+        try:
+            size = int(self.paint_brush_size_var.get())
+        except (tk.TclError, ValueError):
+            size = 30
+        return max(1, size // 2)
+
+    def get_paint_brush_canvas_diameter(self):
+        """Brush diameter converted from image pixels to canvas pixels for previews."""
+        diameter = max(1, self._paint_brush_radius_px() * 2)
+        try:
+            if self.scale_x and self.scale_x > 0:
+                return max(1.0, diameter / self.scale_x)
+        except (AttributeError, TypeError):
+            pass
+        return float(diameter)
+
+    def get_paint_preview_color(self):
+        """Stroke preview color: red while erasing (negative area on), cyan while painting."""
+        return "red" if self.negative_area_mode_active else "cyan"
+
+    def adjust_paint_brush_size(self, delta):
+        """Mouse-wheel brush sizing; clamped to the Brush Size slider range."""
+        if not self.paint_mode_active:
+            return False
+        try:
+            current = int(self.paint_brush_size_var.get())
+        except (tk.TclError, ValueError):
+            current = 30
+        self.paint_brush_size_var.set(min(200, max(1, current + delta)))
+        return True
+
+    def paint_stroke_begin(self, canvas_x, canvas_y):
+        if not self.paint_mode_active:
+            return False
+        if self.current_cv_frame is None:
+            return False
+
+        h, w = self.current_cv_frame.shape[:2]
+
+        if self.negative_area_mode_active:
+            # Negative stroke goes to its own buffer so the pending positive paint is untouched.
+            self.paint_negative_stroke_mask = np.zeros((h, w), dtype=np.uint8)
+        else:
+            # Same anchor guard as the first polygon point, on the first stroke of a fresh mask.
+            fresh = self.paint_stroke_mask is None or not self.paint_stroke_mask.any()
+            if fresh and not self._ensure_label_anchor_or_confirm_switch():
+                return False
+
+            if self.paint_stroke_mask is None or self.paint_stroke_mask.shape != (h, w):
+                self.paint_stroke_mask = np.zeros((h, w), dtype=np.uint8)
+                self.paint_undo_stack = []
+
+            self.paint_undo_stack.append(self.paint_stroke_mask.copy())
+            if len(self.paint_undo_stack) > 10:
+                self.paint_undo_stack.pop(0)
+
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        radius = self._paint_brush_radius_px()
+        target = self.paint_negative_stroke_mask if self.negative_area_mode_active else self.paint_stroke_mask
+        cv2.circle(target, (int(img_x), int(img_y)), radius, 255, thickness=-1)
+        self.paint_last_image_pt = (int(img_x), int(img_y))
+        self.paint_stroke_active = True
+
+        # Anchors for the Shift straight-line constraint: line runs from the drag
+        # start, and the base snapshot lets the provisional line re-render live.
+        self.paint_stroke_start_image_pt = (int(img_x), int(img_y))
+        self.paint_stroke_start_canvas_pt = (canvas_x, canvas_y)
+        self.paint_line_base_mask = target.copy()
+
+        if self.view and hasattr(self.view, 'begin_paint_preview'):
+            self.view.begin_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter(),
+                                          color=self.get_paint_preview_color())
+        return True
+
+    def paint_stroke_update(self, canvas_x, canvas_y, straight=False):
+        if not self.paint_mode_active or not self.paint_stroke_active:
+            return False
+        target = self.paint_negative_stroke_mask if self.negative_area_mode_active else self.paint_stroke_mask
+        if target is None:
+            return False
+
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        cur = (int(img_x), int(img_y))
+        radius = self._paint_brush_radius_px()
+
+        if (straight and self.paint_line_base_mask is not None
+                and self.paint_stroke_start_image_pt is not None):
+            # Shift held: the whole drag renders as one straight line from the drag
+            # start to the pointer, re-derived from the base snapshot every event.
+            np.copyto(target, self.paint_line_base_mask)
+            start = self.paint_stroke_start_image_pt
+            if start != cur:
+                cv2.line(target, start, cur, 255, thickness=max(1, radius * 2))
+            cv2.circle(target, cur, radius, 255, thickness=-1)
+            self.paint_last_image_pt = cur
+            if (self.view and hasattr(self.view, 'update_paint_line_preview')
+                    and self.paint_stroke_start_canvas_pt is not None):
+                sx, sy = self.paint_stroke_start_canvas_pt
+                self.view.update_paint_line_preview(sx, sy, canvas_x, canvas_y,
+                                                    self.get_paint_brush_canvas_diameter(),
+                                                    color=self.get_paint_preview_color())
+            return True
+
+        if self.paint_last_image_pt is not None and self.paint_last_image_pt != cur:
+            cv2.line(target, self.paint_last_image_pt, cur, 255,
+                     thickness=max(1, radius * 2))
+        cv2.circle(target, cur, radius, 255, thickness=-1)
+        self.paint_last_image_pt = cur
+
+        if self.view and hasattr(self.view, 'extend_paint_preview'):
+            self.view.extend_paint_preview(canvas_x, canvas_y, self.get_paint_brush_canvas_diameter(),
+                                           color=self.get_paint_preview_color())
+        return True
+
+    def paint_stroke_finish(self, canvas_x, canvas_y, straight=False):
+        if not self.paint_mode_active or not self.paint_stroke_active:
+            return False
+
+        self.paint_stroke_update(canvas_x, canvas_y, straight=straight)
+        self.paint_stroke_active = False
+        self.paint_last_image_pt = None
+        self._reset_paint_line_state()
+
+        if self.view and hasattr(self.view, 'clear_paint_preview'):
+            self.view.clear_paint_preview()
+
+        if self.negative_area_mode_active:
+            # Applied on release, like the negative-area drag box. The negative stroke
+            # refines the pending positive paint when there is one, else erases objects.
+            neg = self.paint_negative_stroke_mask
+            self.paint_negative_stroke_mask = None
+            neg_bool = neg > 0 if neg is not None else None
+
+            if neg_bool is None or not neg_bool.any():
+                return True
+
+            if self.paint_stroke_mask is not None and self.paint_stroke_mask.any():
+                self.paint_undo_stack.append(self.paint_stroke_mask.copy())
+                if len(self.paint_undo_stack) > 10:
+                    self.paint_undo_stack.pop(0)
+                self.paint_stroke_mask[neg_bool] = 0
+                remaining = int(np.count_nonzero(self.paint_stroke_mask))
+                self.update_status(f"Painted area refined: {remaining} px remain. Paint more or click 'Complete'.")
+            else:
+                modified = self._erase_region_from_all_masks(neg_bool)
+                if modified:
+                    self.update_status(f"Negative Area (paint): erased region from {len(modified)} object(s).")
+                else:
+                    self.update_status("Negative Area (paint): no overlap with any object.")
+                self._update_obj_id_info_label()
+
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            return True
+
+        painted_px = int(np.count_nonzero(self.paint_stroke_mask)) if self.paint_stroke_mask is not None else 0
+        self.update_status(f"Painted area: {painted_px} px. Paint more, 'Undo Stroke', 'Mask prompt Input', or click 'Complete'.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        if self.view and hasattr(self.view, 'update_mask_input_button_state'):
+            self.view.update_mask_input_button_state()
+        return True
+
+    def undo_last_paint_stroke(self):
+        if not self.paint_mode_active or not self.paint_undo_stack:
+            return
+
+        self.paint_stroke_mask = self.paint_undo_stack.pop()
+        painted_px = int(np.count_nonzero(self.paint_stroke_mask))
+        logger.debug(f"Paint stroke undone, painted px: {painted_px}")
+        self.update_status(f"Stroke removed. Painted area: {painted_px} px.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        if self.view and hasattr(self.view, 'update_mask_input_button_state'):
+            self.view.update_mask_input_button_state()
+
+    def _mask_outline_points(self, mask_bool):
+        contours, _ = cv2.findContours(mask_bool.astype(np.uint8) * 255,
+                                       cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        largest = max(contours, key=cv2.contourArea)
+        epsilon = 0.002 * cv2.arcLength(largest, True)
+        approx = cv2.approxPolyDP(largest, epsilon, True).reshape(-1, 2)
+        return [(int(px), int(py)) for px, py in approx]
+
+    def _sam_mask_prompt_predict(self, backend, frame_rgb, mask_bool):
+        h, w = mask_bool.shape[:2]
+        logits = backend.image_predict_mask(frame_rgb, mask_bool)
+        predicted = process_sam_mask(
+            logits, (w, h),
+            apply_closing=self.sam_apply_closing_var.get(),
+            closing_kernel_size=self.sam_closing_kernel_size_var.get(),
+            logit_threshold=self._mask_logit_threshold())
+        if predicted is None or not predicted.any():
+            return None, None
+        return predicted, logits
+
+    def _untracked_polygon_object_ids(self):
+        return [obj_id for obj_id, data in self.tracked_objects.items()
+                if data.get('is_polygon_object', False)]
+
+    def input_mask_to_sam(self):
+        if self.current_cv_frame is None:
+            messagebox.showwarning("Notice", "No current frame.", parent=self.root)
+            return
+
+        has_pending_paint = (self.paint_mode_active
+                             and self.paint_stroke_mask is not None
+                             and self.paint_stroke_mask.any())
+        polygon_ids = self._untracked_polygon_object_ids()
+        if not has_pending_paint and not polygon_ids:
+            messagebox.showwarning(
+                "Notice",
+                "Nothing to input.\nPaint a mask, or complete a polygon/paint object first.",
+                parent=self.root)
+            return
+
+        backend = self.backend
+        if backend is None or not backend.is_loaded():
+            messagebox.showerror("Error", "SAM3 model not loaded.", parent=self.root)
+            return
+
+        try:
+            frame_rgb = cv2.cvtColor(self.current_cv_frame, cv2.COLOR_BGR2RGB)
+
+            if has_pending_paint:
+                self.update_status("Mask prompt Input: running SAM image prediction from the painted mask...")
+                self.root.update_idletasks()
+                predicted, _ = self._sam_mask_prompt_predict(backend, frame_rgb, self.paint_stroke_mask > 0)
+                if predicted is None:
+                    self.update_status("Mask prompt Input: SAM returned an empty mask. Painted area kept.")
+                    messagebox.showwarning("Notice", "SAM returned an empty mask for the painted input.", parent=self.root)
+                    return
+                self.paint_undo_stack.append(self.paint_stroke_mask.copy())
+                if len(self.paint_undo_stack) > 10:
+                    self.paint_undo_stack.pop(0)
+                self.paint_stroke_mask = predicted.astype(np.uint8) * 255
+                self._reset_paint_line_state()
+                painted_px = int(np.count_nonzero(self.paint_stroke_mask))
+                logger.info(f"Paint mask prompt input to SAM image predict: backend={backend.key}, result px={painted_px}")
+                self.update_status(
+                    f"Mask prompt Input: SAM predicted {painted_px} px. 'Complete' to create the object, 'Undo Stroke' to revert.")
+            else:
+                selected = set(self.selected_objects_sam_ids)
+                if self.selected_object_sam_id is not None:
+                    selected.add(self.selected_object_sam_id)
+                targets = [oid for oid in polygon_ids if oid in selected] or polygon_ids
+                self.update_status(f"Mask prompt Input: running SAM image prediction for {len(targets)} polygon/paint object(s)...")
+                self.root.update_idletasks()
+
+                pil_size = (frame_rgb.shape[1], frame_rgb.shape[0])
+                updated, empty = [], []
+                for oid in targets:
+                    data = self.tracked_objects.get(oid)
+                    mask = data.get('last_mask') if data else None
+                    if mask is None or not mask.any():
+                        continue
+                    predicted, logits = self._sam_mask_prompt_predict(backend, frame_rgb, mask.astype(bool))
+                    if predicted is None:
+                        empty.append(oid)
+                        continue
+                    data['last_mask'] = predicted
+                    data['polygon_points'] = self._mask_outline_points(predicted)
+                    sam_interaction._store_confidence_map(self, oid, logits, pil_size)
+                    for poly in self.polygon_objects:
+                        if poly.get('obj_id') == oid:
+                            poly['mask'] = predicted
+                            poly['points'] = data['polygon_points']
+                    updated.append(oid)
+
+                logger.info(f"Mask prompt input to SAM image predict for objects: backend={backend.key}, updated={updated}, empty={empty}")
+                msg = f"Mask prompt Input: {len(updated)} object(s) re-predicted by SAM {updated}."
+                if empty:
+                    msg += f" Empty result kept original for {empty}."
+                msg += " Use 'Inject Data' to enter them into tracking."
+                self.update_status(msg)
+
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            self._update_obj_id_info_label()
+
+        except Exception as e:
+            logger.exception(f"SAM mask input failed: {e}")
+            messagebox.showerror("Error", f"Error during SAM mask input:\n{e}", parent=self.root)
+
+    def complete_paint_object(self):
+        if not self.paint_mode_active:
+            messagebox.showwarning("Notice", "Paint mode is not active.", parent=self.root)
+            return
+
+        if self.paint_stroke_mask is None or not self.paint_stroke_mask.any():
+            messagebox.showwarning("Notice", "Nothing painted yet. Click/drag on the image first.", parent=self.root)
+            return
+
+        if self.current_cv_frame is None:
+            messagebox.showwarning("Notice", "No current frame.", parent=self.root)
+            return
+
+        try:
+            mask_bool = self.paint_stroke_mask > 0
+            points = self._mask_outline_points(mask_bool)
+
+            new_obj_id = self.next_obj_id_to_propose
+            self.next_obj_id_to_propose += 1
+
+            label = self.default_object_label_var.get()
+            self.tracked_objects[new_obj_id] = {
+                'custom_label': label,
+                'last_mask': mask_bool,
+                'is_polygon_object': True,
+                'polygon_points': points
+            }
+
+            self.polygon_objects.append({
+                'obj_id': new_obj_id,
+                'points': points,
+                'mask': mask_bool,
+                'label': label
+            })
+
+            logger.info(f"Paint object created: ID={new_obj_id}, painted px={int(np.count_nonzero(mask_bool))}, label={label}")
+            self.update_status(f"Paint object {new_obj_id} created. Inject Data, Mask prompt Input, or continue painting.")
+
+            self._clear_paint_state()
+
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+            self._update_obj_id_info_label()
+
+            if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+                self.view.update_paint_mode_ui(True)
+
+        except Exception as e:
+            logger.exception(f"Paint object creation failed: {e}")
+            messagebox.showerror("Error", f"Error creating paint object:\n{e}", parent=self.root)
+
+    def cancel_paint_mode(self):
+        if not self._confirm_discard_pending_manual_input(
+                "Cancelling paint mode", modes=("paint",)):
+            return
+        self._deactivate_paint_mode()
+        self.update_status("Paint mode cancelled")
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        logger.info("Paint mode cancelled")
+
+    def toggle_negative_area_mode(self):
+        """Toggle the 'negative area' editing mode."""
+        activating = not self.negative_area_mode_active
+        if (activating and not self._confirm_discard_pending_manual_input(
+                "Enabling negative-area mode", modes=("polygon",))):
+            return
+
+        self.negative_area_mode_active = activating
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+
+        if self.negative_area_mode_active:
+            # Paint mode stays on: paint + negative area = brush eraser.
+            self._deactivate_multi_choose_mode()
+            self._deactivate_polygon_mode()
+
+        if self.negative_area_mode_active:
+            self.update_status(
+                "Negative Area ON: drag to erase from all masks; or use Add Polygon → Complete to subtract a region."
+            )
+            logger.info("Negative area mode activated")
+        else:
+            self.update_status("Negative Area OFF")
+            logger.info("Negative area mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_negative_area_mode_ui'):
+            self.view.update_negative_area_mode_ui(self.negative_area_mode_active)
+
+        # Paint mode doubles as the eraser brush while negative area is on — refresh its hint text.
+        if self.paint_mode_active and self.view and hasattr(self.view, 'update_paint_mode_ui'):
+            self.view.update_paint_mode_ui(True)
+
+        if self.view:
+            self.view.delete_temp_bbox()
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def _erase_region_from_all_masks(self, erase_mask_bool):
+        """Subtract erase_mask_bool (HxW) from every tracked object's last_mask."""
+        if self.current_cv_frame is None or erase_mask_bool is None:
+            return []
+        if not isinstance(erase_mask_bool, np.ndarray) or erase_mask_bool.dtype != bool:
+            erase_mask_bool = np.asarray(erase_mask_bool, dtype=bool)
+        if not erase_mask_bool.any():
+            return []
+
+        h, w = self.current_cv_frame.shape[:2]
+        if erase_mask_bool.shape != (h, w):
+            return []
+
+        modified = []
+        emptied = []
+        for obj_id, data in list(self.tracked_objects.items()):
+            if not data:
+                continue
+            mask = data.get('last_mask')
+            if mask is None:
+                continue
+            if mask.shape != (h, w):
+                continue
+            new_mask = mask & ~erase_mask_bool
+            if np.array_equal(new_mask, mask):
+                continue
+            data['last_mask'] = new_mask
+            if 'is_polygon_object' in data and data.get('is_polygon_object'):
+                data.pop('polygon_points', None)
+                data['is_polygon_object'] = False
+            # Hand-edited: drop the raw logit map so a later threshold re-apply can never undo the user's erasure.
+            if hasattr(self, 'current_confidence_masks'):
+                self.current_confidence_masks.pop(obj_id, None)
+            modified.append(obj_id)
+            if not new_mask.any():
+                emptied.append(obj_id)
+
+        for obj_id in emptied:
+            self.tracked_objects.pop(obj_id, None)
+            self.selected_objects_sam_ids.discard(obj_id)
+            if self.selected_object_sam_id == obj_id:
+                self.selected_object_sam_id = None
+
+        if modified:
+            logger.info(
+                f"Negative area: erased region from {len(modified)} object(s); "
+                f"emptied={emptied}"
+            )
+
+        return modified
+
+    def negative_drag_begin(self, canvas_x, canvas_y):
+        if not self.negative_area_mode_active:
+            return False
+        if self.current_cv_frame is None:
+            return False
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        self.negative_drag_start_canvas = (canvas_x, canvas_y)
+        self.negative_drag_last_canvas = (canvas_x, canvas_y)
+        self.negative_drag_path_image = [(int(img_x), int(img_y))]
+        return True
+
+    def negative_drag_update(self, canvas_x, canvas_y):
+        if not self.negative_area_mode_active:
+            return False
+        if self.negative_drag_start_canvas is None:
+            return False
+        self.negative_drag_last_canvas = (canvas_x, canvas_y)
+        if self.view:
+            sx, sy = self.negative_drag_start_canvas
+            self.view.draw_temp_bbox(sx, sy, canvas_x, canvas_y)
+        img_x, img_y = self._canvas_to_image_coords(canvas_x, canvas_y)
+        self.negative_drag_path_image.append((int(img_x), int(img_y)))
+        return True
+
+    def negative_drag_finish(self, canvas_x, canvas_y):
+        if not self.negative_area_mode_active:
+            return False
+        if self.negative_drag_start_canvas is None:
+            return False
+        if self.current_cv_frame is None:
+            self.negative_drag_start_canvas = None
+            self.negative_drag_last_canvas = None
+            self.negative_drag_path_image = []
+            return False
+
+        sx_c, sy_c = self.negative_drag_start_canvas
+        ex_c, ey_c = canvas_x, canvas_y
+        if self.view:
+            self.view.delete_temp_bbox()
+
+        h, w = self.current_cv_frame.shape[:2]
+        erase_mask = np.zeros((h, w), dtype=np.uint8)
+
+        img_s = self._canvas_to_image_coords(min(sx_c, ex_c), min(sy_c, ey_c))
+        img_e = self._canvas_to_image_coords(max(sx_c, ex_c), max(sy_c, ey_c))
+        x0 = max(0, int(min(img_s[0], img_e[0])))
+        y0 = max(0, int(min(img_s[1], img_e[1])))
+        x1 = min(w, int(max(img_s[0], img_e[0])))
+        y1 = min(h, int(max(img_s[1], img_e[1])))
+
+        rect_significant = (x1 - x0) >= 2 and (y1 - y0) >= 2
+        if rect_significant:
+            erase_mask[y0:y1, x0:x1] = 255
+
+        # Always also stamp the path itself so a thin/zero-area drag still erases
+        path = self.negative_drag_path_image
+        if path:
+            try:
+                px_size_pct = 0.4
+                if hasattr(self, 'view') and self.view is not None:
+                    try:
+                        v = float(self.view.polygon_point_size_entry.get())
+                        if v > 0:
+                            px_size_pct = v
+                    except Exception:
+                        pass
+                radius = max(2, int(round(min(h, w) * px_size_pct / 100.0)))
+                pts = np.array(path, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(erase_mask, [pts], isClosed=False, color=255, thickness=radius * 2)
+                for (px, py) in path:
+                    if 0 <= px < w and 0 <= py < h:
+                        cv2.circle(erase_mask, (int(px), int(py)), radius, 255, thickness=-1)
+            except Exception as _e:
+                logger.debug(f"negative path stamp failed: {_e}")
+
+        erase_bool = erase_mask > 0
+        modified = self._erase_region_from_all_masks(erase_bool)
+
+        self.negative_drag_start_canvas = None
+        self.negative_drag_last_canvas = None
+        self.negative_drag_path_image = []
+
+        if modified:
+            self.update_status(f"Negative Area: erased region from {len(modified)} object(s).")
+        else:
+            self.update_status("Negative Area: no overlap with any object.")
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        self._update_obj_id_info_label()
+        return True
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def toggle_multi_choose_mode(self):
+        activating = not self.multi_choose_mode_active
+        if (activating and not self._confirm_discard_pending_manual_input(
+                "Enabling multi-choose mode", modes=("paint", "polygon"))):
+            return
+
+        self.multi_choose_mode_active = activating
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+
+        if self.multi_choose_mode_active:
+            self._deactivate_negative_area_mode()
+            self._deactivate_polygon_mode()
+            self._deactivate_paint_mode()
+
+        if self.multi_choose_mode_active:
+            self.update_status(
+                "Multi Choose ON: drag a rectangle to select every object inside (like Ctrl-clicking each)."
+            )
+            logger.info("Multi-choose mode activated")
+        else:
+            self.update_status("Multi Choose OFF")
+            logger.info("Multi-choose mode deactivated")
+
+        if self.view and hasattr(self.view, 'update_multi_choose_mode_ui'):
+            self.view.update_multi_choose_mode_ui(self.multi_choose_mode_active)
+
+        if self.view:
+            self.view.delete_temp_bbox()
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def multi_choose_drag_begin(self, canvas_x, canvas_y):
+        if not self.multi_choose_mode_active:
+            return False
+        if self.current_cv_frame is None:
+            return False
+        self.multi_choose_drag_start_canvas = (canvas_x, canvas_y)
+        self.multi_choose_drag_last_canvas = (canvas_x, canvas_y)
+        return True
+
+    def multi_choose_drag_update(self, canvas_x, canvas_y):
+        if not self.multi_choose_mode_active:
+            return False
+        if self.multi_choose_drag_start_canvas is None:
+            return False
+        self.multi_choose_drag_last_canvas = (canvas_x, canvas_y)
+        if self.view:
+            sx, sy = self.multi_choose_drag_start_canvas
+            self.view.draw_temp_bbox(sx, sy, canvas_x, canvas_y)
+        return True
+
+    def multi_choose_drag_finish(self, canvas_x, canvas_y):
+        if not self.multi_choose_mode_active:
+            return False
+        if self.multi_choose_drag_start_canvas is None:
+            return False
+        if self.current_cv_frame is None:
+            self.multi_choose_drag_start_canvas = None
+            self.multi_choose_drag_last_canvas = None
+            return False
+
+        sx_c, sy_c = self.multi_choose_drag_start_canvas
+        ex_c, ey_c = canvas_x, canvas_y
+        if self.view:
+            self.view.delete_temp_bbox()
+        self.multi_choose_drag_start_canvas = None
+        self.multi_choose_drag_last_canvas = None
+
+        h, w = self.current_cv_frame.shape[:2]
+        img_s = self._canvas_to_image_coords(min(sx_c, ex_c), min(sy_c, ey_c))
+        img_e = self._canvas_to_image_coords(max(sx_c, ex_c), max(sy_c, ey_c))
+        x0 = max(0, int(min(img_s[0], img_e[0])))
+        y0 = max(0, int(min(img_s[1], img_e[1])))
+        x1 = min(w, int(max(img_s[0], img_e[0])))
+        y1 = min(h, int(max(img_s[1], img_e[1])))
+
+        if (x1 - x0) < 2 or (y1 - y0) < 2:
+            self.update_status("Multi Choose: drag area too small.")
+            return False
+
+        newly_selected = []
+        for obj_id, data in list(self.tracked_objects.items()):
+            if not data:
+                continue
+            mask = data.get('last_mask')
+            if mask is None:
+                continue
+            if mask.shape[:2] != (h, w):
+                continue
+            if mask[y0:y1, x0:x1].any():
+                if obj_id not in self.selected_objects_sam_ids:
+                    newly_selected.append(obj_id)
+                self.selected_objects_sam_ids.add(obj_id)
+                self.selected_object_sam_id = obj_id
+
+        if self.view and hasattr(self.view, 'btn_merge_objects'):
+            if len(self.selected_objects_sam_ids) >= 2:
+                self.view.btn_merge_objects.config(state='normal')
+            else:
+                self.view.btn_merge_objects.config(state='disabled')
+
+        if self.selected_objects_sam_ids and self.view and self.view.notebook and self.view.obj_control_tab:
+            tab_widget = getattr(self.view.obj_control_tab, '_tab_wrapper', self.view.obj_control_tab)
+            try:
+                self.view.notebook.select(tab_widget)
+            except tk.TclError:
+                pass
+
+        input_handlers.update_interaction_status_and_label(self)
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+        if newly_selected:
+            self.update_status(
+                f"Multi Choose: selected {len(newly_selected)} object(s) "
+                f"(total selected: {len(self.selected_objects_sam_ids)})."
+            )
+        else:
+            self.update_status("Multi Choose: no objects inside the drag area.")
+        return True
+
+    def _on_ctrl_press(self, event=None):
+        input_handlers.on_ctrl_press(self, event)
+
+    def _on_spacebar_press(self, event=None):
+        input_handlers.on_spacebar_press(self, event)
+
+    def _on_ctrl_release(self, event=None):
+        input_handlers.on_ctrl_release(self, event)
+
+    def _on_shift_press(self, event=None):
+        input_handlers.on_shift_press(self, event)
+
+    def _on_shift_release(self, event=None):
+        input_handlers.on_shift_release(self, event)
+
+    def _on_alt_press(self, event=None):
+        input_handlers.on_alt_press(self, event)
+
+    def _on_alt_release(self, event=None):
+        input_handlers.on_alt_release(self, event)
+
+    def _update_interaction_status_and_label(self):
+        input_handlers.update_interaction_status_and_label(self)
+
+    def _is_any_special_mode_active(self):
+        return input_handlers.is_any_special_mode_active(self)
+
+    def _get_object_id_at_coords(self, img_x, img_y):
+        return input_handlers.get_object_id_at_coords(self, img_x, img_y)
+
+    def _on_left_mouse_press(self, event):
+        input_handlers.on_left_mouse_press(self, event)
+
+    def _on_left_mouse_drag(self, event):
+        input_handlers.on_left_mouse_drag(self, event)
+
+    def _on_left_mouse_release(self, event):
+        input_handlers.on_left_mouse_release(self, event)
+
+    def _on_ctrl_shift_left_click(self, event):
+        input_handlers.on_ctrl_shift_left_click(self, event)
+
+    def _on_ctrl_middle_click_for_point(self, event):
+        input_handlers.on_ctrl_middle_click_for_point(self, event)
+
+    def _on_ctrl_right_click_for_point(self, event):
+        input_handlers.on_ctrl_right_click_for_point(self, event)
+
+    def _on_right_mouse_press(self, event):
+        input_handlers.on_right_mouse_press(self, event)
+
+    def _on_right_mouse_drag(self, event):
+        input_handlers.on_right_mouse_drag(self, event)
+
+    def _on_right_mouse_release(self, event):
+        input_handlers.on_right_mouse_release(self, event)
+
+    def _emergency_stop(self):
+        input_handlers.emergency_stop(self)
+
+    def _handle_ctrl_point_click_event(self, event, label):
+        input_handlers.handle_ctrl_point_click_event(self, event, label)
+
+    def _on_canvas_resize(self, event):
+        input_handlers.on_canvas_resize(self, event)
+
+    def _perform_resize(self):
+        self._resize_job_id = None
+        if self.current_cv_frame is not None:
+            logger.debug("Canvas resized. Redrawing current frame.")
+            self._display_cv_frame_on_view(
+                self.current_cv_frame,
+                self._get_current_masks_for_display(),
+                None
+            )
+
+    def toggle_reassign_bbox_mode(self):
+        if self.app_state == "PAUSED":
+            self.update_status("Paused: Cannot reassign BBox. Resume propagation first.")
+            return
+        if not self.playback_paused:
+            messagebox.showwarning("Notice", "BBox reassignment only available when paused.", parent=self.root)
+            return
+        if self.selected_object_sam_id is None:
+            messagebox.showinfo("Notice", "Select an object to reassign BBox first (Ctrl+Left click).", parent=self.root)
+            return
+        if self._is_any_special_mode_active() and self.reassign_bbox_mode_active_sam_id != self.selected_object_sam_id :
+             messagebox.showwarning("Notice", "Another interaction (auto-correction etc.) is active.", parent=self.root)
+             return
+
+        if self.reassign_bbox_mode_active_sam_id == self.selected_object_sam_id:
+            self.reassign_bbox_mode_active_sam_id = None
+            logger.info(f"Object {self.selected_object_sam_id} BBox reassignment mode deactivated.")
+        else:
+            self.reassign_bbox_mode_active_sam_id = self.selected_object_sam_id
+            logger.info(f"Object {self.reassign_bbox_mode_active_sam_id} BBox reassignment mode activated. Draw new BBox.")
+
+        self._update_interaction_status_and_label()
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+    def delete_selected_object(self):
+        if not self.playback_paused:
+            messagebox.showwarning("Notice", "Object deletion only available when paused.", parent=self.root)
+            return
+        if self.selected_object_sam_id is None:
+            messagebox.showinfo("Notice", "Select an object to delete first.", parent=self.root)
+            return
+
+        obj_to_delete = self.selected_object_sam_id
+        is_correction_deletion = (self.interaction_correction_pending is not None and
+                                  self.interaction_correction_pending == obj_to_delete)
+
+        if not is_correction_deletion and (self.reassign_bbox_mode_active_sam_id is not None or \
+                                           self.problematic_highlight_active_sam_id is not None):
+             messagebox.showwarning("Notice", "Cannot delete selected object while another interaction is active.", parent=self.root)
+             return
+
+        confirm_message = f"Are you sure you want to delete object ID {obj_to_delete}?"
+        if is_correction_deletion:
+            confirm_message = f"Delete problem object ID {obj_to_delete} during auto-correction?"
+
+        if messagebox.askyesno("Delete Object Confirmation", confirm_message, parent=self.root):
+            reason = "Problem object deleted during auto-correction" if is_correction_deletion else "Manual deletion (button click)"
+            self._delete_object_by_id(obj_to_delete, reason)
+
+            if is_correction_deletion:
+                self.interaction_correction_pending = None
+                if obj_to_delete in self.problematic_objects_flagged:
+                    del self.problematic_objects_flagged[obj_to_delete]
+
+                self.autolabel_active = False
+                self.playback_paused = True
+                self.update_status(f"Problem object {obj_to_delete} deleted. Click 'Resume Auto-labeling'.")
+                self._update_ui_for_autolabel_state(False)
+            
+    def _delete_object_by_id(self, obj_id_to_delete, reason=""):
+        if obj_id_to_delete in self.tracked_objects:
+            if obj_id_to_delete not in self.suppressed_sam_ids:
+                self.suppressed_sam_ids.add(obj_id_to_delete)
+                logger.info(f"SAM ID {obj_id_to_delete} deleted and added to suppression list. This object will no longer be labeled or displayed.")
+
+            del self.tracked_objects[obj_id_to_delete]
+            logger.info(f"Object ID {obj_id_to_delete} removed from tracked_objects. Reason: {reason}")
+
+            if self.selected_object_sam_id == obj_id_to_delete: self.selected_object_sam_id = None
+            if self.reassign_bbox_mode_active_sam_id == obj_id_to_delete: self.reassign_bbox_mode_active_sam_id = None
+            if self.interaction_correction_pending == obj_id_to_delete: self.interaction_correction_pending = None
+            if self.problematic_highlight_active_sam_id == obj_id_to_delete: self.problematic_highlight_active_sam_id = None
+            if obj_id_to_delete in self.problematic_objects_flagged: del self.problematic_objects_flagged[obj_id_to_delete]
+
+            self.update_status(f"Object {obj_id_to_delete} deleted.")
+            self._update_interaction_status_and_label()
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+        else:
+            logger.warning(f"Delete attempt: Object ID {obj_id_to_delete} not in tracked_objects.")
+
+    def _release_video_capture(self):
+        if self.cap and self.cap.isOpened(): logger.info("Video capture released."); self.cap.release(); self.cap = None
+        if hasattr(self, '_temp_video_path') and self._temp_video_path:
+            try:
+                if os.path.exists(self._temp_video_path):
+                    os.remove(self._temp_video_path)
+                    logger.info(f"Temp video file deleted: {self._temp_video_path}")
+            except Exception as e:
+                logger.warning(f"Temp video file delete failed: {e}")
+            self._temp_video_path = None
+
+    def _reset_internal_states_for_new_source(self):
+        logger.info("Resetting internal states for new video source.")
+        self.is_predictor_loaded_first_frame = False; self.tracked_objects.clear()
+        self.next_obj_id_to_propose = 1; self._update_obj_id_info_label()
+        self.current_cv_frame = None; self.current_frame_pil_rgb_original = None
+        self.displayed_frame_bgr = None; self.displayed_overlay_masks = {}; self.displayed_frame_idx = 0
+        self.current_frame_idx_conceptual = 0; self.is_tracking_ever_started = False
+        self.last_active_tracked_sam_ids.clear(); self.selected_object_sam_id = None
+        self.autolabel_active = False; self.just_reset_sam = False; self.sam_operation_in_progress = False
+        self.problematic_objects_flagged.clear()
+        self.interaction_correction_pending = None; self.problematic_highlight_active_sam_id = None
+        self.reassign_bbox_mode_active_sam_id = None
+        self.suppressed_sam_ids.clear()
+        self.is_batch_video_finished = False
+        self.yolo_dataset_initialized = False
+
+        self._reset_group_and_polygon_state()
+
+        self.inference_session = None
+
+        self.pcs_inference_session = None
+        self.pcs_streaming_session = None
+        self.pcs_multi_streaming = []
+        self.current_confidence_masks = {}
+        self.video_frames_cache = []
+        self.pcs_exemplar_boxes = []
+        self.pcs_exemplar_labels = []
+
+        self.cut_start_frame = 0
+        self.cut_point_frame = None
+        self.propagated_results = {}
+        self.review_current_frame = 0
+        self.label_anchor_frame_idx = None
+
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.propagation_paused = False
+        self.propagation_stop_requested = False
+        try:
+            self.propagation_pause_event.set()
+        except Exception:
+            pass
+        try:
+            self._remove_dlmi_persistent_hooks()
+        except Exception as _hook_err:
+            logger.debug(f"_reset_internal_states_for_new_source: dlmi hook cleanup skipped: {_hook_err}")
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
+
+        self.discarded_frames.clear()
+        if hasattr(self, 'view') and hasattr(self.view, 'update_discarded_frames_display'):
+            self.view.update_discarded_frames_display(set())
+
+        self.video_display_name = ""
+        self.video_total_frames = 0
+        self.video_fps = 0
+        self.video_resolution = ""
+        self.info_video_name_var.set("N/A")
+        self.info_video_resolution_var.set("N/A")
+        self.info_video_total_frames_var.set("N/A")
+        self.info_video_fps_var.set("N/A")
+
+        if not self.is_batch_running:
+            self.info_batch_progress_var.set("N/A")
+
+        if self.view and hasattr(self.view, 'clear_original_canvas'):
+            self.view.clear_original_canvas()
+
+        if self.view:
+            self.view.clear_canvas_image()
+            if hasattr(self.view, 'update_current_frame_save_button_state'):
+                self.view.update_current_frame_save_button_state()
+        if self.predictor and hasattr(self.predictor, 'reset_state'):
+            try: self.predictor.reset_state(); logger.info("SAM3 predictor.reset_state() called.")
+            except Exception as e:
+                if 'point_inputs_per_obj' in str(e): logger.warning(f"SAM3 predictor.reset_state() known issue: {e} (ignored)")
+                else: logger.warning(f"SAM3 predictor.reset_state() error: {e} (ignored)")
+
+    def _prompt_yolo_class_info(self):
+        return batch_controller.prompt_yolo_class_info(self)
+
+    def _init_yolo_dataset_structure(self, save_dir):
+        return batch_controller.init_yolo_dataset_structure(self, save_dir)
+
+    def _update_yolo_yaml(self):
+        batch_controller.update_yolo_yaml(self)
+
+    def _check_existing_yolo_dataset(self, save_dir):
+        return batch_controller.check_existing_yolo_dataset(self, save_dir)
+
+    def _get_save_directory(self):
+        return batch_controller.get_save_directory(self)
+
+    def start_batch_processing(self):
+        batch_controller.start_batch_processing(self)
+
+    def skip_current_batch_video(self):
+        batch_controller.skip_current_batch_video(self)
+
+    def _move_completed_video(self, video_path, skipped=False):
+        batch_controller.move_completed_video(self, video_path, skipped)
+
+    def select_batch_completed_dir(self):
+        batch_controller.select_batch_completed_dir(self)
+
+    def select_video_source(self):
+        if self.autolabel_active or self._is_any_special_mode_active():
+            messagebox.showwarning("Busy", "Stop auto-labeling or interaction before changing source.", parent=self.root)
+            return
+
+        if self.batch_processing_mode_var.get():
+            messagebox.showinfo("Notice", "Batch processing mode is active.\nClick 'Start Batch Processing'.", parent=self.root)
+            return
+
+        self._release_video_capture(); self._reset_internal_states_for_new_source()
+        self.is_image_source = False
+
+        if self.allow_image_source_var.get():
+            source_type = messagebox.askquestion("Select Source", "Load from video/image file?\n(Camera 0 is No)", parent=self.root)
+            if source_type == 'yes':
+                self.video_source_path = filedialog.askopenfilename(
+                    title="Select Video/Image File",
+                    filetypes=(
+                        ("Video", "*.mp4 *.avi *.mov *.mkv"),
+                        ("Image", "*.jpg *.jpeg *.png *.bmp *.tiff *.webp"),
+                        ("All Files", "*.*")
+                    ),
+                    parent=self.root
+                )
+                if not self.video_source_path: return
+
+                image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp', '.gif'}
+                file_ext = os.path.splitext(self.video_source_path)[1].lower()
+                if file_ext in image_extensions:
+                    self._load_image_as_video_source(self.video_source_path)
+                    return
+            else:
+                self.video_source_path = 0
+        else:
+            source_type = messagebox.askquestion("Select Source", "Load from video file?\n(Camera 0 is No)", parent=self.root)
+            if source_type == 'yes':
+                self.video_source_path = filedialog.askopenfilename(title="Select Video File", filetypes=(("MP4", "*.mp4"),("AVI", "*.avi"),("All Files", "*.*")), parent=self.root)
+                if not self.video_source_path: return
+            else: self.video_source_path = 0
+
+        self.cap = cv2.VideoCapture(self.video_source_path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", f"Cannot open video source: {self.video_source_path}", parent=self.root); self.cap = None; return
+
+        self.video_total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_resolution = f"{width}x{height}"
+        self.video_display_name = "Camera 0" if self.video_source_path == 0 else os.path.basename(self.video_source_path)
+
+        self.info_video_name_var.set(self.video_display_name)
+        self.info_video_resolution_var.set(self.video_resolution)
+        self.info_video_total_frames_var.set(f"{self.video_total_frames} frames" if self.video_total_frames > 0 else "N/A (live)")
+        self.info_video_fps_var.set(f"{self.video_fps:.2f} FPS" if self.video_fps > 0 else "N/A (live)")
+        self.update_status(f"Source: {self.video_source_path}. Loading first frame..."); self.playback_paused = True
+
+        max_slider_frame = self.video_total_frames - 1 if self.video_total_frames > 0 else 0
+        self.review_current_frame = 0
+        self.view.update_review_slider_range(max_slider_frame)
+        self.view.review_frame_slider.set(0)
+        self.view.update_review_frame_info(0, max_slider_frame)
+
+        ret, frame_bgr = self.cap.read()
+        if ret:
+            self.current_cv_frame = frame_bgr.copy(); self.current_frame_idx_conceptual = 0
+            self._display_cv_frame_on_view(frame_bgr)
+            self.update_status(f"Source loaded. Detect objects then click 'Start Propagation'.")
+            self._update_interaction_status_and_label()
+            if hasattr(self.view, 'update_current_frame_save_button_state'):
+                self.view.update_current_frame_save_button_state()
+        else: messagebox.showerror("Error", "Failed to read first frame from video.", parent=self.root); self._release_video_capture()
+
+    def _load_image_as_video_source(self, image_path):
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                messagebox.showerror("Error", f"Cannot open image: {image_path}", parent=self.root)
+                return
+
+            self.is_image_source = True
+            self.video_source_path = image_path
+
+            import tempfile
+            self._temp_video_path = tempfile.NamedTemporaryFile(suffix='.avi', delete=False).name
+
+            height, width = img.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            out = cv2.VideoWriter(self._temp_video_path, fourcc, 1.0, (width, height))
+            out.write(img)
+            out.write(img)
+            out.release()
+
+            self.cap = cv2.VideoCapture(self._temp_video_path)
+            if not self.cap.isOpened():
+                messagebox.showerror("Error", "Failed to convert image to video.", parent=self.root)
+                self.cap = None
+                return
+
+            self.video_total_frames = 2
+            self.video_fps = 1.0
+            self.video_resolution = f"{width}x{height}"
+            self.video_display_name = f"[Image] {os.path.basename(image_path)}"
+
+            self.info_video_name_var.set(self.video_display_name)
+            self.info_video_resolution_var.set(self.video_resolution)
+            self.info_video_total_frames_var.set("1 frame (image)")
+            self.info_video_fps_var.set("N/A (image)")
+            self.update_status(f"Image loaded: {image_path}")
+            self.playback_paused = True
+
+            self.review_current_frame = 0
+            self.view.update_review_slider_range(0)
+            self.view.review_frame_slider.set(0)
+            self.view.update_review_frame_info(0, 0)
+
+            ret, frame_bgr = self.cap.read()
+            if ret:
+                self.current_cv_frame = frame_bgr.copy()
+                self.current_frame_idx_conceptual = 0
+                self._display_cv_frame_on_view(frame_bgr)
+                self.update_status(f"Image loaded. Detect objects then click 'Confirm Labeling'.")
+                self._update_interaction_status_and_label()
+                if hasattr(self.view, 'update_current_frame_save_button_state'):
+                    self.view.update_current_frame_save_button_state()
+                # Image sources save directly from current annotations, so the save button is usable right away.
+                try:
+                    self.view.btn_confirm_labels.config(state=tk.NORMAL)
+                except (tk.TclError, AttributeError):
+                    pass
+            else:
+                messagebox.showerror("Error", "Failed to read image frame.", parent=self.root)
+                self._release_video_capture()
+
+        except Exception as e:
+            logger.exception(f"Error loading image: {e}")
+            messagebox.showerror("Error", f"Error loading image: {e}", parent=self.root)
+
+    def load_label_file(self):
+        import json
+
+        if self.current_cv_frame is None:
+            messagebox.showwarning("Notice", "Load video or image source first.", parent=self.root)
+            return
+
+        label_file_path = filedialog.askopenfilename(
+            title="Select Label File (JSON or YOLO txt)",
+            filetypes=(
+                ("LabelMe JSON", "*.json"),
+                ("YOLO txt", "*.txt"),
+                ("All Files", "*.*")
+            ),
+            parent=self.root
+        )
+
+        if not label_file_path:
+            return
+
+        file_ext = os.path.splitext(label_file_path)[1].lower()
+
+        try:
+            frame_height, frame_width = self.current_cv_frame.shape[:2]
+            if file_ext == '.json':
+                loaded_objects = autolabel_workflow.parse_labelme_json(label_file_path, frame_width, frame_height)
+            elif file_ext == '.txt':
+                loaded_objects = autolabel_workflow.parse_yolo_txt(label_file_path, frame_width, frame_height)
+            else:
+                messagebox.showerror("Error", "Unsupported file format.\nOnly JSON or txt files are supported.", parent=self.root)
+                return
+
+            if not loaded_objects:
+                messagebox.showinfo("Info", "No objects to load.", parent=self.root)
+                return
+
+            self._apply_loaded_objects(loaded_objects, source_desc=label_file_path)
+
+        except Exception as e:
+            logger.exception(f"Label file load error: {e}")
+            messagebox.showerror("Error", f"Error loading label file:\n{e}", parent=self.root)
+
+    def _apply_loaded_objects(self, loaded_objects, source_desc=""):
+        """Same downstream flow as load_label_file once parsing is done."""
+        if not loaded_objects:
+            return
+
+        if self.low_level_api_enabled_var.get():
+            self._apply_loaded_labels_as_polygon_masks(loaded_objects)
+            return
+
+        current_mode = self.prompt_mode_var.get()
+
+        if current_mode == "PVS" or current_mode == "PVS_CHUNK":
+            self._apply_loaded_labels_as_prompts(loaded_objects)
+        elif current_mode in ("PCS", "PCS_IMAGE"):
+            self._apply_loaded_labels_for_pcs(loaded_objects)
+
+        self.update_status(f"{len(loaded_objects)} objects loaded.")
+        if source_desc:
+            logger.info(f"Label load: source='{source_desc}', objects: {len(loaded_objects)}")
+        else:
+            logger.info(f"Label load (in-memory): objects: {len(loaded_objects)}")
+
+    def _apply_loaded_labels_as_polygon_masks(self, loaded_objects):
+        if not loaded_objects:
+            return
+
+        if self.current_cv_frame is None:
+            messagebox.showerror("Error", "No current frame available.", parent=self.root)
+            return
+
+        try:
+            frame_height, frame_width = self.current_cv_frame.shape[:2]
+
+            self.tracked_objects.clear()
+            self.next_obj_id_to_propose = 1
+            self.polygon_objects.clear()
+
+            for obj in loaded_objects:
+                label = obj.get('label', self.default_object_label_var.get())
+
+                polygon = obj.get('polygon')
+                if polygon and len(polygon) >= 3:
+                    mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                    pts = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
+                    cv2.fillPoly(mask, [pts], 255)
+                    mask_bool = mask > 0
+                elif obj.get('bbox'):
+                    x1, y1, x2, y2 = obj['bbox']
+                    mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                    mask[int(y1):int(y2), int(x1):int(x2)] = 255
+                    mask_bool = mask > 0
+                else:
+                    continue
+
+                if not mask_bool.any():
+                    continue
+
+                new_obj_id = self.next_obj_id_to_propose
+                self.next_obj_id_to_propose += 1
+
+                self.tracked_objects[new_obj_id] = {
+                    'custom_label': label,
+                    'last_mask': mask_bool,
+                    'is_polygon_object': False,
+                }
+
+                logger.info(f"Label load (Low API): object '{label}' (ID: {new_obj_id}) mask created")
+
+            if not self.tracked_objects:
+                messagebox.showwarning("Info", "No objects to convert.", parent=self.root)
+                return
+
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            self._update_obj_id_info_label()
+
+            self.update_status(f"{len(self.tracked_objects)} object masks created. Injecting Low data...")
+            self.root.update_idletasks()
+
+            self.inject_low_level_mask_prompt()
+
+            self.update_status(f"Low-level API: {len(self.tracked_objects)} objects injected to SAM3.")
+            logger.info(f"Label load + Low data injection complete: {len(self.tracked_objects)} objects")
+
+        except Exception as e:
+            logger.exception(f"Low-level API label load failed: {e}")
+            messagebox.showerror("Error", f"Error loading labels via Low-level API:\n{e}", parent=self.root)
+
+    def _apply_loaded_labels_as_prompts(self, loaded_objects):
+        if not loaded_objects:
+            return
+
+        if self.inference_session is None:
+            if not self._init_inference_session():
+                messagebox.showerror("Error", "SAM3 session initialization failed.", parent=self.root)
+                return
+
+        if self.tracked_objects:
+            response = messagebox.askyesno(
+                "Existing Object Handling",
+                f"Currently {len(self.tracked_objects)} objects exist.\n"
+                "Keep existing objects and add new ones?\n\n"
+                "Yes: Keep existing and add\n"
+                "No: Clear existing and add new",
+                parent=self.root
+            )
+            if not response:
+                self.tracked_objects.clear()
+                self.next_obj_id_to_propose = 1
+                self._reset_inference_session()
+
+        self._suppress_mid_session_guard = True
+        try:
+            for obj in loaded_objects:
+                bbox = obj.get('bbox')
+                label = obj.get('label', self.default_object_label_var.get())
+
+                if bbox is None:
+                    continue
+
+                x1, y1, x2, y2 = bbox
+                coords = np.array([x1, y1, x2, y2])
+
+                new_obj_id = self.next_obj_id_to_propose
+
+                self._handle_sam_prompt_wrapper(
+                    prompt_type='bbox',
+                    coords=coords,
+                    label=1,  # positive
+                    proposed_obj_id_for_new=new_obj_id,
+                    target_existing_obj_id=None,
+                    custom_label=label
+                )
+
+                logger.info(f"Label load: object '{label}' (ID: {new_obj_id}) bbox prompt applied")
+        finally:
+            self._suppress_mid_session_guard = False
+
+        if self.current_cv_frame is not None:
+            self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+
+        self._update_obj_id_info_label()
+
+    def _apply_loaded_labels_for_pcs(self, loaded_objects):
+        from util import pcs_controller
+        return pcs_controller.apply_loaded_labels_for_pcs(self, loaded_objects)
+
+    def _display_cv_frame_on_view(self, frame_bgr, masks_to_overlay=None, yolo_bboxes_to_draw=None,
+                                  frame_idx=None, show_pose=True):
+        if frame_bgr is None: return
+        self.displayed_frame_bgr = frame_bgr
+        self.displayed_overlay_masks = dict(masks_to_overlay) if masks_to_overlay else {}
+        self.displayed_frame_idx = (
+            frame_idx if frame_idx is not None
+            else getattr(self, 'current_frame_idx_conceptual', 0)
+        )
+        self.displayed_pose_visible = bool(show_pose)
+        if self.view is not None and hasattr(self.view, 'update_current_frame_save_button_state'):
+            try:
+                self.view.update_current_frame_save_button_state()
+            except Exception as _btn_err:
+                logger.debug(f"current-frame save button refresh skipped: {_btn_err}")
+        try:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self.current_frame_pil_rgb_original = Image.fromarray(frame_rgb)
+
+            img_arr = np.array(self.current_frame_pil_rgb_original.convert("RGBA"))
+            h, w = img_arr.shape[:2]
+            frame_diagonal = None  # lazily computed once per redraw if needed
+
+            bbox_cache = {}
+            special_focus_objs = []
+            group_bbox_cache = {}
+
+            if masks_to_overlay:
+                erosion_k = self.erosion_kernel_size.get()
+                erosion_i = self.erosion_iterations.get()
+                base_alpha = self.mask_alpha_var.get() if hasattr(self, 'mask_alpha_var') else ALPHA_NORMAL
+
+                processed_groups = set()
+                for obj_id, mask_array_bool in masks_to_overlay.items():
+                    if mask_array_bool is None: continue
+
+                    if mask_array_bool.dtype != bool:
+                        mask_array_bool = mask_array_bool > 0.5
+                    if mask_array_bool.shape[0] != h or mask_array_bool.shape[1] != w:
+                        continue
+
+                    bbox_cache[obj_id] = get_bbox_from_mask(mask_array_bool, erosion_k, erosion_i, 1)
+                    group_id = self.sam_id_to_group.get(obj_id)
+                    if group_id is not None:
+                        first_member = min(self.object_groups.get(group_id, {obj_id}))
+                        rgb_color = self._get_object_color(first_member)
+                        current_bbox = bbox_cache[obj_id]
+                        if current_bbox is not None:
+                            if group_id not in group_bbox_cache:
+                                group_bbox_cache[group_id] = list(current_bbox)
+                            else:
+                                x1, y1, x2, y2 = group_bbox_cache[group_id]
+                                nx1, ny1, nx2, ny2 = current_bbox
+                                group_bbox_cache[group_id] = [min(x1, nx1), min(y1, ny1), max(x2, nx2), max(y2, ny2)]
+                    else:
+                        rgb_color = self._get_object_color(obj_id)
+
+                    alpha = base_alpha
+                    is_multi_selected = obj_id in self.selected_objects_sam_ids
+
+                    is_group_selected = False
+                    if group_id is not None:
+                        group_members = self.object_groups.get(group_id, set())
+                        is_group_selected = any(
+                            m in self.selected_objects_sam_ids or m == self.selected_object_sam_id
+                            for m in group_members
+                        )
+
+                    is_special = (is_multi_selected or is_group_selected or
+                                  obj_id == self.selected_object_sam_id or
+                                  obj_id == self.interaction_correction_pending or
+                                  obj_id == self.problematic_highlight_active_sam_id or
+                                  obj_id == self.reassign_bbox_mode_active_sam_id)
+
+                    if is_special:
+                        alpha = min(255, alpha + 50)
+                        special_focus_objs.append(obj_id)
+                    if obj_id == self.problematic_highlight_active_sam_id:
+                        alpha = max(30, alpha - 50)
+                    elif obj_id == self.interaction_correction_pending or obj_id == self.reassign_bbox_mode_active_sam_id:
+                        alpha = max(20, alpha - 80)
+
+                    alpha_ratio = alpha / 255.0
+                    inv_alpha = 1.0 - alpha_ratio
+                    color_arr = np.array(rgb_color, dtype=np.float32)
+                    img_arr[mask_array_bool, :3] = (
+                        img_arr[mask_array_bool, :3] * inv_alpha + color_arr * alpha_ratio
+                    ).astype(np.uint8)
+
+            if (getattr(self, 'paint_mode_active', False)
+                    and self.paint_stroke_mask is not None
+                    and self.paint_stroke_mask.shape[:2] == (h, w)):
+                stroke_bool = self.paint_stroke_mask > 0
+                if stroke_bool.any():
+                    # Pending positive paint is always cyan; negative strokes only preview in red.
+                    paint_alpha = 0.45
+                    paint_color = np.array((0, 255, 255), dtype=np.float32)
+                    img_arr[stroke_bool, :3] = (
+                        img_arr[stroke_bool, :3] * (1.0 - paint_alpha) + paint_color * paint_alpha
+                    ).astype(np.uint8)
+
+            pil_image_to_draw_on = Image.fromarray(img_arr, "RGBA")
+            draw_final = ImageDraw.Draw(pil_image_to_draw_on)
+
+            drawn_group_ids = set()
+            for obj_id in special_focus_objs:
+                group_id = self.sam_id_to_group.get(obj_id)
+
+                if group_id is not None:
+                    if group_id in drawn_group_ids:
+                        continue
+                    drawn_group_ids.add(group_id)
+                    bbox = group_bbox_cache.get(group_id, bbox_cache.get(obj_id))
+                else:
+                    bbox = bbox_cache.get(obj_id)
+
+                if bbox is not None:
+                    x1, y1, x2, y2 = bbox
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+                    if x1 < x2 and y1 < y2:
+                        draw_final.rectangle([x1, y1, x2, y2], outline="yellow", width=3)
+
+            if masks_to_overlay:
+                labeled_groups = set()
+                for obj_id in masks_to_overlay.keys():
+                    group_id = self.sam_id_to_group.get(obj_id)
+
+                    if group_id is not None:
+                        if group_id in labeled_groups:
+                            continue
+                        labeled_groups.add(group_id)
+                        first_member = min(self.object_groups.get(group_id, {obj_id}))
+                        obj_data = self.tracked_objects.get(first_member, {})
+                        member_count = len(self.object_groups.get(group_id, set()))
+                        display_label = f"Group-{group_id} ({member_count}): {obj_data.get('custom_label', 'object')}"
+                        bbox_for_label = group_bbox_cache.get(group_id, bbox_cache.get(obj_id))
+                    else:
+                        obj_data = self.tracked_objects.get(obj_id, {})
+                        display_label = obj_data.get("custom_label", f"Obj-{obj_id}")
+                        if obj_id == self.reassign_bbox_mode_active_sam_id: display_label += " (BBox Reassign)"
+                        elif obj_id == self.problematic_highlight_active_sam_id: display_label += " (Check Required!)"
+                        elif obj_id == self.interaction_correction_pending: display_label += " (Auto Correction...)"
+                        bbox_for_label = bbox_cache.get(obj_id)
+
+                    if bbox_for_label is not None:
+                        x1, y1, x2, y2 = bbox_for_label
+                        if frame_diagonal is None:
+                            frame_diagonal = math.sqrt(w * w + h * h)
+                        diagonal = frame_diagonal
+                        font_size_percent = self.label_font_size_percent_var.get()
+                        dynamic_font_size = max(8, int(diagonal * font_size_percent / 100))
+                        dynamic_font = self._dynamic_font_cache.get(dynamic_font_size)
+                        if dynamic_font is None:
+                            for font_path in self._dynamic_font_paths:
+                                try:
+                                    dynamic_font = ImageFont.truetype(font_path, dynamic_font_size)
+                                    break
+                                except Exception:
+                                    continue
+                            if dynamic_font is None:
+                                dynamic_font = ImageFont.load_default()
+                            self._dynamic_font_cache[dynamic_font_size] = dynamic_font
+                        text_pos = (int(x1 + 5), int(y1 - dynamic_font_size - 5 if y1 > dynamic_font_size + 5 else y1 + 5))
+                        try: draw_final.text(text_pos, display_label, fill="yellow", font=dynamic_font)
+                        except Exception: pass
+                        if obj_id in (self.problematic_highlight_active_sam_id, self.interaction_correction_pending, self.reassign_bbox_mode_active_sam_id):
+                            center_x, center_y = int((x1 + x2) / 2), int((y1 + y2) / 2)
+                            marker_base_size = min(w, h) / 80
+                            marker_color = "orange" if obj_id in (self.interaction_correction_pending, self.reassign_bbox_mode_active_sam_id) else "red"
+                            marker_size = marker_base_size * 0.7 if marker_color == "orange" else marker_base_size
+                            draw_star_marker(draw_final, center_x, center_y, marker_size, color=marker_color)
+
+            if getattr(self, 'polygon_mode_active', False) or getattr(self, 'paint_mode_active', False):
+                polygon_color = (0, 255, 255)
+                if frame_diagonal is None:
+                    frame_diagonal = math.sqrt(w * w + h * h)
+                diagonal = frame_diagonal
+                vertex_size_var = getattr(self, 'polygon_vertex_size_percent_var', None)
+                point_size_percent = vertex_size_var.get() if vertex_size_var is not None else self.polygon_point_size_percent_var.get()
+                point_radius = max(2, int(diagonal * point_size_percent / 100))
+
+                if hasattr(self, 'polygon_points') and self.polygon_points:
+                    for i, (px, py) in enumerate(self.polygon_points):
+                        draw_final.ellipse(
+                            [px - point_radius, py - point_radius, px + point_radius, py + point_radius],
+                            fill="cyan", outline="white"
+                        )
+                        draw_final.text((px + point_radius + 2, py - point_radius), str(i + 1), fill="yellow")
+
+                    if len(self.polygon_points) >= 2:
+                        for i in range(len(self.polygon_points) - 1):
+                            p1 = self.polygon_points[i]
+                            p2 = self.polygon_points[i + 1]
+                            draw_final.line([p1[0], p1[1], p2[0], p2[1]], fill="cyan", width=2)
+
+                if hasattr(self, 'polygon_objects') and self.polygon_objects:
+                    for obj_idx, poly_obj in enumerate(self.polygon_objects):
+                        points = poly_obj.get('points', [])
+                        if len(points) >= 3:
+                            flat_points = [(p[0], p[1]) for p in points]
+                            draw_final.polygon(flat_points, outline="lime", width=2)
+                            first_pt = points[0]
+                            draw_final.text((first_pt[0] + 5, first_pt[1] - 15), f"Poly-{obj_idx + 1}", fill="lime")
+
+            if (hasattr(self, 'show_prompt_visualization_var') and self.show_prompt_visualization_var.get()
+                and hasattr(self, 'object_prompt_history') and self.object_prompt_history):
+                if frame_diagonal is None:
+                    frame_diagonal = math.sqrt(w * w + h * h)
+                diagonal = frame_diagonal
+                point_size_percent = self.polygon_point_size_percent_var.get()
+                line_width = max(1, int(diagonal * point_size_percent / 100))
+                point_radius = max(2, int(diagonal * point_size_percent / 100))
+
+                show_per_object = hasattr(self, 'show_prompt_per_object_var') and self.show_prompt_per_object_var.get()
+                selected_id = getattr(self, 'selected_object_sam_id', None)
+
+                for obj_id, prompts in self.object_prompt_history.items():
+                    if show_per_object and selected_id is not None and obj_id != selected_id:
+                        continue
+                    for box in prompts.get('boxes', []):
+                        x1, y1, x2, y2 = [int(v) for v in box]
+                        draw_final.rectangle([x1, y1, x2, y2], outline="black", width=line_width)
+
+                    for pt in prompts.get('positive_points', []):
+                        px, py = int(pt[0]), int(pt[1])
+                        draw_final.ellipse(
+                            [px - point_radius, py - point_radius, px + point_radius, py + point_radius],
+                            fill="lime", outline="white"
+                        )
+
+                    for pt in prompts.get('negative_points', []):
+                        px, py = int(pt[0]), int(pt[1])
+                        draw_final.ellipse(
+                            [px - point_radius, py - point_radius, px + point_radius, py + point_radius],
+                            fill="red", outline="white"
+                        )
+
+                    for contour in prompts.get('mask_contours', []):
+                        if len(contour) >= 2:
+                            flat_pts = [(int(p[0][0]), int(p[0][1])) for p in contour if len(p) > 0]
+                            if len(flat_pts) >= 2:
+                                draw_final.line(flat_pts + [flat_pts[0]], fill="lime", width=line_width)
+
+                    for box in prompts.get('exemplar_positive', []):
+                        x1, y1, x2, y2 = [int(v) for v in box]
+                        draw_final.rectangle([x1, y1, x2, y2], outline="lime", width=max(1, line_width // 2))
+
+                    for box in prompts.get('exemplar_negative', []):
+                        x1, y1, x2, y2 = [int(v) for v in box]
+                        draw_final.rectangle([x1, y1, x2, y2], outline="red", width=max(1, line_width // 2))
+
+            if yolo_bboxes_to_draw:
+                for yolo_id, data in yolo_bboxes_to_draw.items():
+                    if data["bbox"] is None: continue
+                    x1, y1, x2, y2 = data["bbox"]
+                    label = f"Y-{yolo_id}: {data['class_name']}"
+                    draw_final.rectangle([x1, y1, x2, y2], outline="cyan", width=1)
+                    draw_final.text((x1, y1 - 10 if y1 > 10 else y1 + 2), label, fill="cyan", font=self.label_font)
+
+            if (hasattr(self, 'show_object_border_var') and self.show_object_border_var.get() and masks_to_overlay):
+                border_color = (0, 0, 0, 255)
+                for obj_id, mask_arr in masks_to_overlay.items():
+                    if mask_arr is None or not mask_arr.any(): continue
+                    mask_uint8 = (mask_arr.astype(np.uint8) if mask_arr.dtype == bool else (mask_arr > 0.5).astype(np.uint8)) * 255
+                    outer_contours, hole_contours = extract_polygon_contours(mask_uint8)
+                    for contour in outer_contours + [h for hs in hole_contours for h in hs]:
+                        if len(contour) >= 3:
+                            points = [tuple(pt[0]) for pt in contour]
+                            if len(points) >= 3:
+                                draw_final.polygon(points, outline=border_color, width=2)
+
+            if self.view: self.view.display_image(pil_image_to_draw_on)
+            if self._pose_ui is not None and self.view and hasattr(self.view, 'canvas'):
+                try:
+                    if show_pose:
+                        self._pose_ui.render_pose_on_canvas(
+                            self.view.canvas, self,
+                            selected_pose_set=self.selected_pose_points
+                        )
+                    else:
+                        self.view.canvas.delete("pose_overlay")
+                except Exception as _pose_render_err:
+                    logger.debug(f"pose overlay render skipped: {_pose_render_err}")
+        except Exception as e: logger.exception(f"_display_cv_frame_on_view error: {e}")
+
+    def _get_current_masks_for_display(self):
+        current_keys = list(self.tracked_objects.keys())
+        masks = {}
+
+        filter_enabled = self.filter_small_objects_var.get()
+        threshold_ratio = self.small_object_threshold_var.get()
+
+        min_bbox_width = 0
+        if filter_enabled and self.current_cv_frame is not None:
+            frame_width = self.current_cv_frame.shape[1]
+            min_bbox_width = frame_width * threshold_ratio
+
+        for obj_id in current_keys:
+            data = self.tracked_objects.get(obj_id)
+            if data and "last_mask" in data and data["last_mask"] is not None:
+                mask = data["last_mask"]
+
+                if filter_enabled and min_bbox_width > 0:
+                    bbox = get_bbox_from_mask(mask, min_bbox_area_val=1)
+                    if bbox is not None:
+                        bbox_width = bbox[2] - bbox[0]
+                        if bbox_width < min_bbox_width:
+                            logger.debug(f"Small object filter: ObjID {obj_id} (width {bbox_width:.1f} < threshold {min_bbox_width:.1f})")
+                            continue
+
+                masks[obj_id] = mask
+        return masks
+
+    def _update_ui_for_autolabel_state(self, is_autolabeling_active_or_resuming):
+        is_paused_or_stopped = not is_autolabeling_active_or_resuming
+        is_special_mode = self._is_any_special_mode_active()
+
+        general_state = tk.NORMAL if is_paused_or_stopped and not is_special_mode else tk.DISABLED
+        special_mode_override = is_paused_or_stopped
+
+        self.view.set_ui_element_state("btn_select_source", general_state)
+        self.view.set_ui_element_state("btn_clear_tracked", general_state if self.predictor else tk.DISABLED)
+        self.view.set_ui_element_state("notebook_tabs", general_state)
+        self.view.set_ui_element_state("entry_default_label", general_state)
+
+        selected_obj_exists = self.selected_object_sam_id is not None
+        self.view.set_ui_element_state("btn_set_custom_label", tk.NORMAL if selected_obj_exists and special_mode_override and not is_special_mode else tk.DISABLED)
+        self.view.set_ui_element_state("btn_reassign_bbox_selected", tk.NORMAL if selected_obj_exists and special_mode_override else tk.DISABLED)
+
+        can_delete = (selected_obj_exists and special_mode_override and not self.reassign_bbox_mode_active_sam_id and not self.problematic_highlight_active_sam_id)
+        self.view.set_ui_element_state("btn_delete_selected", tk.NORMAL if can_delete else tk.DISABLED)
+
+        can_load_label = self.current_cv_frame is not None and is_paused_or_stopped
+        self.view.set_ui_element_state("btn_load_label", tk.NORMAL if can_load_label else tk.DISABLED)
+
+        can_skip_batch = self.is_batch_running and is_paused_or_stopped
+        if hasattr(self.view, 'btn_skip_batch'):
+            self.view.set_ui_element_state("btn_skip_batch", tk.NORMAL if can_skip_batch else tk.DISABLED)
+
+    def _reopen_capture(self):
+        if self.video_source_path is None: return False
+        logger.info(f"Attempting to reopen video capture: {self.video_source_path}")
+        if self.cap: self.cap.release()
+        self.cap = cv2.VideoCapture(self.video_source_path)
+        if not self.cap.isOpened(): err_msg=f"Failed to reopen video source {self.video_source_path}"; logger.error(err_msg); messagebox.showerror("Error", err_msg, parent=self.root); return False
+        if isinstance(self.video_source_path, str) and self.current_frame_idx_conceptual == 0:
+            try: self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0); logger.info("Moved to start after video file reopen.")
+            except Exception as e: logger.warning(f"Failed to reset video frame position: {e} (ignored)")
+        self.is_predictor_loaded_first_frame = False
+        if self.predictor and hasattr(self.predictor, 'reset_state'):
+            try: self.predictor.reset_state()
+            except Exception as e:
+                if 'point_inputs_per_obj' in str(e): logger.warning(f"SAM3 predictor.reset_state() known issue: {e} (ignored)")
+                else: logger.warning(f"SAM reset failed during capture reopen: {e}")
+        self.is_tracking_ever_started = False; self.last_active_tracked_sam_ids.clear()
+        self.just_reset_sam = False; self.sam_operation_in_progress = False
+        self.problematic_objects_flagged.clear(); self.interaction_correction_pending = None
+        self.problematic_highlight_active_sam_id = None; self.reassign_bbox_mode_active_sam_id = None
+        return True
+
+    def clear_all_tracked_objects(self):
+        if self.autolabel_active or self._is_any_special_mode_active():
+            messagebox.showwarning("Clear Failed", "Stop auto-labeling or interaction before clearing objects.", parent=self.root); return
+        logger.info("Clearing all tracked objects/prompts and resetting SAM3 predictor.")
+        self._remove_dlmi_persistent_hooks()
+        self.label_anchor_frame_idx = None
+        self.tracked_objects.clear(); self.next_obj_id_to_propose = 1
+        self.is_predictor_loaded_first_frame = False; self.is_tracking_ever_started = False
+        self.last_active_tracked_sam_ids.clear(); self.selected_object_sam_id = None
+        self.just_reset_sam = False; self.sam_operation_in_progress = False
+        self.problematic_objects_flagged.clear()
+        self.interaction_correction_pending = None; self.problematic_highlight_active_sam_id = None; self.reassign_bbox_mode_active_sam_id = None
+        self.is_restoration_pending = False
+        self.suppressed_sam_ids.clear()
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
+            logger.info("object_prompt_history cleared.")
+
+        self._reset_group_and_polygon_state()
+
+        if hasattr(self, 'inference_session') and self.inference_session is not None:
+            try:
+                if hasattr(self.inference_session, 'obj_ids'):
+                    self.inference_session.obj_ids.clear()
+                if hasattr(self.inference_session, 'point_inputs_per_obj'):
+                    self.inference_session.point_inputs_per_obj.clear()
+                if hasattr(self.inference_session, 'mask_inputs_per_obj'):
+                    self.inference_session.mask_inputs_per_obj.clear()
+                logger.info("SAM3 inference_session internal state cleared.")
+            except Exception as e:
+                logger.warning(f"Error during inference_session clear (ignored): {e}")
+            self.inference_session = None
+            logger.info("SAM3 inference_session set to None.")
+
+        if self.predictor and hasattr(self.predictor, 'reset_state'):
+            try: self.predictor.reset_state(); logger.info("SAM3 predictor.reset_state() called.")
+            except Exception as e:
+                if 'point_inputs_per_obj' in str(e): logger.warning(f"SAM3 predictor.reset_state() known issue: {e} (ignored)")
+                else: logger.error(f"SAM3 predictor.reset_state() error: {e} (ignored)")
+
+        if hasattr(self, 'propagated_results'):
+            self.propagated_results.clear()
+            logger.info("propagated_results cleared.")
+
+        if hasattr(self, 'discarded_frames'):
+            self.discarded_frames.clear()
+            if hasattr(self, 'view') and hasattr(self.view, 'update_discarded_frames_display'):
+                self.view.update_discarded_frames_display(set())
+            logger.info("discarded_frames cleared.")
+
+        self.object_colors.clear()
+        logger.info("object_colors cache cleared.")
+
+        # Reset slider/cut offset so the next session anchors at frame 0 instead of a stale review position.
+        self.review_current_frame = 0
+        self.cut_start_frame = 0
+        if hasattr(self, 'view') and hasattr(self.view, 'review_frame_slider'):
+            try:
+                self.view.review_frame_slider.set(0)
+            except Exception:
+                pass
+        # Seek video to frame 0 so the display matches the reset state.
+        if self.cap is not None:
+            try:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, first_frame = self.cap.read()
+                if ret:
+                    self.current_cv_frame = first_frame
+                    self.current_frame_idx_conceptual = 0
+            except Exception as _seek_err:
+                logger.debug(f"Clear: video seek to 0 failed: {_seek_err}")
+
+        self.app_state = "IDLE"
+        if hasattr(self, 'view') and hasattr(self.view, 'enable_review_controls'):
+            self.view.enable_review_controls(False)
+        logger.info("app_state reset to IDLE, review controls disabled.")
+
+        self._update_obj_id_info_label()
+        if self.current_cv_frame is not None: self._display_cv_frame_on_view(self.current_cv_frame)
+        self.update_status("All objects cleared.")
+        self._update_interaction_status_and_label()
+
+    def _get_object_color(self, obj_id, for_tkinter_hex=False):
+        obj_id_key = get_hashable_obj_id(obj_id)
+        if obj_id_key not in self.object_colors:
+            import matplotlib.pyplot as _plt  # lazy import: only needed when a new color is allocated
+            cmap = _plt.get_cmap("tab10")
+            color_idx = (obj_id_key - 1) % cmap.N if obj_id_key > 0 else abs(obj_id_key) % cmap.N
+            self.object_colors[obj_id_key] = tuple(int(c * 255) for c in cmap(color_idx)[:3])
+
+        color_tuple = self.object_colors.get(obj_id_key, (128, 128, 128))
+        return rgb_to_tkinter_hex(color_tuple) if for_tkinter_hex else color_tuple
+
+    def _perform_sam_tracking_for_frame(self, frame_bgr, frame_num):
+        logger.debug(f"SAM3 tracking start. frame: {frame_num}")
+        current_sam_masks_for_display = {}
+        current_sam_masks_for_labeling = {}
+
+        if self.tracker_model is None or self.inference_session is None:
+            logger.debug(f"Frame {frame_num}: SAM3 tracker not ready. Skipping tracking.")
+            return self._get_current_masks_for_display(), {
+                k: v.copy() for k, v in self.tracked_objects.items()
+                if "last_mask" in v and v["last_mask"] is not None and k not in self.suppressed_sam_ids
+            }
+
+        if self.just_reset_sam:
+            logger.info(f"Frame {frame_num}: Right after SAM3 reset. Skipping tracking.")
+            self.just_reset_sam = False
+            return self._get_current_masks_for_display(), {
+                k: v.copy() for k, v in self.tracked_objects.items()
+                if "last_mask" in v and v["last_mask"] is not None and k not in self.suppressed_sam_ids
+            }
+
+        if not self.tracked_objects:
+            logger.debug(f"Frame {frame_num}: tracked_objects empty. Skipping tracking.")
+            return current_sam_masks_for_display, current_sam_masks_for_labeling
+
+        track_successful_this_frame = False
+        try:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_pil = Image.fromarray(frame_rgb)
+
+            inputs = self.tracker_processor(images=frame_pil, device=self.device, return_tensors="pt")
+
+            frame_tensor = inputs.pixel_values[0]
+            if self.model_dtype == torch.float32 and frame_tensor.dtype != torch.float32:
+                frame_tensor = frame_tensor.to(dtype=torch.float32)
+
+            with torch.inference_mode():
+                model_outputs = self.tracker_model(
+                    inference_session=self.inference_session,
+                    frame=frame_tensor,
+                )
+
+            processed_outputs = self.tracker_processor.post_process_masks(
+                [model_outputs.pred_masks],
+                original_sizes=inputs.original_sizes,
+                binarize=False
+            )[0]
+
+            track_successful_this_frame = True
+
+            if not self.is_tracking_ever_started:
+                self.is_tracking_ever_started = True
+                logger.info(f"Frame {frame_num}: First SAM3 tracking success.")
+
+            self.last_active_tracked_sam_ids.clear()
+            target_h, target_w = frame_bgr.shape[:2]
+            pil_size_for_mask = (target_w, target_h)
+            target_shape = (pil_size_for_mask[1], pil_size_for_mask[0])
+
+            apply_closing = self.sam_apply_closing_var.get()
+            closing_kernel = self.sam_closing_kernel_size_var.get()
+            erosion_k = self.erosion_kernel_size.get()
+            erosion_i = self.erosion_iterations.get()
+            min_bbox_area = self.min_bbox_area_for_reprompt.get()
+
+            if not hasattr(self, 'current_confidence_masks'):
+                self.current_confidence_masks = {}
+
+            tracked_obj_ids = list(self.inference_session.obj_ids) if hasattr(self.inference_session, 'obj_ids') else list(self.tracked_objects.keys())
+
+            for i, obj_id in enumerate(tracked_obj_ids):
+                if obj_id in self.suppressed_sam_ids:
+                    continue
+
+                self.last_active_tracked_sam_ids.add(obj_id)
+
+                if i < processed_outputs.shape[0]:
+                    mask_tensor = processed_outputs[i]
+                    mask_np = mask_tensor.cpu().numpy()
+
+                    conf_mask_raw = np.squeeze(mask_np)
+                    if conf_mask_raw.ndim > 2:
+                        conf_mask_raw = conf_mask_raw[0]
+                    if conf_mask_raw.shape != target_shape:
+                        conf_mask_resized = cv2.resize(conf_mask_raw, pil_size_for_mask, interpolation=cv2.INTER_LINEAR)
+                    else:
+                        conf_mask_resized = conf_mask_raw
+                    self.current_confidence_masks[obj_id] = conf_mask_resized
+
+                    mask_processed = process_sam_mask(
+                        mask_np,
+                        pil_size_for_mask,
+                        apply_closing=apply_closing,
+                        closing_kernel_size=closing_kernel,
+                        logit_threshold=self._mask_logit_threshold()
+                    )
+
+                    if mask_processed is not None:
+                        current_sam_masks_for_display[obj_id] = mask_processed
+                        current_tracked_data = self.tracked_objects.get(obj_id)
+
+                        if current_tracked_data:
+                            current_tracked_data["last_mask"] = mask_processed
+                            current_sam_masks_for_labeling[obj_id] = {
+                                'last_mask': mask_processed.copy(),
+                                'custom_label': current_tracked_data.get('custom_label', ''),
+                                'points_for_reprompt': list(current_tracked_data.get('points_for_reprompt', [])),
+                                'initial_bbox_prompt': current_tracked_data.get('initial_bbox_prompt'),
+                            }
+                        else:
+                            logger.warning(f"SAM3 tracking result ID {obj_id} not in tracked_objects. Adding temp.")
+                            initial_bbox = get_bbox_from_mask(mask_processed, erosion_k, erosion_i, min_bbox_area)
+                            temp_data = {
+                                "last_mask": mask_processed,
+                                "custom_label": f"Tracked_{obj_id}",
+                                "points_for_reprompt": [],
+                                "initial_bbox_prompt": initial_bbox
+                            }
+                            self.tracked_objects[obj_id] = temp_data
+                            current_sam_masks_for_labeling[obj_id] = {
+                                'last_mask': mask_processed.copy(),
+                                'custom_label': temp_data.get('custom_label', ''),
+                                'points_for_reprompt': list(temp_data.get('points_for_reprompt', [])),
+                                'initial_bbox_prompt': temp_data.get('initial_bbox_prompt'),
+                            }
+                    else:
+                        logger.warning(f"SAM3 tracking ObjID {obj_id} mask processing failed.")
+
+        except RuntimeError as e:
+            track_successful_this_frame = False
+            error_msg = str(e)
+            logger.error(f"SAM3 tracking RuntimeError (frame {frame_num}): {e}")
+
+            if "CUDA out of memory" in error_msg or "out of memory" in error_msg.lower():
+                self._tracking_fatal_error = f"GPU OOM error - frame {frame_num}"
+            else:
+                self._tracking_fatal_error = f"Tracking error (frame {frame_num}): {error_msg[:100]}"
+
+        except Exception as e:
+            track_successful_this_frame = False
+            logger.error(f"SAM3 tracking exception (frame {frame_num}): {e}")
+            self._tracking_fatal_error = f"Tracking error (frame {frame_num}): {str(e)[:100]}"
+
+        if not track_successful_this_frame and self.is_tracking_ever_started:
+            logger.warning(f"Frame {frame_num}: SAM3 tracking failed. Stopping propagation.")
+            if not hasattr(self, '_tracking_fatal_error') or not self._tracking_fatal_error:
+                self._tracking_fatal_error = f"SAM3 tracking failed (frame {frame_num})"
+
+        logger.debug(f"SAM3 tracking complete. frame: {frame_num}")
+        return current_sam_masks_for_display, current_sam_masks_for_labeling
+
+    def init_pcs_streaming_session(self, text_prompt):
+        from util import pcs_controller
+        return pcs_controller.init_pcs_streaming_session(self, text_prompt)
+
+    def _perform_pcs_streaming_tracking(self, frame_bgr, frame_num):
+        from util import pcs_controller
+        return pcs_controller.perform_pcs_streaming_tracking(self, frame_bgr, frame_num)
+
+    def init_pcs_session_with_single_frame(self):
+        from util import pcs_controller
+        return pcs_controller.init_pcs_session_with_single_frame(self)
+
+    def detect_objects_with_pcs(self, text_prompt, frame_idx=0):
+        from util import pcs_controller
+        return pcs_controller.detect_objects_with_pcs(self, text_prompt, frame_idx=frame_idx)
+
+    def _on_git_precision_toggle(self):
+        """Toolbar fp32 checkbox clicked."""
+        active = self.active_backend_var.get() if hasattr(self, "active_backend_var") else "hug"
+        if active == "hug":
+            self.backend_fp32_display_var.set(True)   # HF stays fp32
+            return
+        self.git_fp32_var.set(bool(self.backend_fp32_display_var.get()))
+        mode = "fp32" if self.git_fp32_var.get() else "bf16 (default)"
+        try:
+            self.update_status(f"git/3.1 compute precision: {mode}. Applies to the next segmentation.")
+        except Exception:
+            pass
+        logger.info(f"git/3.1 compute precision set to {mode}.")
+
+    def _on_custom_save_toggle(self):
+        self.view.update_custom_save_options_state()
+
+    def _on_batch_mode_toggle(self):
+        self.view.update_batch_options_state()
+
+    def select_custom_save_dir(self):
+        dir_path = filedialog.askdirectory(title="Select Save Folder", parent=self.root)
+        if dir_path:
+            self.custom_save_dir_var.set(dir_path)
+
+    def select_custom_pose_save_dir(self):
+        dir_path = filedialog.askdirectory(title="Select Pose Label Save Folder", parent=self.root)
+        if dir_path:
+            self.custom_pose_save_dir_var.set(dir_path)
+
+    def _on_custom_pose_save_toggle(self):
+        if hasattr(self, 'view') and hasattr(self.view, 'update_custom_pose_save_options_state'):
+            self.view.update_custom_pose_save_options_state()
+
+    # ---------- User settings persistence (Save Settings button) ----------
+
+    # Tk Variables we never persist: live video metadata + transient interaction-mode toggles.
+    _SETTINGS_EXCLUDE_NAMES = frozenset({
+        "info_video_name_var",
+        "info_video_resolution_var",
+        "info_video_total_frames_var",
+        "info_video_fps_var",
+        "info_batch_progress_var",
+        "pose_add_mode_var",
+        "pose_chain_mode_var",
+        "tabs_visible_var",
+        "pose_idx_var",
+        "pose_class_var",
+    })
+
+    def _iter_persistable_vars(self):
+        """Yield (name, var) for every tk.Variable on self that should be persisted across runs."""
+        excludes = self._SETTINGS_EXCLUDE_NAMES
+        for name, value in vars(self).items():
+            if name in excludes:
+                continue
+            if isinstance(value, tk.Variable):
+                yield name, value
+
+    def save_user_settings(self):
+        """Snapshot every persistable tk.Variable on this app to a JSON file next to app.py."""
+        import json
+        snapshot = {}
+        for name, var in self._iter_persistable_vars():
+            try:
+                snapshot[name] = var.get()
+            except Exception as _v_err:
+                logger.debug(f"save_user_settings: skipping {name}: {_v_err}")
+        try:
+            with open(self._user_settings_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.exception(f"save_user_settings write failed: {e}")
+            messagebox.showerror("Error", f"Failed to save settings:\n{e}", parent=self.root)
+            return
+        logger.info(f"User settings saved: {self._user_settings_path} ({len(snapshot)} keys)")
+        self.update_status(f"Settings saved to {os.path.basename(self._user_settings_path)} ({len(snapshot)} entries).")
+        messagebox.showinfo(
+            "Settings Saved",
+            f"{len(snapshot)} settings saved to:\n{self._user_settings_path}\n\n"
+            f"They will be auto-loaded on the next launch.",
+            parent=self.root,
+        )
+
+    def _load_user_settings(self):
+        """Apply persisted settings if a JSON file exists next to app.py."""
+        path = self._user_settings_path
+        if not os.path.exists(path):
+            return
+        import json
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+        except Exception as e:
+            logger.warning(f"User settings file unreadable ({path}): {e}")
+            return
+        if not isinstance(snapshot, dict):
+            logger.warning(f"User settings file malformed: {path}")
+            return
+
+        applied = 0
+        skipped_keys = []
+        excludes = self._SETTINGS_EXCLUDE_NAMES
+        for name, value in snapshot.items():
+            if name in excludes:
+                continue
+            attr = getattr(self, name, None)
+            if not isinstance(attr, tk.Variable):
+                continue
+            try:
+                # tk.IntVar / DoubleVar / BooleanVar will refuse strings; coerce.
+                if isinstance(attr, tk.BooleanVar):
+                    attr.set(bool(value))
+                elif isinstance(attr, tk.IntVar):
+                    attr.set(int(value))
+                elif isinstance(attr, tk.DoubleVar):
+                    attr.set(float(value))
+                else:
+                    attr.set(value if value is not None else "")
+                applied += 1
+            except Exception as set_err:
+                skipped_keys.append((name, str(set_err)))
+        if skipped_keys:
+            logger.debug(f"User settings: skipped {len(skipped_keys)} keys: {skipped_keys[:5]}...")
+        logger.info(f"User settings auto-loaded: {applied} keys from {path}")
+
+    def select_batch_source_dir(self):
+        dir_path = filedialog.askdirectory(title="Select Batch Video Folder", parent=self.root)
+        if dir_path:
+            self.batch_source_dir_var.set(dir_path)
+
+    def _load_next_batch_video(self):
+        if not self.batch_processing_mode_var.get() or not self.batch_video_files:
+            logger.info("Batch list is empty or mode is disabled.")
+            self.is_batch_running = False
+            self.view.set_ui_element_state("btn_start_batch", tk.NORMAL)
+            return False
+
+        self.batch_current_index += 1
+        if self.batch_current_index >= len(self.batch_video_files):
+            logger.info("Batch processing for all video files completed.")
+            messagebox.showinfo("Complete", "Batch processing for all video files completed.", parent=self.root)
+            self.batch_processing_mode_var.set(False)
+            self._on_batch_mode_toggle()
+            self.is_batch_running = False
+            self.view.set_ui_element_state("btn_start_batch", tk.NORMAL)
+            return False
+
+        next_video_path = self.batch_video_files[self.batch_current_index]
+        logger.info(f"Batch: Loading next video... ({self.batch_current_index + 1}/{len(self.batch_video_files)}) - {next_video_path}")
+
+        self._release_video_capture()
+        self._reset_internal_states_for_new_source()
+
+        # Defensive: enforce a clean slate so cut/DLMI state from the previous video can never leak into propagation of the next one.
+        self.cut_start_frame = 0
+        self.cut_point_frame = None
+        self.propagated_results = {}
+        self.review_current_frame = 0
+        self.label_anchor_frame_idx = None
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.propagation_paused = False
+        self.propagation_stop_requested = False
+        try:
+            self.propagation_pause_event.set()
+        except Exception:
+            pass
+        try:
+            self._remove_dlmi_persistent_hooks()
+        except Exception as _hook_err:
+            logger.debug(f"_load_next_batch_video: dlmi hook cleanup skipped: {_hook_err}")
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
+
+        self.video_source_path = next_video_path
+        self.cap = cv2.VideoCapture(self.video_source_path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Error", f"Cannot open next video: {self.video_source_path}", parent=self.root)
+            return self._load_next_batch_video()
+
+        self.video_total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.video_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_resolution = f"{width}x{height}"
+        self.video_display_name = os.path.basename(self.video_source_path)
+
+        self.info_video_name_var.set(self.video_display_name)
+        self.info_video_resolution_var.set(self.video_resolution)
+        self.info_video_total_frames_var.set(f"{self.video_total_frames} frames")
+        self.info_video_fps_var.set(f"{self.video_fps:.2f} FPS")
+        self.info_batch_progress_var.set(f"{self.batch_current_index + 1} / {len(self.batch_video_files)}")
+        self.update_status(f"Batch: {os.path.basename(next_video_path)} loaded. Detect objects then press 'Start Propagation'.")
+        self.playback_paused = True
+
+        max_slider_frame = self.video_total_frames - 1 if self.video_total_frames > 0 else 0
+        self.review_current_frame = 0
+        self.view.update_review_slider_range(max_slider_frame)
+        self.view.review_frame_slider.set(0)
+        self.view.update_review_frame_info(0, max_slider_frame)
+
+        ret, frame_bgr = self.cap.read()
+        if ret:
+            self.current_cv_frame = frame_bgr.copy()
+            self.current_frame_idx_conceptual = 0
+            self._display_cv_frame_on_view(frame_bgr)
+            self._update_interaction_status_and_label()
+        else:
+            messagebox.showerror("Error", f"Failed to read first frame from video: {self.video_source_path}", parent=self.root)
+            self._release_video_capture()
+            return self._load_next_batch_video()
+
+        return True
+
+    def _execute_pcs_with_exemplars(self):
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return None
+        from util import pcs_controller
+        return pcs_controller.execute_pcs_with_exemplars(self)
+
+    def execute_pcs_detection(self):
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return None
+        from util import pcs_controller
+        return pcs_controller.execute_pcs_detection(self)
+
+    def _auto_disable_polygon_mode(self):
+        """Auto-disable polygon/paint mode if active. Called before propagation start/resume."""
+        if self.polygon_mode_active:
+            self.polygon_mode_active = False
+            self.polygon_points = []
+            if self.view and hasattr(self.view, 'update_polygon_mode_ui'):
+                self.view.update_polygon_mode_ui(False)
+            logger.info("Polygon mode auto-disabled before propagation")
+        if self.paint_mode_active:
+            self.paint_mode_active = False
+            self._clear_paint_state()
+            if self.view and hasattr(self.view, 'update_paint_mode_ui'):
+                self.view.update_paint_mode_ui(False)
+            logger.info("Paint mode auto-disabled before propagation")
+
+    def _remove_untracked_polygon_objects(self):
+        removed = self._untracked_polygon_object_ids()
+        for oid in removed:
+            self.tracked_objects.pop(oid, None)
+            self.selected_objects_sam_ids.discard(oid)
+            if self.selected_object_sam_id == oid:
+                self.selected_object_sam_id = None
+            if hasattr(self, 'current_confidence_masks'):
+                self.current_confidence_masks.pop(oid, None)
+        self.polygon_objects = [p for p in self.polygon_objects if p.get('obj_id') not in removed]
+        if removed:
+            logger.info(f"Untracked polygon/paint objects removed before propagation: {removed}")
+            if self.current_cv_frame is not None:
+                self._display_cv_frame_on_view(self.current_cv_frame, self._get_current_masks_for_display())
+            self._update_obj_id_info_label()
+        return removed
+
+    def _resolve_untracked_polygon_objects_before_start(self):
+        from util.ui_dialogs import ask_choice
+
+        pending = self._untracked_polygon_object_ids()
+        if not pending:
+            return True
+
+        choice = ask_choice(
+            self,
+            "Polygon/Paint objects not in SAM3 tracking",
+            f"{len(pending)} polygon/paint object(s) {pending} have not been entered into SAM3 tracking.\n"
+            "Starting now would drop them from the propagation.\n\n"
+            "Apply DLMI: inject all current masks via DLMI, then start.\n"
+            "Force Start: remove these objects and start with the tracked ones only.\n"
+            "Cancel: go back (use 'Inject Data' first).",
+            [("Cancel", "cancel", "#eeeeee"),
+             ("Force Start", "force", "#ffcdd2"),
+             ("Apply DLMI", "dlmi", "#e1bee7")],
+            cancel_value="cancel",
+        )
+
+        if choice == "force":
+            removed = self._remove_untracked_polygon_objects()
+            self.update_status(f"Force start: {len(removed)} untracked polygon/paint object(s) removed.")
+            return True
+
+        if choice == "dlmi":
+            if not self.low_level_api_enabled_var.get():
+                self.low_level_api_enabled_var.set(True)
+                if self.view and hasattr(self.view, '_on_low_level_api_toggle'):
+                    self.view._on_low_level_api_toggle()
+            self.inject_low_level_mask_prompt(force=True)
+            if self._untracked_polygon_object_ids() or not self.is_tracking_ever_started:
+                self.update_status("DLMI injection did not complete. Propagation not started.")
+                return False
+            self.update_status("DLMI applied. Starting propagation...")
+            return True
+
+        self.update_status("Propagation start cancelled.")
+        return False
+
+    def start_propagation(self):
+        if not self._confirm_discard_pending_manual_input(
+                "Starting or resuming propagation"):
+            return
+
+        self._auto_disable_polygon_mode()
+
+        # Resume from pause
+        if self.propagation_paused:
+            self.propagation_paused = False
+            self.propagation_pause_event.set()
+            self.app_state = "PROPAGATING"
+            self.view.set_propagate_button_states(is_propagating=True)
+            if self.dlmi_pending_injection:
+                self.update_status("Propagation resumed. DLMI injection will apply on next frame.")
+            else:
+                self.update_status("Propagation resumed.")
+            logger.info("Propagation resumed from pause.")
+            return
+
+        if not self._resolve_untracked_polygon_objects_before_start():
+            return
+
+        current_mode = self.prompt_mode_var.get()
+
+        if current_mode == "PCS_IMAGE":
+            if not self.pcs_text_prompt_var.get().strip():
+                messagebox.showwarning("Info", "In PCS(per-image) mode, please enter a text prompt.", parent=self.root)
+                return
+        elif not self.tracked_objects:
+            messagebox.showwarning("Info", "Define objects first (PCS or PVS mode).", parent=self.root)
+            return
+
+        if current_mode == "PCS":
+            if self.pcs_inference_session is None:
+                messagebox.showwarning("Info", "PCS session not initialized. Perform text detection first.", parent=self.root)
+                return
+        elif current_mode in ("PVS", "PVS_CHUNK"):
+            if self.inference_session is None:
+                if not self._init_inference_session():
+                    messagebox.showwarning("Info", "SAM3 session initialization failed.", parent=self.root)
+                    return
+
+        self.app_state = "PROPAGATING"
+        self.propagation_stop_requested = False
+        self.propagation_paused = False
+        self.propagation_pause_event.set()
+        self.propagated_results = {}
+        self.propagation_progress = 0
+
+        # Pre-propagate anchor served its purpose; from here on propagated_results is the source of truth for display.
+        self.label_anchor_frame_idx = None
+
+        if hasattr(self, 'object_prompt_history'):
+            self.object_prompt_history.clear()
+            logger.info("Propagation start: object_prompt_history cleared.")
+
+        self._snapshot_pose_queries_and_hide()
+
+        self.view.set_propagate_button_states(is_propagating=True)
+        self.view.update_propagate_progress(0, "Starting propagation...")
+
+        self.processing_thread = threading.Thread(target=self._propagate_thread, daemon=True)
+        self.processing_thread.start()
+
+    def _snapshot_pose_queries_and_hide(self):
+        from util import pose_controller
+        return pose_controller.snapshot_pose_queries_and_hide(self)
+
+    def _propagate_thread(self):
+        try:
+            total_frames = int(self.video_total_frames)
+            if total_frames <= 0:
+                total_frames = 1000
+
+            start_frame = getattr(self, 'cut_start_frame', 0)
+            actual_total_frames = total_frames - start_frame
+
+            current_mode = self.prompt_mode_var.get()
+
+            if self.sam2_enabled_var.get() and self.sam2_model is not None:
+                if not self.sam2_tracking_enabled_var.get():
+                    logger.info("SAM2 enabled state starting SAM3 propagation - transferring SAM2 masks to SAM3")
+                    self.transfer_sam2_masks_to_sam3_and_unload()
+                    self.sam2_enabled_var.set(False)
+                    self.root.after(0, lambda: self.view._update_sam2_ui_state(enabled=False))
+
+            if self.sam2_tracking_enabled_var.get() and self.sam2_model is not None:
+                logger.info("Starting propagation in SAM2 tracking mode")
+                if not self.sam2_masks and self.tracked_objects:
+                    self._transfer_sam3_masks_to_sam2()
+                propagation_controller.propagate_sam2_mode(self, start_frame, actual_total_frames)
+            elif current_mode == "PCS":
+                propagation_controller.propagate_pcs_mode(self, start_frame, actual_total_frames)
+            elif current_mode == "PCS_IMAGE":
+                propagation_controller.propagate_pcs_image_mode(self, start_frame, actual_total_frames)
+            elif current_mode == "PVS_CHUNK":
+                propagation_controller.propagate_pvs_chunk_mode(self, start_frame, actual_total_frames)
+            else:
+                propagation_controller.propagate_pvs_mode(self, start_frame, actual_total_frames)
+
+            self.root.after(0, self._on_propagation_finished)
+
+        except Exception as e:
+            logger.exception("Propagation error:")
+            self.root.after(0, self.update_status, f"Propagation error: {e}")
+            self.root.after(0, self._on_propagation_finished)
+
+    def _perform_pcs_single_image_detection(self, frame_bgr, text_prompt, frame_idx):
+        from util import pcs_controller
+        return pcs_controller.perform_pcs_single_image_detection(self, frame_bgr, text_prompt, frame_idx)
+
+    def toggle_discard_current_frame(self):
+        frame_idx = self.review_current_frame
+
+        if frame_idx in self.discarded_frames:
+            self.discarded_frames.remove(frame_idx)
+            self.update_status(f"Frame {frame_idx} discard cancelled")
+            self.view.update_discard_button_state(False)
+        else:
+            self.discarded_frames.add(frame_idx)
+            self.update_status(f"Frame {frame_idx} marked for discard (excluded from save)")
+            self.view.update_discard_button_state(True)
+
+        self.view.update_discarded_frames_display(self.discarded_frames)
+
+    def _on_propagation_finished(self):
+        self.propagation_paused = False
+        self.propagation_pause_event.set()
+        self.dlmi_pending_injection = False
+        self.dlmi_pending_masks = {}
+        self.app_state = "REVIEWING"
+        self.view.set_propagate_button_states(is_propagating=False)
+        self.view.enable_review_controls(True)
+
+        # Auto-disable "add" toggles so user goes into plain review mode, not an accidental add-pose or add-polygon state.
+        self._auto_disable_polygon_mode()
+        try:
+            if hasattr(self, 'pose_add_mode_var') and self.pose_add_mode_var.get():
+                self.pose_add_mode_var.set(False)
+            if hasattr(self, 'pose_chain_mode_var') and self.pose_chain_mode_var.get():
+                self.pose_chain_mode_var.set(False)
+        except Exception:
+            pass
+
+        cut_offset = getattr(self, 'cut_start_frame', 0)
+        remaining_frames = self.video_total_frames - cut_offset
+        max_slider_frame = remaining_frames - 1 if remaining_frames > 0 else 0
+        propagated_count = len(self.propagated_results) if self.propagated_results else 0
+
+        if propagated_count > 0:
+            max_propagated_frame = max(self.propagated_results.keys())
+            self.view.update_review_slider_range(max_slider_frame)
+            self.view.update_review_frame_info(cut_offset, max_slider_frame)
+            self.view.update_propagate_progress(100, f"Propagation complete: {propagated_count} frames (total: {remaining_frames})")
+            self.update_status(f"Propagation complete. {propagated_count} frames processed. {remaining_frames} frames available for review.")
+        else:
+            self.view.update_review_slider_range(max_slider_frame)
+            self.view.update_propagate_progress(0, "No propagation results")
+            self.update_status("No propagation results. All frames can be reviewed.")
+
+        try:
+            tap_on = bool(self.pose_tapnext_enabled_var.get()) if hasattr(self, 'pose_tapnext_enabled_var') else False
+            has_pose_queries = (
+                any(obj.get('pose_points') for obj in self.tracked_objects.values())
+                or bool(getattr(self, '_pose_query_seeds', None))
+            )
+            if propagated_count > 0 and tap_on and has_pose_queries:
+                logger.info("TAPNext++ auto-run after propagation (toggle on).")
+                self.update_status("Propagation done. Preparing TAPNext++ pose tracking...")
+                self.root.update_idletasks()
+                self.run_tapnext_post_process()
+            elif propagated_count > 0 and tap_on and not has_pose_queries:
+                logger.info("TAPNext++ toggle on but no pose points in tracked_objects; skipped.")
+                self.update_status("TAPNext++ on, but no initial pose points were set \u2014 nothing to track.")
+        except Exception as _tap_auto_err:
+            logger.debug(f"TAPNext auto-run skipped: {_tap_auto_err}")
+
+        try:
+            if getattr(self, 'pose_automatch_var', None) and self.pose_automatch_var.get():
+                merged = self._try_automatch_pose_to_segments()
+                if merged > 0:
+                    logger.info(f"Auto-match after propagation: {merged} merges.")
+        except Exception as _am_err:
+            logger.debug(f"Auto-match after propagation skipped: {_am_err}")
+
+        # Restore pose seeds into frame 0 if TAPNext did NOT populate per-frame pose data.
+        try:
+            seeds = getattr(self, '_pose_query_seeds', None)
+            if seeds and propagated_count > 0:
+                has_pose_anywhere = any(
+                    any(d.get('pose_points') for d in r.get('masks', {}).values() if isinstance(d, dict))
+                    for r in self.propagated_results.values()
+                )
+                if not has_pose_anywhere:
+                    first_key = min(self.propagated_results.keys())
+                    frame0_masks = self.propagated_results[first_key].setdefault('masks', {})
+                    for oid, seed in seeds.items():
+                        slot = frame0_masks.setdefault(int(oid), {})
+                        slot['pose_points'] = [dict(p) for p in seed.get('points', [])]
+                        slot['pose_edges'] = [list(e) for e in seed.get('edges', [])]
+                        if seed.get('pose_class'):
+                            slot['pose_class'] = seed['pose_class']
+                        if seed.get('custom_label'):
+                            slot['custom_label'] = seed['custom_label']
+                    logger.info(f"Pose seeds restored into frame {first_key} for review.")
+                # Refresh current slider frame so tracked_objects reflects pose
+                self.on_review_frame_change(getattr(self, 'review_current_frame', 0))
+        except Exception as _seed_restore_err:
+            logger.debug(f"Pose seed restore skipped: {_seed_restore_err}")
+
+    def _run_pcs_review_mode_async(self):
+        import threading
+        from util.autolabel_workflow import run_pcs_review_mode
+
+        def progress_callback(current, total):
+            progress = int(current / total * 100)
+            self.root.after(0, self.view.update_propagate_progress, progress,
+                            f"Review mode: {current}/{total} frames analyzing...")
+
+        def run_review():
+            self.root.after(0, self.update_status, "PCS review mode running...")
+            run_pcs_review_mode(self, progress_callback)
+            self.root.after(0, self.update_status, "PCS review mode complete")
+            self.root.after(0, self.view.update_propagate_progress, 100, "Review mode complete")
+
+        thread = threading.Thread(target=run_review, daemon=True)
+        thread.start()
+
+    def pause_propagation(self):
+        if not self.propagation_paused and self.app_state == "PROPAGATING":
+            self.propagation_paused = True
+            self.propagation_pause_event.clear()
+            self.app_state = "PAUSED"
+            self.view.set_propagate_button_states_paused()
+            self.update_status("Propagation paused. Modify objects and/or inject DLMI, then resume.")
+            logger.info(f"Propagation paused at frame {self.propagation_current_frame_idx}.")
+
+    def stop_propagation(self):
+        self.propagation_stop_requested = True
+        if self.propagation_paused:
+            self.propagation_paused = False
+            self.propagation_pause_event.set()  # Unblock thread so it can check stop flag
+        self.update_status("Propagation stop requested...")
+
+    def on_review_frame_change(self, frame_idx):
+        self.review_current_frame = frame_idx
+
+        cut_offset = getattr(self, 'cut_start_frame', 0)
+        actual_frame_idx = frame_idx + cut_offset
+
+        remaining_frames = self.video_total_frames - cut_offset
+        max_slider_frame = remaining_frames - 1 if remaining_frames > 0 else 0
+
+        if frame_idx in self.propagated_results:
+            result = self.propagated_results[frame_idx]
+            frame_bgr = result['frame']
+            masks = result['masks']
+
+            self.current_cv_frame = frame_bgr
+            self.current_frame_idx_conceptual = frame_idx
+
+            masks_for_display = {obj_id: data['last_mask'] for obj_id, data in masks.items() if 'last_mask' in data}
+
+            # Sync mask + pose info into tracked_objects so any redraw reflects THIS frame; objects absent here get their visual state stripped.
+            frame_obj_ids = set(masks.keys())
+            for _oid in list(self.tracked_objects.keys()):
+                if _oid in frame_obj_ids:
+                    _data = masks[_oid]
+                    if 'last_mask' in _data and _data['last_mask'] is not None:
+                        self.tracked_objects[_oid]['last_mask'] = _data['last_mask']
+                    else:
+                        self.tracked_objects[_oid].pop('last_mask', None)
+                    _pts = _data.get('pose_points')
+                    if _pts is not None:
+                        self.tracked_objects[_oid]['pose_points'] = _pts
+                        if 'pose_edges' in _data:
+                            self.tracked_objects[_oid]['pose_edges'] = _data['pose_edges']
+                    else:
+                        self.tracked_objects[_oid].pop('pose_points', None)
+                        self.tracked_objects[_oid].pop('pose_edges', None)
+                elif self.tracked_objects[_oid].get('mid_session_added'):
+                    # Keep mid-session-added objects intact; their last_mask only exists at the frame they were created on.
+                    continue
+                else:
+                    # Object doesn't appear in this frame's masks; strip its visual state so it doesn't ghost across frames.
+                    self.tracked_objects[_oid].pop('last_mask', None)
+                    self.tracked_objects[_oid].pop('pose_points', None)
+                    self.tracked_objects[_oid].pop('pose_edges', None)
+            for _oid in frame_obj_ids:
+                if _oid not in self.tracked_objects:
+                    self.tracked_objects[_oid] = {}
+                    _data = masks[_oid]
+                    if 'last_mask' in _data and _data['last_mask'] is not None:
+                        self.tracked_objects[_oid]['last_mask'] = _data['last_mask']
+                    if _data.get('pose_points') is not None:
+                        self.tracked_objects[_oid]['pose_points'] = _data['pose_points']
+                        if 'pose_edges' in _data:
+                            self.tracked_objects[_oid]['pose_edges'] = _data['pose_edges']
+                    if _data.get('custom_label'):
+                        self.tracked_objects[_oid]['custom_label'] = _data['custom_label']
+
+            self._display_cv_frame_on_view(frame_bgr, masks_for_display)
+        else:
+            # During propagation/pause, propagation thread owns self.cap.
+            if self.app_state in ("PAUSED", "PROPAGATING"):
+                self.update_status(
+                    f"Frame {actual_frame_idx} not yet processed (propagation in progress). "
+                    f"Reviewable once that frame is reached."
+                )
+            elif self.cap and self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, actual_frame_idx)
+                ret, frame_bgr = self.cap.read()
+                if ret:
+                    self.current_cv_frame = frame_bgr
+                    self.current_frame_idx_conceptual = frame_idx
+                    # Pre-propagate phase: when the user navigates back to the anchor frame, restore the in-progress masks they were composing.
+                    if (self._is_pre_propagate_phase()
+                            and self.label_anchor_frame_idx is not None
+                            and frame_idx == self.label_anchor_frame_idx
+                            and self.tracked_objects):
+                        self._display_cv_frame_on_view(
+                            frame_bgr, self._get_current_masks_for_display()
+                        )
+                    else:
+                        self._display_cv_frame_on_view(frame_bgr, {}, show_pose=False)
+                else:
+                    logger.warning(f"Review: Frame {actual_frame_idx} read failed")
+            else:
+                logger.warning(f"Review: Video capture not open (frame {actual_frame_idx})")
+
+        self.view.update_review_frame_info(actual_frame_idx, max_slider_frame)
+
+        is_discarded = frame_idx in self.discarded_frames
+        self.view.update_discard_button_state(is_discarded)
+
+    def cut_and_repropagate(self):
+        from util import cut_workflow
+        return cut_workflow.cut_and_repropagate(self)
+
+    def _cut_save_frames_0_to_n(self, slider_idx, save_labels, current_offset):
+        from util import cut_workflow
+        return cut_workflow.save_frames_0_to_n(self, slider_idx, save_labels, current_offset)
+
+    def _pose_labels_subdir(self):
+        from util import cut_workflow
+        return cut_workflow.pose_labels_subdir(self)
+
+    def _cut_reset_state_and_seek(self, next_start_frame):
+        from util import cut_workflow
+        return cut_workflow.reset_state_and_seek(self, next_start_frame)
+
+    def _dlmi_mini_propagate_n_to_n1(self, frame_n_bgr, frame_n_plus_1_bgr, obj_id_to_mask_label):
+        from util import cut_workflow
+        return cut_workflow.dlmi_mini_propagate_n_to_n1(
+            self, frame_n_bgr, frame_n_plus_1_bgr, obj_id_to_mask_label
+        )
+
+    def open_pose_settings(self):
+        from util import pose_controller
+        return pose_controller.open_pose_settings(self)
+
+    def _default_pose_class_name(self):
+        from util import pose_controller
+        return pose_controller.default_pose_class_name(self)
+
+    def add_pose_point_at(self, img_x, img_y):
+        if not self._ensure_label_anchor_or_confirm_switch():
+            return None
+        from util import pose_controller
+        return pose_controller.add_pose_point_at(self, img_x, img_y)
+
+    def toggle_pose_point_selection(self, obj_id, kpt_idx):
+        from util import pose_controller
+        return pose_controller.toggle_pose_point_selection(self, obj_id, kpt_idx)
+
+    def clear_pose_selection(self):
+        from util import pose_controller
+        return pose_controller.clear_pose_selection(self)
+
+    def _update_pose_action_button_states(self):
+        from util import pose_controller
+        return pose_controller.update_pose_action_button_states(self)
+
+    def new_pose_object(self):
+        from util import pose_controller
+        return pose_controller.new_pose_object(self)
+
+    def _refresh_pose_class_menu(self):
+        from util import pose_controller
+        return pose_controller.refresh_pose_class_menu(self)
+
+    def _update_pose_class_display(self):
+        from util import pose_controller
+        return pose_controller.update_pose_class_display(self)
+
+    def _on_pose_class_selected(self):
+        from util import pose_controller
+        return pose_controller.on_pose_class_selected(self)
+
+    def delete_selected_object_pose(self):
+        from util import pose_controller
+        return pose_controller.delete_selected_object_pose(self)
+
+    def select_pose_chain_at(self, img_x, img_y):
+        from util import pose_controller
+        return pose_controller.select_pose_chain_at(self, img_x, img_y)
+
+    def toggle_selected_pose_visibility(self):
+        from util import pose_controller
+        return pose_controller.toggle_selected_pose_visibility(self)
+
+    def _automatch_classify_pose_object(self, oid, force=False):
+        from util import pose_controller
+        return pose_controller.automatch_classify_pose_object(self, oid, force=force)
+
+    def _automatch_all_new_pose_objects(self):
+        from util import pose_controller
+        return pose_controller.automatch_all_new_pose_objects(self)
+
+    def _try_automatch_pose_to_segments(self, min_ratio=0.7):
+        from util import pose_controller
+        return pose_controller.try_automatch_pose_to_segments(self, min_ratio=min_ratio)
+
+    def reassign_selected_pose_idx(self):
+        from util import pose_controller
+        return pose_controller.reassign_selected_pose_idx(self)
+
+    def connect_selected_pose_points(self):
+        from util import pose_controller
+        return pose_controller.connect_selected_pose_points(self)
+
+    def _default_pose_models_dir(self):
+        from util import pose_controller
+        return pose_controller.default_pose_models_dir(self)
+
+    def _ensure_tapnext_ckpt(self, interactive=True):
+        from util import pose_controller
+        return pose_controller.ensure_tapnext_ckpt(self, interactive=interactive)
+
+    def _open_download_dialog(self, url, dest):
+        from util import ui_dialogs
+        return ui_dialogs.open_download_dialog(self, url, dest)
+
+    def _open_loading_dialog(self, title, subtitle):
+        from util import ui_dialogs
+        return ui_dialogs.open_loading_dialog(self, title, subtitle)
+
+    def _get_pose_tracker(self):
+        from util import pose_controller
+        return pose_controller.get_pose_tracker(self)
+
+    def _offer_pose_fallback(self, reason=""):
+        from util import pose_controller
+        return pose_controller.offer_pose_fallback(self, reason=reason)
+
+    def _get_yolo_pose_detector(self):
+        from util import pose_controller
+        return pose_controller.get_yolo_pose_detector(self)
+
+    def run_yolo_pose_detect(self):
+        from util import pose_controller
+        return pose_controller.run_yolo_pose_detect(self)
+
+    def run_tapnext_post_process(self):
+        from util import pose_controller
+        return pose_controller.run_tapnext_post_process(self)
+
+    def delete_selected_pose_points(self):
+        from util import pose_controller
+        return pose_controller.delete_selected_pose_points(self)
+
+    def _seed_session_with_masks(self, oid_to_mask):
+        from util import cut_workflow
+        return cut_workflow.seed_session_with_masks(self, oid_to_mask)
+
+    def cut_and_dlmi_propagate(self):
+        from util import cut_workflow
+        return cut_workflow.cut_and_dlmi_propagate(self)
+
+    def cut_and_load_labels(self):
+        from util import cut_workflow
+        return cut_workflow.cut_and_load_labels(self)
+
+    def repropagate_all(self):
+        from util import cut_workflow
+        return cut_workflow.repropagate_all(self)
+
+    def confirm_and_save_labels(self):
+        from util import save_controller
+        return save_controller.confirm_and_save_labels(self)
+
+    def save_current_frame_labels(self):
+        from util import save_controller
+        return save_controller.save_current_frame_labels(self)
+
+    def _on_save_finished(self, total_frames):
+        from util import save_controller
+        return save_controller.on_save_finished(self, total_frames)
+
+    def _handle_sam_reset(self):
+        from util import sam2_manager
+        return sam2_manager.handle_sam_reset(self)
+
+    def load_sam2_model_async(self):
+        from util import sam2_manager
+        return sam2_manager.load_sam2_model_async(self)
+
+    def unload_sam2_model(self):
+        from util import sam2_manager
+        return sam2_manager.unload_sam2_model(self)
+
+    def _transfer_sam3_masks_to_sam2(self):
+        from util import sam2_manager
+        return sam2_manager.transfer_sam3_masks_to_sam2(self)
+
+    def transfer_sam2_masks_to_sam3_and_unload(self):
+        from util import sam2_manager
+        return sam2_manager.transfer_sam2_masks_to_sam3_and_unload(self)
+
+    def _get_current_frame_masks(self):
+        from util import sam2_manager
+        return sam2_manager.get_current_frame_masks(self)
+
+    def _reinit_sam3_session_with_masks(self):
+        from util import sam2_manager
+        return sam2_manager.reinit_sam3_session_with_masks(self)
+
+    def _handle_sam2_prompt(self, prompt_type, coords, label=None,
+                            proposed_obj_id_for_new=None, target_existing_obj_id=None,
+                            custom_label=None):
+        from util import sam2_manager
+        return sam2_manager.handle_sam2_prompt(
+            self, prompt_type, coords, label=label,
+            proposed_obj_id_for_new=proposed_obj_id_for_new,
+            target_existing_obj_id=target_existing_obj_id,
+            custom_label=custom_label,
+        )
+
+    def refine_mask_with_sam2(self, obj_id: int, input_points=None, input_labels=None, input_boxes=None):
+        from util import sam2_manager
+        return sam2_manager.refine_mask_with_sam2(
+            self, obj_id, input_points=input_points,
+            input_labels=input_labels, input_boxes=input_boxes,
+        )
+
+    def _on_closing_window_confirm(self):
+        if self._is_any_special_mode_active():
+            if messagebox.askokcancel("Exit Confirmation", f"Currently interacting with objects. Do you really want to exit?", parent=self.root): self._perform_cleanup_and_destroy()
+            return
+        if self.autolabel_active :
+            if messagebox.askokcancel("Exit Confirmation", "Auto labeling is in progress. Do you really want to exit?", parent=self.root): self._perform_cleanup_and_destroy()
+        else: self._perform_cleanup_and_destroy()
+
+    def _perform_cleanup_and_destroy(self):
+        logger.info("Performing application shutdown procedure..."); self.autolabel_active = False; self.playback_paused = True
+        self.interaction_correction_pending = None; self.problematic_highlight_active_sam_id = None; self.reassign_bbox_mode_active_sam_id = None
+        if self.processing_thread and self.processing_thread.is_alive():
+            logger.info("Waiting for background processing thread join (max 1 second)..."); self.processing_thread.join(timeout=1.0)
+            if self.processing_thread and self.processing_thread.is_alive(): logger.warning("Processing thread join timeout.")
+        self.processing_thread = None; self._release_video_capture(); logger.info("Destroying root window.")
+        if self.root:
+            try: self.root.destroy()
+            except tk.TclError as e: logger.warning(f"TclError while destroying root window: {e}")
+            self.root = None
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = SAM3AutolabelApp(root)
+    root.geometry("1100x850")
+    root.minsize(960, 700)
+    root.mainloop()
